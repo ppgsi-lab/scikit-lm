@@ -1,0 +1,141 @@
+[project]
+name = "scikit-lm"
+dynamic = ["version"]
+description = "scikit-learn estimators backed by language models: classifiers, regressors, imputers and oversamplers."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "Gabriel Francisco dos Santos Silva", email = "gabfssilva@gmail.com" }]
+keywords = [
+    "scikit-learn",
+    "language-model",
+    "tabular-data",
+    "imputation",
+    "oversampling",
+    "classification",
+    "regression",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+dependencies = [
+    "numpy>=2.0",
+    "pandas>=2.2",
+    "scikit-learn>=1.6",
+    "imbalanced-learn>=0.14",
+]
+
+[project.urls]
+Homepage = "https://github.com/ppgsi-lab/scikit-lm"
+Repository = "https://github.com/ppgsi-lab/scikit-lm"
+Issues = "https://github.com/ppgsi-lab/scikit-lm/issues"
+
+[project.optional-dependencies]
+hf = ["torch>=2.6", "transformers>=5.0", "peft>=0.15", "accelerate>=1.0"]
+quant = [
+    "bitsandbytes>=0.45; sys_platform == 'linux'",
+    "mps-bitsandbytes>=0.7.0; sys_platform == 'darwin'",
+]
+# HQQ low-bit (2-/3-bit) quantization for the HF backend; on-the-fly, CUDA or CPU.
+hqq = ["hqq>=0.2.8.post1"]
+# MLX backend; delegates training to mlx-lm's tuner. The compute variant is the
+# user's install-time choice: Metal on macOS ([mlx]), CPU or CUDA on Linux
+# ([mlx-cpu] / [mlx-cuda12] / [mlx-cuda13]). mlx-lm itself is platform-agnostic.
+mlx = [
+    "mlx>=0.31; sys_platform == 'darwin'",
+    "mlx-lm>=0.31; sys_platform == 'darwin'",
+]
+mlx-cpu = [
+    "mlx[cpu]>=0.31; sys_platform == 'linux'",
+    "mlx-lm>=0.31; sys_platform == 'linux'",
+]
+mlx-cuda12 = [
+    "mlx[cuda12]>=0.31; sys_platform == 'linux'",
+    "mlx-lm>=0.31; sys_platform == 'linux'",
+]
+mlx-cuda13 = [
+    "mlx[cuda13]>=0.31; sys_platform == 'linux'",
+    "mlx-lm>=0.31; sys_platform == 'linux'",
+]
+# Pretty live progress bars via TqdmCallbacks.
+tqdm = ["tqdm>=4.66"]
+# Live fine-tuning dashboard via RichCallbacks (loss curve through plotext).
+rich = ["rich>=13.0", "plotext>=5.2"]
+optuna = [
+    "optuna>=4.0",
+    "optuna-integration>=4.0",
+]
+# Everything; platform markers in the referenced extras keep this resolvable
+# anywhere (mlx/mps-bitsandbytes drop off Linux, mlx-cpu/bitsandbytes drop off
+# macOS). The CUDA MLX variants stay opt-in so `all` never pulls CUDA libraries.
+all = ["scikit-lm[hf,quant,hqq,mlx,mlx-cpu,tqdm,rich,optuna]"]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+# Version is derived from the latest git tag (vX.Y.Z) by hatch-vcs and written to
+# src/sklm/_version.py at build time. fallback-version keeps builds working before
+# the first tag exists (e.g. a fresh checkout with no tags).
+[tool.hatch.version]
+source = "vcs"
+fallback-version = "0.0.0"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/sklm/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/sklm"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/sklm",
+    "tests",
+    "examples",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.15", "pyright>=1.1.400"]
+
+[tool.uv.extra-build-dependencies]
+# mps-bitsandbytes needs torch at build time but doesn't declare it.
+mps-bitsandbytes = ["torch"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+extend-exclude = ["examples", "src/sklm/_version.py"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.flake8-bugbear]
+# Frozen, immutable config dataclasses are safe as argument defaults.
+extend-immutable-calls = [
+    "sklm.config.TrainingConfig",
+    "sklm.config.GenerationConfig",
+    "sklm.config.ModelConfig",
+    "sklm.serialize.PlainNumber",
+]
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "standard"
+
+[tool.pytest.ini_options]
+markers = ["slow: tests that fine-tune a real language model (require the 'hf' or 'mlx' extra)"]
