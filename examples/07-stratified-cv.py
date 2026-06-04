@@ -21,10 +21,8 @@ from sklearn.model_selection import StratifiedKFold, cross_val_score
 
 from sklm import (
     GenerationConfig,
-    JSONSerializer,
     LanguageModelClassifier,
     LoggingCallback,
-    LoRAConfig,
     TrainingConfig,
 )
 
@@ -40,10 +38,10 @@ def main() -> None:
         backend="mlx",
         model="gabfssilva/distilgpt2",
         training=TrainingConfig(
-            epochs=2,
-            batch_size=8,
+            epochs=3,
+            batch_size=16,
             lr_scheduler='constant',
-            augmentation_factor=12,
+            augmentation_factor=24,
         ),
         generation=GenerationConfig(n_samples=24),
         random_state=seed,

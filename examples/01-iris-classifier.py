@@ -37,8 +37,8 @@ def main() -> None:
         backend="mlx",
         model="gabfssilva/distilgpt2",
         training=TrainingConfig(
-            epochs=4,
-            batch_size=8,
+            epochs=3,
+            batch_size=16,
             lr_scheduler='constant',
             augmentation_factor=24,
         ),

@@ -47,6 +47,8 @@ clf.predict_proba(X_test)  # -> per-row distribution over clf.classes_
 - [scikit-learn integration](#scikit-learn-integration)
 - [Callbacks](#callbacks)
 - [Requirements](#requirements)
+- [References](#references)
+- [Citation](#citation)
 - [License](#license)
 
 ---
@@ -55,7 +57,7 @@ clf.predict_proba(X_test)  # -> per-row distribution over clf.classes_
 
 Everything in scikit-lm is built on **a single mechanism**.
 
-A tabular row is turned into a short piece of text (JSON by default), and a small autoregressive language model is fine-tuned to produce that text. The trick is in *how* the rows are presented during training: **the order of the columns is randomly re-permuted for every row at every epoch.**
+A tabular row is turned into a short piece of text (JSON by default), and a small autoregressive language model is fine-tuned to produce that text. The trick is in *how* the rows are presented during training: **the column order of each row is randomly permuted throughout training, so the model sees many orderings.**
 
 ```
         row                         serialized (one random order per epoch)
@@ -499,6 +501,48 @@ Each shipped dashboard takes `n_train_examples` to preview the exact text the mo
 
 - Python ≥ 3.12
 - A backend extra to fine-tune and run a model: `[hf]` (any platform), or an MLX variant — `[mlx]` (Apple Silicon / Metal), `[mlx-cpu]`, `[mlx-cuda12]` or `[mlx-cuda13]` (Linux)
+
+---
+
+## References
+
+### Tabular language modeling
+
+scikit-lm builds on a line of work that fine-tunes autoregressive language models on serialized tabular rows:
+
+- **GReaT** — the core mechanism scikit-lm implements: serialize each row to text and fine-tune while re-permuting the column order at every epoch, so the model learns the conditional distribution of any column given any subset of the others. Vadim Borisov, Kathrin Seßler, Tobias Leemann, Martin Pawelczyk, and Gjergji Kasneci. *Language Models are Realistic Tabular Data Generators.* ICLR 2023. [arXiv:2210.06280](https://arxiv.org/abs/2210.06280)
+- **TAPTAP** — the digit-by-digit numeric serialization behind `SpacedDigits` (rendering `18` as `1 8`), which helps the model capture number semantics positionally. Tianping Zhang, Shaowen Wang, Shuicheng Yan, Jian Li, and Qian Liu. *Generative Table Pre-training Empowers Models for Tabular Prediction.* EMNLP 2023. [arXiv:2305.09696](https://arxiv.org/abs/2305.09696)
+- **TabLLM** — classifies a serialized row by ranking the candidate labels by their likelihood under the model, the same scheme the classifier uses, although TabLLM ranks with an encoder-decoder model (T0) over manually verbalized answers rather than scoring the target column's own value under a decoder-only model. Stefan Hegselmann, Alejandro Buendia, Hunter Lang, Monica Agrawal, Xiaoyi Jiang, and David A. Sontag. *TabLLM: Few-shot Classification of Tabular Data with Large Language Models.* AISTATS 2023. [arXiv:2210.10723](https://arxiv.org/abs/2210.10723)
+
+### Fine-tuning and quantization
+
+scikit-lm exposes these parameter-efficient fine-tuning and quantization techniques through `LoRAConfig`, `QuantizationConfig`, and `TrainingConfig`. The adapter and fine-tuning methods (LoRA, rsLoRA, DoRA, NEFTune) run on both the Hugging Face and MLX backends; the bitsandbytes and HQQ quantization paths below are Hugging Face–specific (MLX quantizes with its own native quantizer):
+
+- **LoRA** — low-rank adapters (`LoRAConfig`). Edward J. Hu, Yelong Shen, Phillip Wallis, Zeyuan Allen-Zhu, Yuanzhi Li, Shean Wang, Lu Wang, and Weizhu Chen. *LoRA: Low-Rank Adaptation of Large Language Models.* ICLR 2022. [arXiv:2106.09685](https://arxiv.org/abs/2106.09685)
+- **rsLoRA** — rank-stabilized LoRA scaling, `alpha / sqrt(rank)` (`LoRAConfig(rslora=True)`). Damjan Kalajdzievski. *A Rank Stabilization Scaling Factor for Fine-Tuning with LoRA.* arXiv 2023. [arXiv:2312.03732](https://arxiv.org/abs/2312.03732)
+- **DoRA** — weight-decomposed low-rank adaptation (`LoRAConfig(dora=True)`). Shih-Yang Liu, Chien-Yi Wang, Hongxu Yin, Pavlo Molchanov, Yu-Chiang Frank Wang, Kwang-Ting Cheng, and Min-Hung Chen. *DoRA: Weight-Decomposed Low-Rank Adaptation.* ICML 2024. [arXiv:2402.09353](https://arxiv.org/abs/2402.09353)
+- **QLoRA** — 4-bit NF4 quantized base weights via bitsandbytes (`quantization="4bit"`). Tim Dettmers, Artidoro Pagnoni, Ari Holtzman, and Luke Zettlemoyer. *QLoRA: Efficient Finetuning of Quantized LLMs.* NeurIPS 2023. [arXiv:2305.14314](https://arxiv.org/abs/2305.14314)
+- **LLM.int8()** — 8-bit quantized base weights via bitsandbytes (`quantization="8bit"`). Tim Dettmers, Mike Lewis, Younes Belkada, and Luke Zettlemoyer. *LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale.* NeurIPS 2022. [arXiv:2208.07339](https://arxiv.org/abs/2208.07339)
+- **HQQ** — 2-/3-bit quantization (`quantization="2bit"` / `"3bit"`, method `hqq`). Hicham Badri and Appu Shaji. *Half-Quadratic Quantization of Large Machine Learning Models.* Mobius Labs, 2023. [mobiusml.github.io/hqq_blog](https://mobiusml.github.io/hqq_blog/)
+- **NEFTune** — noisy-embedding fine-tuning (`TrainingConfig(neftune_noise_alpha=...)`). Neel Jain, Ping-yeh Chiang, Yuxin Wen, et al. *NEFTune: Noisy Embeddings Improve Instruction Finetuning.* ICLR 2024. [arXiv:2310.05914](https://arxiv.org/abs/2310.05914)
+
+---
+
+## Citation
+
+If you use scikit-lm in your research, please cite it. GitHub's "Cite this repository" button
+(backed by [`CITATION.cff`](CITATION.cff)) exports BibTeX and APA automatically, or use:
+
+```bibtex
+@software{dos_santos_silva_scikit_lm,
+  author  = {dos Santos Silva, Gabriel Francisco},
+  title   = {scikit-lm: scikit-learn estimators backed by language models},
+  version = {0.0.1},
+  year    = {2026},
+  url     = {https://github.com/ppgsi-lab/scikit-lm},
+  abstract = {scikit-lm provides scikit-learn-compatible estimators backed by a fine-tuned autoregressive language model for tabular data. A single mechanism underlies all of them: each row is serialized to text and the model is fine-tuned while the column order is permuted throughout training, so it learns the conditional distribution of any column given any subset of the others. From this one fitted model the library exposes four estimators (a classifier, a regressor, a missing-value imputer, and a minority-class oversampler), as well as conditional and unconditional tabular synthesis. It runs on Hugging Face Transformers or Apple MLX backends, while the core estimators depend only on the lightweight NumPy, pandas, and scikit-learn stack.}
+}
+```
 
 ---
 
