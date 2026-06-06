@@ -71,14 +71,18 @@ mlx-cuda13 = [
 tqdm = ["tqdm>=4.66"]
 # Live fine-tuning dashboard via RichCallbacks (loss curve through plotext).
 rich = ["rich>=13.0", "plotext>=5.2"]
+# Notebook-native live dashboard via JupyterCallback (loss curve drawn as inline SVG).
+jupyter = ["ipywidgets>=8.0"]
 optuna = [
     "optuna>=4.0",
     "optuna-integration>=4.0",
 ]
+# Plotting + Jupyter toolchain for the notebooks under examples/.
+examples = ["seaborn>=0.13", "jupyterlab>=4.0", "ipywidgets"]
 # Everything; platform markers in the referenced extras keep this resolvable
 # anywhere (mlx/mps-bitsandbytes drop off Linux, mlx-cpu/bitsandbytes drop off
 # macOS). The CUDA MLX variants stay opt-in so `all` never pulls CUDA libraries.
-all = ["scikit-lm[hf,quant,hqq,mlx,mlx-cpu,tqdm,rich,optuna]"]
+all = ["scikit-lm[hf,quant,hqq,mlx,mlx-cpu,tqdm,rich,jupyter,optuna,examples]"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]

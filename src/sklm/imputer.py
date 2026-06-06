@@ -29,7 +29,7 @@ from .base import (
     select_candidates,
     to_frame,
 )
-from .callbacks import predict_batches, resolve_callbacks
+from .callbacks import predict_batches
 from .config import DiscretizationConfig, GenerationConfig
 from .core import _ScoreSpec
 from .params import AnnotatedDefault, ImputerArgs, _FlatParams
@@ -74,8 +74,11 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
         Default ``3``.
     random_state : int or None, optional
         Seed forwarded to the backend and serializer.
-    callbacks : Callback or None, optional
-        Feedback hooks for fitting and inference. Default ``None`` (no-op).
+    callback : Callback, list of Callback or None, optional
+        Feedback hooks for fitting and inference. A list is wrapped in a
+        :class:`~sklm.CompositeCallback`. Default ``None`` auto-selects a
+        dashboard for the runtime environment (Jupyter, rich, or
+        logging).
     lora : LoRAConfig or None, optional
         Fine-tune with LoRA adapters when set; full-weight otherwise (default).
     quantization : {"2bit", "3bit", "4bit", "6bit", "8bit"}, QuantizationConfig or None, optional
@@ -191,7 +194,7 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
         original_columns = to_frame(X).columns
         work = align_features(self, X)
         out = work.copy()
-        cb = resolve_callbacks(self.callbacks)
+        cb = self.lm_.callback
         rows = records(work)
         knowns = [{c: row[c] for c in self.feature_cols_ if not is_missing(row[c])} for row in rows]
         targets = [[c for c in self.feature_cols_ if is_missing(row[c])] for row in rows]

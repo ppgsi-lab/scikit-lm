@@ -159,12 +159,12 @@ class HFBackend:
 
     def fit(
         self,
-        epoch_texts: Callable[[], list[TrainingExample]],
+        epoch_texts: Callable[[int], list[TrainingExample]],
         training: TrainingConfig,
         model_config: ModelConfig,
         *,
         random_state: int | None,
-        callbacks: Callback,
+        callback: Callback,
         eval_examples: list[TrainingExample] | None = None,
     ) -> None:
         from transformers import (
@@ -195,7 +195,7 @@ class HFBackend:
         seq_len = training.max_seq_length
         if seq_len is None:
             eos = tok.eos_token or ""
-            measured = [*epoch_texts(), *(eval_examples or [])]
+            measured = [*epoch_texts(0), *(eval_examples or [])]
             seq_len = resolve_max_seq_length(
                 measured, lambda text: len(tok(text + eos)["input_ids"])
             )
@@ -206,7 +206,7 @@ class HFBackend:
             output_dir = training.checkpoint_dir or tmp
             dataset = _text_dataset(epoch_texts, tok, seq_len)
             eval_dataset = (
-                _text_dataset(lambda: eval_examples, tok, seq_len) if eval_examples else None
+                _text_dataset(lambda _: eval_examples, tok, seq_len) if eval_examples else None
             )
             args = TrainingArguments(
                 **_training_kwargs(
@@ -222,7 +222,7 @@ class HFBackend:
 
             trainer_callbacks: list[Any] = [
                 _reshuffle_callback(dataset),
-                _loss_callback(callbacks, self._device_memory_bytes),
+                _loss_callback(callback, self._device_memory_bytes),
             ]
             if eval_dataset is not None and training.early_stopping_patience is not None:
                 trainer_callbacks.append(
@@ -495,29 +495,30 @@ def _reshuffle_callback(dataset: Any) -> Any:
     return _Reshuffle()
 
 
-def _loss_callback(callbacks: Callback, device_memory: Callable[[], int | None]) -> Any:
+def _loss_callback(callback: Callback, device_memory: Callable[[], int | None]) -> Any:
     """Build a ``TrainerCallback`` that forwards ``on_log`` loss and the current
-    device memory to ``callbacks`` (both at each logging step)."""
+    device memory to ``callback`` (both at each logging step)."""
     from transformers import TrainerCallback
 
     class _LossReport(TrainerCallback):
         def on_log(self, args: object, state: Any, control: object, **kw: Any) -> None:
             logs = kw.get("logs") or {}
             if "eval_loss" in logs:
-                callbacks.on_eval_report(
+                callback.on_eval_report(
                     step=state.global_step, loss=float(logs["eval_loss"]), epoch=state.epoch
                 )
                 return
             if "loss" not in logs:
                 return
-            callbacks.on_memory(device_memory())
+            callback.on_memory(device_memory())
             total = state.max_steps if state.max_steps and state.max_steps > 0 else None
-            callbacks.on_train_report(
+            callback.on_train_report(
                 step=state.global_step,
                 total_steps=total,
                 loss=float(logs["loss"]),
                 epoch=state.epoch,
                 learning_rate=logs.get("learning_rate"),
+                grad_norm=logs.get("grad_norm"),
             )
 
     return _LossReport()
@@ -634,13 +635,14 @@ def _causal_collator(tokenizer: Any) -> Callable[[list[dict[str, Any]]], dict[st
 
 
 def _text_dataset(
-    epoch_texts: Callable[[], list[TrainingExample]], tokenizer: Any, max_seq_length: int
+    epoch_texts: Callable[[int], list[TrainingExample]], tokenizer: Any, max_seq_length: int
 ) -> Any:
     """Build a torch map-style dataset over per-epoch (re)serialized rows.
 
-    ``reshuffle`` refreshes the buffer from ``epoch_texts`` so the column-order
-    permutation is redrawn at each epoch boundary (driven by a Trainer
-    callback). Tokenization is lazy in ``__getitem__``; the causal collator
+    ``reshuffle`` refreshes the buffer from ``epoch_texts`` for the next epoch
+    index so the column-order permutation is redrawn at each epoch boundary
+    (driven by a Trainer callback). Tokenization is lazy in ``__getitem__``; the
+    causal collator
     pads dynamically and builds the labels. When an example carries a non-empty
     ``prompt`` (loss-on-target-only), ``prompt_len`` records how many leading
     tokens the collator must mask, found as the longest common token prefix
@@ -652,10 +654,12 @@ def _text_dataset(
 
     class _TextDataset(TorchDataset):
         def __init__(self) -> None:
-            self._buffer = epoch_texts()
+            self._epoch = 0
+            self._buffer = epoch_texts(0)
 
         def reshuffle(self) -> None:
-            self._buffer = epoch_texts()
+            self._epoch += 1
+            self._buffer = epoch_texts(self._epoch)
 
         def __len__(self) -> int:
             return len(self._buffer)

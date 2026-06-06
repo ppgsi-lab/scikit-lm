@@ -277,7 +277,7 @@ rows = lm.complete_many(
 synth = pd.DataFrame([r for r in rows if r is not None])
 ```
 
-Sampling with `temperature > 0` is what gives the rows their diversity (greedy decoding would collapse every row to the same mode). Each result is a dict, or `None` if it stayed malformed after retries, so filter before building the frame. [`examples/08-synthesizer.py`](examples/08-synthesizer.py) runs the conditional path end to end and checks the synthesized per-feature moments and class balance against the real Iris table.
+Sampling with `temperature > 0` is what gives the rows their diversity (greedy decoding would collapse every row to the same mode). Each result is a dict, or `None` if it stayed malformed after retries, so filter before building the frame. [`examples/08-synthesizer.ipynb`](examples/08-synthesizer.ipynb) runs the conditional path end to end and checks the synthesized per-feature moments and class balance against the real Iris table.
 
 ---
 
@@ -457,7 +457,7 @@ search = GridSearchCV(pipe, {
 search.fit(X_train, y_train)
 ```
 
-The fixed hyperparameters are declared once on the estimator; only the swept fields go in the grid. The same pattern drives Optuna's `OptunaSearchCV` — see [`examples/06-optuna-search.py`](examples/06-optuna-search.py).
+The fixed hyperparameters are declared once on the estimator; only the swept fields go in the grid. The same pattern drives Optuna's `OptunaSearchCV` — see [`examples/06-optuna-search.ipynb`](examples/06-optuna-search.ipynb).
 
 Input handling follows scikit-learn conventions: DataFrame columns are matched by name and reordered to the training order at predict time; array input is accepted too. Fitted attributes end with `_` (`classes_`, `n_features_in_`, `feature_names_in_` — the last only for DataFrame input).
 
@@ -465,21 +465,27 @@ Input handling follows scikit-learn conventions: DataFrame columns are matched b
 
 ## Callbacks
 
-Pass a `callbacks=` object to watch fitting and inference. `Callback` is a concrete base class that folds the granular event stream into a running `TrainingState` and dispatches a single `on_event(state, event)` — subclass it and override `on_event`. Three implementations ship:
+Pass a `callback=` object to watch fitting and inference. `Callback` is a concrete base class that folds the granular event stream into a running `TrainingState` and dispatches a single `on_event(state, event)` — subclass it and override `on_event`. Four dashboards ship: `LoggingCallback`, `TqdmCallback` (`[tqdm]` extra), `RichCallback` (`[rich]` extra) and `JupyterCallback` (`[jupyter]` extra). Leave `callback` unset (the default) and one is auto-selected for the runtime environment — `JupyterCallback` in a Jupyter kernel, `RichCallback` when the `[rich]` extra is installed, otherwise `LoggingCallback`. Pass a list to drive several at once (wrapped in a `CompositeCallback`).
 
 ```python
 from sklm import LanguageModelClassifier, LoggingCallback, RichCallback, TqdmCallback
 
+# Default: a dashboard is auto-selected for the environment (Jupyter / rich / logging):
+LanguageModelClassifier()
+
 # Live progress bars (needs the [tqdm] extra); print a few serialized rows at fit start:
-LanguageModelClassifier(callbacks=TqdmCallback(n_train_examples=5))
+LanguageModelClassifier(callback=TqdmCallback(n_train_examples=5))
 
 # A live dashboard with an in-terminal loss curve (needs the [rich] extra):
-LanguageModelClassifier(callbacks=RichCallback())
+LanguageModelClassifier(callback=RichCallback())
 
 # Or route every event through the standard logging module:
 import logging
 logging.basicConfig(level=logging.INFO)
-LanguageModelClassifier(callbacks=LoggingCallback())
+LanguageModelClassifier(callback=LoggingCallback())
+
+# Several at once — wrapped in a CompositeCallback internally:
+LanguageModelClassifier(callback=[LoggingCallback(), RichCallback()])
 ```
 
 Every change arrives at `on_event` as an `Event` — `FitStart`, `TrainExamples`, `TrainReport`, `EvalReport`, `Memory`, `FitEnd`, `PredictStart`, `RowEnd`, `PredictEnd`, `Generation`, `Score`, `Retry` — alongside the running `TrainingState` (loss series, derived epoch, peak memory, …). `match` on the event to react; the state carries the aggregated history so a renderer never re-derives it:

@@ -126,12 +126,12 @@ class MLXBackend:
 
     def fit(
         self,
-        epoch_texts: Callable[[], list[TrainingExample]],
+        epoch_texts: Callable[[int], list[TrainingExample]],
         training: TrainingConfig,
         model_config: ModelConfig,
         *,
         random_state: int | None,
-        callbacks: Callback,
+        callback: Callback,
         eval_examples: list[TrainingExample] | None = None,
     ) -> None:
         import mlx.core as mx
@@ -156,7 +156,7 @@ class MLXBackend:
         tok = self._tokenizer
         seq_len = training.max_seq_length
         if seq_len is None:
-            measured = [*epoch_texts(), *(eval_examples or [])]
+            measured = [*epoch_texts(0), *(eval_examples or [])]
             seq_len = resolve_max_seq_length(measured, lambda text: len(tok.encode(text)) + 1)
             training = replace(training, max_seq_length=seq_len)
         self._max_seq_length = seq_len
@@ -170,7 +170,7 @@ class MLXBackend:
             )
         val_dataset = None
         if eval_examples:
-            val_dataset = _MLXTextDataset(lambda: eval_examples, self._tokenizer, seq_len)
+            val_dataset = _MLXTextDataset(lambda _: eval_examples, self._tokenizer, seq_len)
             if len(val_dataset) < training.batch_size:
                 raise ValueError(
                     f"MLXBackend needs at least batch_size={training.batch_size} validation rows, "
@@ -191,7 +191,7 @@ class MLXBackend:
         loss_fn = _make_loss(training.label_smoothing) if training.label_smoothing > 0 else None
         patience = training.early_stopping_patience
 
-        report = _loss_report_callback(callbacks, lm, iters, patience)
+        report = _loss_report_callback(callback, lm, optimizer, iters, patience)
         with tempfile.TemporaryDirectory(prefix="sklm_mlx_") as tmpdir:
             ckpt_dir = training.checkpoint_dir or tmpdir
             Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
@@ -334,22 +334,28 @@ class _MLXTextDataset:
     the number of leading tokens ``iterate_batches`` masks out of the loss
     (``0`` unless ``loss_on_target_only`` masks the row), found as the longest
     common token prefix between the example's prompt and full text. ``reshuffle``
-    re-draws the buffer from ``epoch_texts`` so the column-order permutation is
-    redrawn at each epoch boundary; tokenization is lazy and memoized per epoch.
+    re-draws the buffer from ``epoch_texts`` for the next epoch index so the
+    column-order permutation is redrawn at each epoch boundary; tokenization is
+    lazy and memoized per epoch.
     """
 
     def __init__(
-        self, epoch_texts: Callable[[], list[TrainingExample]], tokenizer: Any, max_seq_length: int
+        self,
+        epoch_texts: Callable[[int], list[TrainingExample]],
+        tokenizer: Any,
+        max_seq_length: int,
     ) -> None:
         self._epoch_texts = epoch_texts
         self._tok = tokenizer
         self._max = max_seq_length
         self._eos = tokenizer.eos_token_id
-        self._buffer = epoch_texts()
+        self._epoch = 0
+        self._buffer = epoch_texts(0)
         self._cache: dict[int, tuple[list[int], int]] = {}
 
     def reshuffle(self) -> None:
-        self._buffer = self._epoch_texts()
+        self._epoch += 1
+        self._buffer = self._epoch_texts(self._epoch)
         self._cache.clear()
 
     def __len__(self) -> int:
@@ -376,9 +382,14 @@ class _MLXTextDataset:
         return result
 
 
-def _loss_report_callback(callbacks: Callback, lm: Any, iters: int, patience: int | None) -> Any:
-    """Build an mlx-lm ``TrainingCallback`` that forwards train/val loss and the
-    current device memory to ``callbacks``.
+def _loss_report_callback(
+    callback: Callback, lm: Any, optimizer: Any, iters: int, patience: int | None
+) -> Any:
+    """Build an mlx-lm ``TrainingCallback`` that forwards train/val loss, the
+    gradient norm and the current device memory to ``callback``.
+
+    The gradient norm stays ``None`` when clipping is disabled
+    (``max_grad_norm`` unset), since nothing computes it then.
 
     When ``patience`` is set it also tracks the best validation snapshot for early
     stopping, exposed as ``.best`` for the caller to restore after training, and
@@ -398,18 +409,20 @@ def _loss_report_callback(callbacks: Callback, lm: Any, iters: int, patience: in
             self.no_improve = 0
 
         def on_train_loss_report(self, train_info: dict[str, Any]) -> None:
-            callbacks.on_memory(int(mx.get_active_memory()))
-            callbacks.on_train_report(
+            callback.on_memory(int(mx.get_active_memory()))
+            norm = optimizer.state.get("last_grad_norm")
+            callback.on_train_report(
                 step=int(train_info["iteration"]),
                 total_steps=iters,
                 loss=float(train_info["train_loss"]),
                 epoch=None,
                 learning_rate=train_info.get("learning_rate"),
+                grad_norm=float(norm.item()) if norm is not None else None,
             )
 
         def on_val_loss_report(self, val_info: dict[str, Any]) -> None:
             loss = float(val_info["val_loss"])
-            callbacks.on_eval_report(step=int(val_info["iteration"]), loss=loss, epoch=None)
+            callback.on_eval_report(step=int(val_info["iteration"]), loss=loss, epoch=None)
             if patience is None:
                 return
             if loss < self.best_loss - 1e-9:
@@ -479,6 +492,7 @@ def _make_iterate_batches(random_state: int | None) -> Callable[..., Iterator[An
 
 
 def _build_optimizer(training: TrainingConfig, iters: int, lr: float) -> Any:
+    import mlx.core as mx
     import mlx.optimizers as opt
 
     def main_schedule(n: int) -> Any:
@@ -530,13 +544,17 @@ def _build_optimizer(training: TrainingConfig, iters: int, lr: float) -> Any:
         max_norm = float(training.max_grad_norm)
 
         # ``train``'s compiled step never clips; the optimizer's ``update`` is
-        # the only hook, so clip the gradients there.
+        # the only hook, so clip there. The norm must land in ``optimizer.state``
+        # (seeded below): only arrays inside the captured ``state`` cross mlx's
+        # ``compile`` boundary -- a plain attribute is a traced array that dies
+        # outside it. This mirrors how the optimizer's own ``step`` survives.
         class _ClippedOptimizer(type(optimizer)):  # type: ignore[misc]  # dynamic base class
             def update(self, model: Any, gradients: Any) -> None:
-                gradients, _ = opt.clip_grad_norm(gradients, max_norm)
+                gradients, self.state["last_grad_norm"] = opt.clip_grad_norm(gradients, max_norm)
                 super().update(model, gradients)
 
         optimizer.__class__ = _ClippedOptimizer
+        optimizer.state["last_grad_norm"] = mx.array(0.0)
 
     return optimizer
 

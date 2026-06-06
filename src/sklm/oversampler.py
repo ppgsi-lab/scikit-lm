@@ -17,7 +17,6 @@ from imblearn.over_sampling.base import BaseOverSampler
 from imblearn.utils import check_target_type
 
 from .base import forget, make_tabular_lm, to_frame, unique_name
-from .callbacks import resolve_callbacks
 from .config import GenerationConfig
 from .params import AnnotatedDefault, OversamplerArgs, _FlatParams
 
@@ -54,8 +53,11 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
         Default ``3``.
     random_state : int or None, optional
         Seed forwarded to the backend and serializer.
-    callbacks : Callback or None, optional
-        Feedback hooks for fitting and inference. Default ``None`` (no-op).
+    callback : Callback, list of Callback or None, optional
+        Feedback hooks for fitting and inference. A list is wrapped in a
+        :class:`~sklm.CompositeCallback`. Default ``None`` auto-selects a
+        dashboard for the runtime environment (Jupyter, rich, or
+        logging).
     lora : LoRAConfig or None, optional
         Fine-tune with LoRA adapters when set; full-weight otherwise (default).
     quantization : {"2bit", "3bit", "4bit", "6bit", "8bit"}, QuantizationConfig or None, optional
@@ -152,7 +154,7 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
             )
         self.lm_ = make_tabular_lm(self).fit(frame)
 
-        cb = resolve_callbacks(self.callbacks)
+        cb = self.lm_.callback
         total = sum(self.sampling_strategy_.values())
         cb.on_predict_start(total)
         batch_size = self.generation.inference_batch_size or self.training.batch_size

@@ -94,7 +94,7 @@ class EstimatorArgs(TypedDict, total=False):
     serializer: Annotated[str | Serializer, AnnotatedDefault("json")]
     max_decimals: Annotated[int | None, AnnotatedDefault(3)]
     random_state: Annotated[int | None, AnnotatedDefault(None)]
-    callbacks: Annotated[Callback | None, AnnotatedDefault(None)]
+    callback: Annotated[Callback | list[Callback] | None, AnnotatedDefault(None)]
     lora: Annotated[LoRAConfig | None, AnnotatedDefault(None)]
     quantization: Annotated[Quantization | QuantizationConfig | None, AnnotatedDefault(None)]
     precision: Annotated[Precision, AnnotatedDefault("fp32")]
@@ -134,7 +134,7 @@ class _FlatParams:
     serializer: str | Serializer
     max_decimals: int | None
     random_state: int | None
-    callbacks: Callback | None
+    callback: Callback | list[Callback] | None
     lora: LoRAConfig | None
     quantization: Quantization | QuantizationConfig | None
     precision: Precision

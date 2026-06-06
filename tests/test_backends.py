@@ -75,9 +75,7 @@ def test_hf_generation_knobs() -> None:
     X.loc[0, "a"] = np.nan
     out = LanguageModelImputer(
         training=TrainingConfig(epochs=2, batch_size=8),
-        generation=GenerationConfig(
-            temperature=0.8, top_p=0.9, top_k=40, repetition_penalty=1.2
-        ),
+        generation=GenerationConfig(temperature=0.8, top_p=0.9, top_k=40, repetition_penalty=1.2),
         random_state=0,
     ).fit_transform(X)
     assert out.isna().sum().sum() == 0

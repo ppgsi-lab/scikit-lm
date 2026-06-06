@@ -70,20 +70,23 @@ class LanguageModelBackend(Protocol):
 
     def fit(
         self,
-        epoch_texts: Callable[[], list[TrainingExample]],
+        epoch_texts: Callable[[int], list[TrainingExample]],
         training: TrainingConfig,
         model_config: ModelConfig,
         *,
         random_state: int | None,
-        callbacks: Callback,
+        callback: Callback,
         eval_examples: list[TrainingExample] | None = None,
     ) -> None:
-        """Fine-tune ``model_config.model`` on serialized rows. ``epoch_texts()`` returns one
-        freshly (re-)permuted :class:`~sklm.TrainingExample` per training row and
-        is called once per epoch, so feature-order permutation stays dynamic
-        across epochs. Each example's ``prompt`` (empty unless
-        ``loss_on_target_only`` masks that row) is excluded from the loss.
-        ``callbacks`` receives training-loss reports.
+        """Fine-tune ``model_config.model`` on serialized rows. ``epoch_texts(epoch)``
+        returns one freshly (re-)permuted :class:`~sklm.TrainingExample` per training
+        row for the 0-indexed ``epoch``, so feature-order permutation stays dynamic
+        across epochs. The permutation is seeded on ``(seed, epoch)``: calling it
+        again with the same epoch yields identical examples, so the measurement
+        pre-pass and the epoch-0 dataset seed can both request epoch 0 without
+        diverging. Each example's ``prompt`` (empty unless ``loss_on_target_only``
+        masks that row) is excluded from the loss. ``callback`` receives
+        training-loss reports.
 
         ``eval_examples`` is the held-out validation set (``None`` when
         ``training.validation_split`` is ``0``): a fixed list serialized once, so

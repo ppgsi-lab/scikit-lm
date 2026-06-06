@@ -11,6 +11,7 @@ feature-order permutation, then exposes two conditional primitives:
 from __future__ import annotations
 
 import math
+import os
 import warnings
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -166,13 +167,13 @@ class TabularLanguageModel:
         Converts rows to and from text.
     training : TrainingConfig
         Fine-tuning hyperparameters handed to the backend.
-    model_config : ModelConfig
+    model : ModelConfig
         Model-loading configuration (including the model id) handed to the backend.
     random_state : int or None, optional
         Seed for the per-epoch column-permutation RNG.
     max_retries : int, optional
         Generation attempts per target value before giving up. Default ``15``.
-    callbacks : Callback, optional
+    callback : Callback, optional
         Feedback hooks; defaults to a no-op instance.
 
     Attributes
@@ -186,10 +187,16 @@ class TabularLanguageModel:
     backend: LanguageModelBackend = field(default_factory=HFBackend)
     serializer: Serializer = field(default_factory=JSONSerializer)
     training: TrainingConfig = field(default_factory=TrainingConfig)
-    model_config: ModelConfig = field(default_factory=ModelConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
     random_state: int | None = None
     max_retries: int = 15
-    callbacks: Callback = field(default_factory=Callback)
+    callback: Callback = field(default_factory=Callback)
+
+    def __getstate__(self) -> dict[str, object]:
+        # The callback is live observability (a dashboard may hold an open stream
+        # or logging handler) and not part of the model state; drop it so a fitted
+        # estimator stays picklable, restoring a no-op on load.
+        return {**self.__dict__, "callback": Callback()}
 
     def fit(self, frame: pd.DataFrame, *, target_cols: frozenset[str] = frozenset()) -> Self:
         """Fine-tune the backend on serialized rows.
@@ -223,7 +230,12 @@ class TabularLanguageModel:
             raise ValueError(f"duplicate column names are not supported: {duplicates}")
         self.columns_ = list(frame.columns)
         self.numeric_cols_ = frozenset(frame.select_dtypes(include="number").columns)
-        rng = np.random.default_rng(self.random_state)
+        # sklearn convention: random_state=None is non-deterministic. Draw one base
+        # seed per fit so each epoch's permutation is seeded on (base_seed, epoch) --
+        # idempotent within the fit, fresh across fits when None.
+        base_seed = (
+            self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
+        )
         masking = self.training.loss_on_target_only and bool(target_cols)
 
         def _ordered_fields(row: Mapping[str, object], order: Sequence[str]) -> list[Field]:
@@ -263,10 +275,15 @@ class TabularLanguageModel:
 
         aug = self.training.augmentation_factor
 
-        def epoch_texts() -> list[TrainingExample]:
+        def epoch_texts(epoch: int) -> list[TrainingExample]:
+            # Seed per epoch so the call is pure in ``epoch``: the backend requests
+            # epoch 0 twice (sequence-length measurement, then the dataset seed) and
+            # must get identical data, and the permutation stream must not depend on
+            # whether ``max_seq_length`` was auto-measured.
+            rng = np.random.default_rng([base_seed, epoch])
             examples = [ex for row in train_rows for ex in row_examples(row, rng, aug)]
             rng.shuffle(examples)
-            self.callbacks.on_train_examples(examples[:_TRAIN_PREVIEW])
+            self.callback.on_train_examples(examples[:_TRAIN_PREVIEW], epoch)
             return examples
 
         eval_examples: list[TrainingExample] | None = None
@@ -274,17 +291,17 @@ class TabularLanguageModel:
             eval_rng = np.random.default_rng(self.random_state)
             eval_examples = [ex for row in eval_rows for ex in row_examples(row, eval_rng, 1)]
 
-        self.callbacks.on_fit_info(self.model_config.model, self.training)
-        self.callbacks.on_fit_start(len(train_rows), self.training.epochs)
+        self.callback.on_fit_info(self.model.model, self.training)
+        self.callback.on_fit_start(len(train_rows), self.training.epochs)
         self.backend.fit(
             epoch_texts,
             self.training,
-            self.model_config,
+            self.model,
             random_state=self.random_state,
-            callbacks=self.callbacks,
+            callback=self.callback,
             eval_examples=eval_examples,
         )
-        self.callbacks.on_fit_end()
+        self.callback.on_fit_end()
         return self
 
     def _fields(self, known: Mapping[str, object]) -> list[Field]:
@@ -318,15 +335,15 @@ class TabularLanguageModel:
                 prompts = [requests[i][0] for i in chunk]
                 continuations = self.backend.generate(prompts, generation)
                 for i, continuation in zip(chunk, continuations, strict=True):
-                    self.callbacks.on_generation(requests[i][0], continuation, requests[i][1])
                     numeric = requests[i][1] in self.numeric_cols_
                     value = self.serializer.decode_value(continuation, numeric=numeric)
+                    self.callback.on_generation(requests[i][0], continuation, requests[i][1], value)
                     if value is None:
                         still.append(i)
                     else:
                         results[i] = value
             for i in still:
-                self.callbacks.on_retry(requests[i][1], attempt, self.max_retries)
+                self.callback.on_retry(requests[i][1], attempt, self.max_retries)
             pending = still
         return results
 
@@ -647,7 +664,7 @@ class TabularLanguageModel:
                 proba[i] = pooled / total if total > 0 else np.full(n_cand, 1.0 / n_cand)
             else:
                 proba[i] = np.mean(dists, axis=0)
-            self.callbacks.on_score(
+            self.callback.on_score(
                 prompts,
                 candidates,
                 [d.tolist() for d in dists],

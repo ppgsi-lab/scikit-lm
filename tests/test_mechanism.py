@@ -46,7 +46,7 @@ def _fit(
             epochs=1,
             loss_on_target_only=loss_on_target_only,
         ),
-        model_config=ModelConfig(model="m"),
+        model=ModelConfig(model="m"),
         random_state=random_state,
     )
     lm.fit(frame, target_cols=frozenset(target_cols) if target_cols else frozenset())
@@ -160,7 +160,7 @@ def _lm(backend: FakeBackend) -> TabularLanguageModel:
         backend=backend,
         serializer=JSONSerializer(),
         training=TrainingConfig(epochs=1),
-        model_config=ModelConfig(model="m"),
+        model=ModelConfig(model="m"),
         random_state=0,
     )
 

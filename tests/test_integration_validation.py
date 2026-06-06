@@ -63,7 +63,7 @@ def _eval_reports_fire(model: str, backend: str) -> None:
         model=model,
         backend=backend,
         training=TrainingConfig(epochs=2, batch_size=8, validation_split=0.25),
-        callbacks=rec,
+        callback=rec,
         random_state=0,
     )
     clf.fit(X, y)
@@ -88,7 +88,7 @@ def _early_stopping_stops_short(model: str, backend: str) -> None:
             stratify=False,
             early_stopping_patience=2,
         ),
-        callbacks=rec,
+        callback=rec,
         random_state=0,
     )
     clf.fit(X, y)

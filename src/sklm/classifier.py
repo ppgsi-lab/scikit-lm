@@ -17,7 +17,7 @@ from sklearn.utils.multiclass import check_classification_targets
 from sklearn.utils.validation import check_is_fitted
 
 from .base import align_features, forget, make_tabular_lm, records, to_frame, unique_name
-from .callbacks import predict_batches, resolve_callbacks
+from .callbacks import predict_batches
 from .params import AnnotatedDefault, EstimatorArgs, _FlatParams
 from .serialize import is_missing
 
@@ -52,8 +52,11 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
         Default ``3``.
     random_state : int or None, optional
         Seed forwarded to the backend and serializer.
-    callbacks : Callback or None, optional
-        Feedback hooks for fitting and inference. Default ``None`` (no-op).
+    callback : Callback, list of Callback or None, optional
+        Feedback hooks for fitting and inference. A list is wrapped in a
+        :class:`~sklm.CompositeCallback`. Default ``None`` auto-selects a
+        dashboard for the runtime environment (Jupyter, rich, or
+        logging).
     lora : LoRAConfig or None, optional
         Fine-tune with LoRA adapters when set; full-weight otherwise (default).
     quantization : {"2bit", "3bit", "4bit", "6bit", "8bit"}, QuantizationConfig or None, optional
@@ -154,7 +157,7 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
         check_is_fitted(self)
         rows = self._known_rows(X)
         candidates = list(self.classes_)
-        cb = resolve_callbacks(self.callbacks)
+        cb = self.lm_.callback
         knowns = [{c: v for c, v in row.items() if not is_missing(v)} for row in rows]
         batch_size = self.generation.inference_batch_size or self.training.batch_size
         proba = np.empty((len(rows), len(candidates)))

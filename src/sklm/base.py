@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .backend import LanguageModelBackend
-from .callbacks import Callback, resolve_callbacks
+from .callbacks import Callback, resolve_callback
 from .config import (
     DiscretizationConfig,
     LoRAConfig,
@@ -53,7 +53,7 @@ class _HasBackendParams(Protocol):
     serializer: str | Serializer
     max_decimals: int | None
     random_state: int | None
-    callbacks: Callback | None
+    callback: Callback | list[Callback] | None
     lora: LoRAConfig | None
     quantization: Quantization | QuantizationConfig | None
     precision: Precision
@@ -253,7 +253,7 @@ def make_tabular_lm(estimator: _HasBackendParams) -> TabularLanguageModel:
         backend=resolve_backend(estimator.backend),
         serializer=resolve_serializer(estimator.serializer, estimator.max_decimals),
         training=estimator.training,
-        model_config=ModelConfig(
+        model=ModelConfig(
             model=estimator.model,
             lora=estimator.lora,
             quantization=resolve_quantization(estimator.quantization),
@@ -264,7 +264,7 @@ def make_tabular_lm(estimator: _HasBackendParams) -> TabularLanguageModel:
             attn_implementation=estimator.attn_implementation,
         ),
         random_state=estimator.random_state,
-        callbacks=resolve_callbacks(estimator.callbacks),
+        callback=resolve_callback(estimator.callback),
     )
 
 

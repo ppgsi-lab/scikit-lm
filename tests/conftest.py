@@ -43,16 +43,16 @@ class FakeBackend:
 
     def fit(
         self,
-        epoch_texts: Callable[[], list],
+        epoch_texts: Callable[[int], list],
         training: object,
         model_config: object,
         *,
         random_state: int | None,
-        callbacks: object = None,
+        callback: object = None,
         eval_examples: list | None = None,
     ) -> None:
         self.fit_calls += 1
-        examples = epoch_texts()
+        examples = epoch_texts(0)
         self.last_examples = examples
         self.last_epoch_texts = [ex.text for ex in examples]
         self.last_eval_examples = eval_examples
@@ -163,7 +163,7 @@ _BACKENDS = [
             deterministic=False,
             backend=lambda: "huggingface",
             model="distilgpt2",
-            training=TrainingConfig(epochs=4, batch_size=4),
+            training=TrainingConfig(epochs=6, batch_size=4),
             generation=GenerationConfig(),
         ),
         id="hf",
