@@ -163,11 +163,11 @@ class MLXBackend:
         lm = self._model
 
         dataset = _MLXTextDataset(epoch_texts, self._tokenizer, seq_len)
+        # mlx_lm's batcher needs a full batch per step; clamp batch_size down to the
+        # dataset size so tiny inputs (down to sklearn's 1-row conformance checks)
+        # still train, the way HFBackend's Trainer already does.
         if len(dataset) < training.batch_size:
-            raise ValueError(
-                f"MLXBackend needs at least batch_size={training.batch_size} rows, "
-                f"got {len(dataset)}."
-            )
+            training = replace(training, batch_size=len(dataset))
         val_dataset = None
         if eval_examples:
             val_dataset = _MLXTextDataset(lambda _: eval_examples, self._tokenizer, seq_len)

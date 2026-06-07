@@ -10,6 +10,7 @@ from typing import Literal, Protocol
 
 import numpy as np
 import pandas as pd
+from sklearn.utils.validation import check_array
 
 from .backend import LanguageModelBackend
 from .callbacks import Callback, resolve_callback
@@ -281,12 +282,18 @@ def forget(obj: object, name: str) -> None:
 
 def to_frame(X: object, columns: Sequence[str] | None = None) -> pd.DataFrame:
     """Coerce array-like input to a DataFrame, naming columns ``x0..`` (or with
-    ``columns``) when the input is not already a DataFrame."""
+    ``columns``) when the input is not already a DataFrame.
+
+    Non-DataFrame input is validated with scikit-learn's ``check_array`` in a mode
+    that still admits string/categorical cells and NaN (``dtype=None``,
+    ``ensure_all_finite=False``), so sparse, complex, empty, and 1-D inputs are
+    rejected with scikit-learn's standard messages while text tables pass through.
+    """
     if isinstance(X, pd.DataFrame):
         return X
+    # dtype=None keeps string/object cells & NaN; sklearn infers check_array's dtype as str
+    check_array(X, dtype=None, ensure_all_finite=False)  # pyright: ignore[reportArgumentType]
     arr = np.asarray(X)
-    if arr.ndim != 2:
-        raise ValueError("X must be 2-dimensional")
     names = list(columns) if columns is not None else [f"x{i}" for i in range(arr.shape[1])]
     return pd.DataFrame(arr, columns=names)
 
@@ -313,7 +320,10 @@ def align_features(estimator: _Fitted, X: object) -> pd.DataFrame:
     names = getattr(estimator, "feature_names_in_", None)
     X_df = to_frame(X, names)
     if X_df.shape[1] != estimator.n_features_in_:
-        raise ValueError(f"X has {X_df.shape[1]} features, expected {estimator.n_features_in_}")
+        raise ValueError(
+            f"X has {X_df.shape[1]} features, but {type(estimator).__name__} "
+            f"is expecting {estimator.n_features_in_} features as input."
+        )
     if isinstance(X, pd.DataFrame) and names is not None:
         absent = [c for c in names if c not in X_df.columns]
         if absent:

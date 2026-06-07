@@ -14,7 +14,7 @@ import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils import Tags
 from sklearn.utils.multiclass import check_classification_targets
-from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.validation import check_is_fitted, column_or_1d
 
 from .base import align_features, forget, make_tabular_lm, records, to_frame, unique_name
 from .callbacks import predict_batches
@@ -117,7 +117,7 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
             an unknown string selector.
         """
         X_df = to_frame(X)
-        y_arr = np.asarray(y)
+        y_arr = column_or_1d(y, warn=True)
         check_classification_targets(y_arr)
         self.classes_ = np.unique(y_arr)
         self.n_features_in_ = X_df.shape[1]

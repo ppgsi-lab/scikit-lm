@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.utils import Tags
-from sklearn.utils.validation import check_is_fitted
+from sklearn.utils.validation import check_is_fitted, column_or_1d
 
 from .base import (
     align_features,
@@ -134,7 +134,7 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
             (the target supervises training and cannot be missing).
         """
         X_df = to_frame(X)
-        y_arr = np.asarray(y, dtype=float)
+        y_arr = np.asarray(column_or_1d(y, warn=True), dtype=float)
         if not np.isfinite(y_arr).all():
             raise ValueError("Input y contains NaN or infinite values; y must be finite")
         self.n_features_in_ = X_df.shape[1]
