@@ -151,7 +151,13 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
         self.lm_ = make_tabular_lm(self).fit(frame, target_cols=frozenset({self.target_col_}))
         return self
 
-    def predict(self, X: object) -> np.ndarray:
+    def predict(
+        self,
+        X: object,
+        *,
+        discretization: DiscretizationConfig | None = None,
+        generation: GenerationConfig | None = None,
+    ) -> np.ndarray:
         """Predict the continuous target for each row.
 
         With ``discretization`` off (default) the target is the mean of
@@ -163,6 +169,13 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
         ----------
         X : array-like or pandas.DataFrame of shape (n_samples, n_features)
             Feature table.
+        discretization : DiscretizationConfig, optional
+            Per-call override of the estimator's ``discretization``. ``None``
+            (default) uses the fitted estimator's attribute; passing a config
+            switches decoders for this call only, without mutating the estimator.
+        generation : GenerationConfig, optional
+            Per-call override of the estimator's ``generation``, with the same
+            fall-back-to-attribute semantics as ``discretization``.
 
         Returns
         -------
@@ -179,29 +192,31 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
             path always yields a distribution, so it never raises this.
         """
         check_is_fitted(self)
+        discretization = self.discretization if discretization is None else discretization
+        generation = self.generation if generation is None else generation
         rows = records(align_features(self, X))
         cb = self.lm_.callback
         knowns = [{c: v for c, v in row.items() if not is_missing(v)} for row in rows]
-        batch_size = self.generation.inference_batch_size or self.training.batch_size
+        batch_size = generation.inference_batch_size or self.training.batch_size
         preds = np.empty(len(rows))
-        if self.discretization.bins:
-            candidates = select_candidates(self.target_values_, self.discretization)
+        if discretization.bins:
+            candidates = select_candidates(self.target_values_, discretization)
             for start, stop in predict_batches(cb, len(rows), batch_size):
                 proba = self.lm_.predict_proba_many(
-                    knowns[start:stop], self.target_col_, candidates, self.generation
+                    knowns[start:stop], self.target_col_, candidates, generation
                 )
                 for j in range(proba.shape[0]):
-                    preds[start + j] = reduce_estimate(proba[j], candidates, self.discretization)
+                    preds[start + j] = reduce_estimate(proba[j], candidates, discretization)
             return preds
         for start, stop in predict_batches(cb, len(rows), batch_size):
             chunk = knowns[start:stop]
             outs = self.lm_.sample_aggregate_many(
-                chunk, [[self.target_col_]] * len(chunk), self.generation
+                chunk, [[self.target_col_]] * len(chunk), generation
             )
             for j, out in enumerate(outs):
                 if out is None:
                     raise RuntimeError(
-                        f"all {self.generation.n_samples} generated samples for row "
+                        f"all {generation.n_samples} generated samples for row "
                         f"{start + j} were malformed after {self.lm_.max_retries} retries "
                         "each; the model is not producing valid numeric values"
                     )

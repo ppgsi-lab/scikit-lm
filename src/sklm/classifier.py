@@ -18,6 +18,7 @@ from sklearn.utils.validation import check_is_fitted, column_or_1d
 
 from .base import align_features, forget, make_tabular_lm, records, to_frame, unique_name
 from .callbacks import predict_batches
+from .config import GenerationConfig
 from .params import AnnotatedDefault, EstimatorArgs, _FlatParams
 from .serialize import is_missing
 
@@ -136,13 +137,18 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
     def _known_rows(self, X: object) -> list[dict[str, object]]:
         return records(align_features(self, X))
 
-    def predict_proba(self, X: object) -> np.ndarray:
+    def predict_proba(self, X: object, *, generation: GenerationConfig | None = None) -> np.ndarray:
         """Return class probabilities, with columns ordered as ``classes_``.
 
         Parameters
         ----------
         X : array-like or pandas.DataFrame of shape (n_samples, n_features)
             Feature table.
+        generation : GenerationConfig, optional
+            Per-call override of the estimator's ``generation``. ``None``
+            (default) uses the fitted estimator's attribute; passing a config
+            (e.g. to change order marginalization or the scoring batch) applies
+            to this call only, without mutating the estimator.
 
         Returns
         -------
@@ -155,32 +161,36 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
             If ``X``'s feature count does not match what was seen at fit.
         """
         check_is_fitted(self)
+        generation = self.generation if generation is None else generation
         rows = self._known_rows(X)
         candidates = list(self.classes_)
         cb = self.lm_.callback
         knowns = [{c: v for c, v in row.items() if not is_missing(v)} for row in rows]
-        batch_size = self.generation.inference_batch_size or self.training.batch_size
+        batch_size = generation.inference_batch_size or self.training.batch_size
         proba = np.empty((len(rows), len(candidates)))
         for start, stop in predict_batches(cb, len(rows), batch_size):
             proba[start:stop] = self.lm_.predict_proba_many(
-                knowns[start:stop], self.target_col_, candidates, self.generation
+                knowns[start:stop], self.target_col_, candidates, generation
             )
         return proba
 
-    def predict(self, X: object) -> np.ndarray:
+    def predict(self, X: object, *, generation: GenerationConfig | None = None) -> np.ndarray:
         """Return the most likely label per row.
 
         Parameters
         ----------
         X : array-like or pandas.DataFrame of shape (n_samples, n_features)
             Feature table.
+        generation : GenerationConfig, optional
+            Per-call override of the estimator's ``generation``, forwarded to
+            :meth:`predict_proba`; ``None`` (default) uses the fitted attribute.
 
         Returns
         -------
         numpy.ndarray of shape (n_samples,)
             Predicted labels drawn from ``classes_``.
         """
-        proba = self.predict_proba(X)
+        proba = self.predict_proba(X, generation=generation)
         return self.classes_[np.argmax(proba, axis=1)]
 
     @override

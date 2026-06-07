@@ -168,13 +168,26 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
                     f"discretization can only score numeric columns; {col!r} is not numeric"
                 )
 
-    def transform(self, X: object) -> pd.DataFrame | np.ndarray:
+    def transform(
+        self,
+        X: object,
+        *,
+        generation: GenerationConfig | None = None,
+        discretization: DiscretizationConfig | Mapping[str, DiscretizationConfig] | None = None,
+    ) -> pd.DataFrame | np.ndarray:
         """Return ``X`` with every NaN filled.
 
         Parameters
         ----------
         X : array-like or pandas.DataFrame of shape (n_samples, n_features)
             Feature table to impute.
+        generation : GenerationConfig, optional
+            Per-call override of the estimator's ``generation``. ``None``
+            (default) uses the fitted estimator's attribute; passing a config
+            applies to this call only, without mutating the estimator.
+        discretization : DiscretizationConfig or Mapping[str, DiscretizationConfig], optional
+            Per-call override of the estimator's ``discretization``, with the same
+            fall-back-to-attribute semantics as ``generation``.
 
         Returns
         -------
@@ -191,6 +204,8 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
             value, so they never trigger this.
         """
         check_is_fitted(self)
+        generation = self.generation if generation is None else generation
+        discretization = self.discretization if discretization is None else discretization
         original_columns = to_frame(X).columns
         work = align_features(self, X)
         out = work.copy()
@@ -198,8 +213,8 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
         rows = records(work)
         knowns = [{c: row[c] for c in self.feature_cols_ if not is_missing(row[c])} for row in rows]
         targets = [[c for c in self.feature_cols_ if is_missing(row[c])] for row in rows]
-        batch_size = self.generation.inference_batch_size or self.training.batch_size
-        scored = resolve_discretization(self.discretization, self.lm_.numeric_cols_)
+        batch_size = generation.inference_batch_size or self.training.batch_size
+        scored = resolve_discretization(discretization, self.lm_.numeric_cols_)
         score = {
             col: _ScoreSpec(
                 select_candidates(self.column_values_[col], cfg),
@@ -210,11 +225,11 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
         for start, stop in predict_batches(cb, len(rows), batch_size):
             if score:
                 filled = self.lm_.impute_many(
-                    knowns[start:stop], targets[start:stop], self.generation, score=score
+                    knowns[start:stop], targets[start:stop], generation, score=score
                 )
             else:
                 filled = self.lm_.sample_aggregate_many(
-                    knowns[start:stop], targets[start:stop], self.generation
+                    knowns[start:stop], targets[start:stop], generation
                 )
             for j, i in enumerate(range(start, stop)):
                 row = filled[j]
