@@ -18,6 +18,9 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Protocol, runtime_checkable
 
+import numpy as np
+import pandas as pd
+
 __all__ = [
     "BracketSerializer",
     "Field",
@@ -130,16 +133,17 @@ class NumberFormat(Protocol):
 
 
 def is_missing(value: object) -> bool:
-    """Return whether ``value`` is missing or non-finite (``None``/NaN/inf).
+    """Return whether ``value`` is missing or non-finite (``None``/NaN/NaT/inf).
 
     Such values are never serialized: training drops them and inference
-    conditions only on the remaining observed cells.
+    conditions only on the remaining observed cells. The scalar missing check is
+    pandas' ``isna`` (covering ``None``, NaN and ``NaT``), extended so that
+    non-finite floats (``inf``/``-inf``, not missing under ``isna``) also count
+    as missing.
     """
-    if value is None:
-        return True
     if isinstance(value, float):
         return not math.isfinite(value)
-    return False
+    return bool(pd.isna(value))
 
 
 def _round(value: float, max_decimals: int | None) -> float:
@@ -156,10 +160,23 @@ def _round(value: float, max_decimals: int | None) -> float:
 
 def _digits(value: object, max_decimals: int | None) -> str:
     """Text for a numeric cell: a float-typed value keeps a decimal point even
-    when whole (``7.0``); an integer-typed value renders without one (``7``)."""
+    when whole (``7.0``); an integer-typed value renders without one (``7``).
+
+    NumPy scalars are unboxed first: ``np.float64`` is a ``float`` subclass
+    whose ``repr`` is ``"np.float64(1.5)"`` on NumPy >= 2, which would corrupt
+    the serialized text silently. Anything that is not a number after unboxing
+    raises rather than degrading into garbage prompt text.
+    """
+    if isinstance(value, np.generic):
+        value = value.item()
     if isinstance(value, float):
         return repr(_round(value, max_decimals))
-    return str(value)
+    if isinstance(value, int):
+        return str(value)
+    raise TypeError(
+        f"cannot encode {value!r} ({type(value).__name__}) as a numeric cell; "
+        "expected a Python or NumPy number"
+    )
 
 
 @dataclass(frozen=True, slots=True)

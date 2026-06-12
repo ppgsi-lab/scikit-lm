@@ -17,8 +17,6 @@ abstract: >-
   and unconditional tabular synthesis. It runs on Hugging Face Transformers or
   Apple MLX backends, while the core estimators depend only on the lightweight
   NumPy, pandas, and scikit-learn stack.
-version: 0.0.1
-date-released: "2026-06-03"
 repository-code: "https://github.com/ppgsi-lab/scikit-lm"
 url: "https://github.com/ppgsi-lab/scikit-lm"
 license: MIT

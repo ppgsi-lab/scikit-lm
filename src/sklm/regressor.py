@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.utils import Tags
-from sklearn.utils.validation import check_is_fitted, column_or_1d
+from sklearn.utils.validation import check_consistent_length, check_is_fitted, column_or_1d
 
 from .base import (
     align_features,
@@ -59,7 +59,8 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
         instead of generating and averaging. Default off (``bins=0``), keeping
         the generative path.
     serializer : str or Serializer, optional
-        ``"json"`` or a custom :class:`~sklm.Serializer`. Default ``"json"``.
+        ``"json"``, ``"key-value"``, ``"bracket"``, or a custom
+        :class:`~sklm.Serializer`. Default ``"json"``.
     max_decimals : int or None, optional
         Round numeric cells to at most this many decimal places when
         serializing. Applies only to the string ``serializer`` selectors; a
@@ -108,7 +109,10 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
 
     def __init__(self, model: str = "distilgpt2", **kwargs: Unpack[RegressorArgs]) -> None:
         self.model = model
-        for key, value in AnnotatedDefault.create_with_defaults(RegressorArgs, **kwargs).items():
+        defaults = AnnotatedDefault.create_with_defaults(
+            RegressorArgs, valid_params=self._get_param_names(), **kwargs
+        )
+        for key, value in defaults.items():
             setattr(self, key, value)
 
     def fit(self, X: object, y: object) -> Self:
@@ -135,6 +139,7 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
         """
         X_df = to_frame(X)
         y_arr = np.asarray(column_or_1d(y, warn=True), dtype=float)
+        check_consistent_length(X_df, y_arr)
         if not np.isfinite(y_arr).all():
             raise ValueError("Input y contains NaN or infinite values; y must be finite")
         self.n_features_in_ = X_df.shape[1]
@@ -203,7 +208,11 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
             candidates = select_candidates(self.target_values_, discretization)
             for start, stop in predict_batches(cb, len(rows), batch_size):
                 proba = self.lm_.predict_proba_many(
-                    knowns[start:stop], self.target_col_, candidates, generation
+                    knowns[start:stop],
+                    self.target_col_,
+                    candidates,
+                    generation,
+                    row_ids=range(start, stop),
                 )
                 for j in range(proba.shape[0]):
                     preds[start + j] = reduce_estimate(proba[j], candidates, discretization)
@@ -211,7 +220,7 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
         for start, stop in predict_batches(cb, len(rows), batch_size):
             chunk = knowns[start:stop]
             outs = self.lm_.sample_aggregate_many(
-                chunk, [[self.target_col_]] * len(chunk), generation
+                chunk, [[self.target_col_]] * len(chunk), generation, row_ids=range(start, stop)
             )
             for j, out in enumerate(outs):
                 if out is None:

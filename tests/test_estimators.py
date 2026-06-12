@@ -9,6 +9,7 @@ deterministic fake backend.
 
 from __future__ import annotations
 
+import pickle
 from collections.abc import Sequence
 
 import numpy as np
@@ -18,6 +19,7 @@ from sklearn.exceptions import NotFittedError
 
 from sklm import (
     BracketSerializer,
+    Callback,
     Field,
     GenerationConfig,
     KeyValueSerializer,
@@ -25,6 +27,7 @@ from sklm import (
     LanguageModelImputer,
     LanguageModelOverSampler,
     LanguageModelRegressor,
+    LoggingCallback,
     Serializer,
     TrainingConfig,
 )
@@ -297,6 +300,20 @@ def test_imputer_accepts_builtin_non_json_serializers(serializer: Serializer, na
     assert out.isna().sum().sum() == 0
 
 
+def test_pickle_drops_live_callback_and_keeps_imputing(nan_data) -> None:
+    """Pickling a fitted estimator restores a no-op ``Callback`` on the inner
+    model (a live callback may hold an open stream) while transform still works."""
+    backend = FakeBackend()
+    imp = LanguageModelImputer(backend=backend, callback=LoggingCallback()).fit(nan_data)
+    # the fake records the live epoch_texts closure for white-box assertions;
+    # closures don't pickle, so drop the recording before the round-trip
+    backend.epoch_texts = None
+    restored = pickle.loads(pickle.dumps(imp))
+    assert type(restored.lm_.callback) is Callback
+    out = restored.transform(nan_data)
+    assert out.isna().sum().sum() == 0
+
+
 # --- oversampler ----------------------------------------------------------
 
 
@@ -328,6 +345,13 @@ def test_oversampler_preserves_float_columns() -> None:
     X_res = result[0]
     synthetic = X_res.iloc[len(X) :]
     assert (synthetic["weight"] == 2.5).all()  # float round-trips, not rounded to 2 or 3
+
+
+def test_oversampler_raises_when_generation_stays_malformed(imbalanced_data) -> None:
+    X, y = imbalanced_data
+    over = LanguageModelOverSampler(backend=FakeBackend(value="garbage"))
+    with pytest.raises(RuntimeError, match="not producing valid rows"):
+        over.fit_resample(X, y)
 
 
 def test_oversampler_warns_on_loss_on_target_only(imbalanced_data) -> None:

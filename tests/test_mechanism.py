@@ -14,6 +14,7 @@ from collections.abc import Sequence
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.exceptions import NotFittedError
 
 from sklm import (
     GenerationConfig,
@@ -26,7 +27,7 @@ from sklm import (
     TrainingConfig,
 )
 
-from .conftest import FakeBackend
+from .conftest import FakeBackend, _stable
 
 
 def _fit(
@@ -86,6 +87,40 @@ def test_permutation_is_reproducible_across_fits() -> None:
 def test_invalid_factor_raises() -> None:
     with pytest.raises(ValueError, match="augmentation_factor"):
         TrainingConfig(augmentation_factor=0)
+
+
+# --- epoch_texts contract --------------------------------------------------
+
+
+def _fitted_fake(frame: pd.DataFrame) -> FakeBackend:
+    fake = FakeBackend()
+    TabularLanguageModel(
+        backend=fake,
+        serializer=JSONSerializer(),
+        training=TrainingConfig(epochs=2),
+        model=ModelConfig(model="m"),
+        random_state=0,
+    ).fit(frame)
+    return fake
+
+
+def test_epoch_texts_is_pure_within_an_epoch() -> None:
+    # both real backends call epoch_texts(0) twice (max_seq_length pre-pass,
+    # then the dataset) and rely on getting identical data back
+    frame = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"], "c": [4.0, 5.0, 6.0]})
+    fake = _fitted_fake(frame)
+    assert fake.epoch_texts is not None
+    assert [ex.text for ex in fake.epoch_texts(0)] == [ex.text for ex in fake.epoch_texts(0)]
+
+
+def test_epoch_texts_repermutes_column_order_across_epochs() -> None:
+    frame = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"], "c": [4.0, 5.0, 6.0]})
+    fake = _fitted_fake(frame)
+    assert fake.epoch_texts is not None
+    # sorting removes the example shuffle, so any difference is a column-order change
+    epoch0 = sorted(ex.text for ex in fake.epoch_texts(0))
+    epoch1 = sorted(ex.text for ex in fake.epoch_texts(1))
+    assert epoch0 != epoch1
 
 
 # --- loss_on_target_only masking -----------------------------------------
@@ -227,6 +262,67 @@ def test_sample_aggregate_permutes_conditioning_order_per_draw() -> None:
     assert len(set(fake.prompts)) > 1
 
 
+# --- whole-row sampling (sample) -------------------------------------------
+
+
+def test_fit_records_sklearn_ceremony() -> None:
+    lm = _lm(FakeBackend())
+    lm.fit(pd.DataFrame({"age": [1.0, 2.0], "city": ["SP", "RJ"]}))
+    assert lm.n_features_in_ == 2
+    assert list(lm.feature_names_in_) == ["age", "city"]
+    lm.fit(np.array([[1.0, 2.0], [3.0, 4.0]]))
+    assert lm.n_features_in_ == 2
+    assert not hasattr(lm, "feature_names_in_")
+    assert lm.columns_ == ["x0", "x1"]
+
+
+def test_sample_returns_n_rows_in_training_column_order() -> None:
+    lm = _lm(FakeBackend(value="1.5"))
+    lm.fit(pd.DataFrame({"age": [10.0, 20.0], "score": [0.1, 0.2]}))
+    out = lm.sample(3)
+    assert list(out.columns) == ["age", "score"]
+    assert out.shape == (3, 2)
+    assert out.dtypes.map(pd.api.types.is_float_dtype).all()
+    assert (out == 1.5).all().all()
+
+
+def test_sample_broadcasts_a_single_condition_mapping() -> None:
+    lm = _lm(FakeBackend(value="1.5"))
+    lm.fit(pd.DataFrame({"age": [10.0, 20.0], "city": ["SP", "RJ"]}))
+    out = lm.sample(4, condition={"city": "SP"})
+    assert list(out.columns) == ["age", "city"]
+    assert (out["city"] == "SP").all()
+    assert (out["age"] == 1.5).all()
+
+
+def test_sample_condition_sequence_gives_one_row_each() -> None:
+    lm = _lm(FakeBackend(value="1.5"))
+    lm.fit(pd.DataFrame({"age": [10.0, 20.0], "city": ["SP", "RJ"]}))
+    out = lm.sample(condition=[{"city": "SP"}, {"city": "RJ"}, {"city": "SP"}])
+    assert out["city"].tolist() == ["SP", "RJ", "SP"]
+    assert len(out) == 3
+
+
+def test_sample_rejects_condition_on_unseen_column() -> None:
+    lm = _lm(FakeBackend(value="1.5"))
+    lm.fit(pd.DataFrame({"age": [10.0, 20.0]}))
+    with pytest.raises(ValueError, match="not seen at fit"):
+        lm.sample(2, condition={"bogus": 1})
+
+
+def test_sample_raises_when_rows_stay_malformed() -> None:
+    lm = _lm(FakeBackend(value="garbage"))
+    lm.max_retries = 2
+    lm.fit(pd.DataFrame({"age": [10.0, 20.0]}))
+    with pytest.raises(RuntimeError, match="malformed"):
+        lm.sample(2)
+
+
+def test_sample_requires_fit() -> None:
+    with pytest.raises(NotFittedError):
+        _lm(FakeBackend()).sample(1)
+
+
 # --- classifier order marginalization (permute_order on the score path) ----
 
 
@@ -275,6 +371,102 @@ def test_classifier_permute_order_scores_multiple_column_orders(clf_data) -> Non
     clf.generation = GenerationConfig(permute_order=True, n_samples=4)
     clf.predict_proba(X.head(1))
     assert len(set(fake.scored_prompts)) > 1
+
+
+class _PromptSensitiveBackend(FakeBackend):
+    """Hash the prompt into every result, so outputs expose which orders were drawn."""
+
+    def score(self, prompts: Sequence[str], continuations: Sequence[str]) -> list[float]:
+        self.score_batches.append(len(prompts))
+        return [-_stable(p + c) for p, c in zip(prompts, continuations, strict=True)]
+
+    def generate(self, prompts: Sequence[str], generation: object) -> list[str]:
+        self.generate_batches.append(len(prompts))
+        return [repr(round(_stable(p) % 100, 3)) for p in prompts]
+
+
+def test_classifier_order_marginalization_is_batch_size_invariant(clf_data) -> None:
+    # regression: order draws are seeded per row identity, not per stream position
+    X, y = clf_data
+    clf = LanguageModelClassifier(backend=_PromptSensitiveBackend(), random_state=0).fit(X, y)
+    clf.generation = GenerationConfig(permute_order=True, n_samples=4, inference_batch_size=1)
+    one = clf.predict_proba(X)
+    clf.generation = GenerationConfig(permute_order=True, n_samples=4, inference_batch_size=1000)
+    np.testing.assert_array_equal(one, clf.predict_proba(X))
+
+
+def test_regressor_order_marginalization_is_batch_size_invariant(reg_data) -> None:
+    X, y = reg_data
+    reg = LanguageModelRegressor(backend=_PromptSensitiveBackend(), random_state=0).fit(X, y)
+    reg.generation = GenerationConfig(permute_order=True, n_samples=4, inference_batch_size=1)
+    one = reg.predict(X)
+    reg.generation = GenerationConfig(permute_order=True, n_samples=4, inference_batch_size=1000)
+    np.testing.assert_array_equal(one, reg.predict(X))
+
+
+def test_order_marginalized_predictions_repeat_for_fixed_seed(clf_data) -> None:
+    X, y = clf_data
+    clf = LanguageModelClassifier(
+        backend=_PromptSensitiveBackend(),
+        generation=GenerationConfig(permute_order=True, n_samples=4),
+        random_state=0,
+    ).fit(X, y)
+    np.testing.assert_array_equal(clf.predict_proba(X), clf.predict_proba(X))
+
+
+# --- numpy scalar inputs on the inference paths ----------------------------
+
+
+def test_numpy_scalar_knowns_and_candidates_match_native_floats() -> None:
+    # regression: repr(np.float64(1.5)) is "np.float64(1.5)" on numpy >= 2, so
+    # boxed inputs silently corrupted prompts and flattened the distribution
+    lm = _lm(_PromptSensitiveBackend())
+    lm.fit(pd.DataFrame({"age": [10.0, 20.0], "size": [1.0, 2.0]}))
+    native = lm.predict_proba({"age": 10.5}, "size", [1.0, 2.0])
+    boxed = lm.predict_proba({"age": np.float64(10.5)}, "size", [np.float64(1.0), np.float64(2.0)])
+    np.testing.assert_array_equal(native, boxed)
+
+
+def test_complete_serializes_numpy_scalar_knowns_as_native() -> None:
+    fake = _RecordingBackend()
+    lm = _lm(fake)
+    lm.fit(pd.DataFrame({"age": [10.0, 20.0], "size": [1.0, 2.0]}))
+    lm.complete({"age": np.float64(10.5)}, ["size"], GenerationConfig())
+    assert fake.prompts == ['{"age": 10.5, "size": ']
+
+
+# --- permute_order semantics ------------------------------------------------
+
+
+def test_permute_order_defaults_off() -> None:
+    assert GenerationConfig().permute_order is False
+
+
+def test_regressor_single_sample_permute_order_is_inert() -> None:
+    X = pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]})
+    y = np.array([1.0, 2.0])
+    fake = _RecordingBackend()
+    reg = LanguageModelRegressor(
+        backend=fake, generation=GenerationConfig(permute_order=True, n_samples=1)
+    ).fit(X, y)
+    reg.predict(X)
+    first = list(fake.prompts)
+    reg.predict(X)
+    assert fake.prompts == first * 2  # no order draw -> deterministic with random_state=None
+    assert all(p.index('"a"') < p.index('"b"') for p in first)  # canonical feature order
+
+
+def test_imputer_single_sample_permute_order_is_inert() -> None:
+    X = pd.DataFrame({"a": [1.0, 2.0, np.nan], "b": [3.0, 4.0, 5.0], "c": ["x", "y", "z"]})
+    fake = _RecordingBackend()
+    imp = LanguageModelImputer(
+        backend=fake, generation=GenerationConfig(permute_order=True, n_samples=1)
+    ).fit(X)
+    imp.transform(X)
+    first = list(fake.prompts)
+    imp.transform(X)
+    assert fake.prompts == first * 2  # no order draw -> deterministic with random_state=None
+    assert all(p.index('"b"') < p.index('"c"') for p in first)  # canonical feature order
 
 
 def test_classifier_never_exceeds_configured_batch(clf_data) -> None:

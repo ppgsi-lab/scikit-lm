@@ -34,9 +34,7 @@ def _numeric_frame() -> pd.DataFrame:
 
 
 def _mixed_frame() -> pd.DataFrame:
-    return pd.DataFrame(
-        {"n": [10.0, 20.0, 10.0, 20.0, np.nan], "c": ["x", "y", "x", "y", np.nan]}
-    )
+    return pd.DataFrame({"n": [10.0, 20.0, 10.0, 20.0, np.nan], "c": ["x", "y", "x", "y", np.nan]})
 
 
 # --- regressor -------------------------------------------------------------
@@ -107,7 +105,7 @@ def test_classifier_predict_proba_override_is_batch_invariant(clf_data) -> None:
 
 def test_imputer_transform_discretization_override_routes_scoring() -> None:
     frame = _mixed_frame()
-    fake = FakeBackend(value='"z"', scores={"10": 0.0, "20": 0.0})
+    fake = FakeBackend(value='"z"', scores={"10.0": 0.0, "20.0": 0.0})
     imp = LanguageModelImputer(backend=fake).fit(frame)  # default: all-generative
 
     imp.transform(frame, discretization=DiscretizationConfig(bins=2))

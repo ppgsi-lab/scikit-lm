@@ -18,7 +18,7 @@ together with the TypedDict keys.
 from __future__ import annotations
 
 import inspect
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from copy import deepcopy
 from typing import Annotated, ClassVar, TypedDict, get_args, get_type_hints
 
@@ -52,13 +52,21 @@ class AnnotatedDefault:
 
     @classmethod
     def create_with_defaults(
-        cls, typed_dict: type[EstimatorArgs], **overrides: object
+        cls,
+        typed_dict: type[EstimatorArgs],
+        *,
+        valid_params: Iterable[str] | None = None,
+        **overrides: object,
     ) -> dict[str, object]:
         """Return the TypedDict's ``AnnotatedDefault`` values, with ``overrides`` applied.
 
         Raises :class:`TypeError` when ``overrides`` carries a key absent from
         ``typed_dict`` -- a typo'd or unsupported constructor argument -- rather
-        than silently setting a dead attribute.
+        than silently setting a dead attribute. ``valid_params``, when given,
+        replaces the TypedDict keys in that error's "Valid parameters" list, so
+        callers can report their full constructor surface (explicit signature
+        parameters such as ``model`` included, via
+        :meth:`_FlatParams._get_param_names`).
 
         ``get_type_hints`` (not ``__annotations__``) is required because the
         module uses ``from __future__ import annotations``, which leaves the raw
@@ -72,9 +80,10 @@ class AnnotatedDefault:
         hints = get_type_hints(typed_dict, include_extras=True)
         unknown = sorted(set(overrides) - set(hints))
         if unknown:
+            valid = sorted(hints) if valid_params is None else sorted(valid_params)
             raise TypeError(
                 f"unexpected keyword argument(s): {', '.join(unknown)}. "
-                f"Valid parameters: {', '.join(sorted(hints))}."
+                f"Valid parameters: {', '.join(valid)}."
             )
         defaults = {
             key: deepcopy(meta.default)

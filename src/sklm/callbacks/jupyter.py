@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections import deque
 from time import monotonic
 from typing import Any, Literal, override
 
@@ -58,10 +57,10 @@ class JupyterCallback(Callback):
         How many serialized training rows to show, sampled at each epoch start.
         ``0`` hides them. Default ``5``.
     examples_view : {"table", "raw"}, optional
-        How the training examples are shown: ``"table"`` (default) lays the rows
-        out in a fixed-column table; ``"raw"`` shows the serialized text with JSON
-        syntax highlighting. ``"table"`` falls back to ``"raw"`` for serializers
-        whose output is not a JSON object.
+        How the training examples are shown: ``"raw"`` (default) shows the
+        serialized text with JSON syntax highlighting; ``"table"`` lays the rows
+        out in a fixed-column table. ``"table"`` falls back to ``"raw"`` for
+        serializers whose output is not a JSON object.
     n_generations : int, optional
         How many of the most recent predictions to keep in the inference section.
         Default ``8``.
@@ -161,26 +160,6 @@ class JupyterCallback(Callback):
         self._dash: Any = None
         self._ex_body: Any = None
         self._log_html: Any = None
-
-    # The training-log rows, the open interval, the eval-by-step map and the
-    # rolling predictions live on the shared :class:`DashboardState`. Tests read
-    # them off the callback, so re-expose the live containers.
-
-    @property
-    def _log(self) -> list[dict[str, Any]]:
-        return self._dash_state.log
-
-    @property
-    def _pending(self) -> list[dict[str, Any]]:
-        return self._dash_state.pending
-
-    @property
-    def _eval_by_step(self) -> dict[int, float]:
-        return self._dash_state.eval_by_step
-
-    @property
-    def _generations(self) -> deque[dict[str, Any]]:
-        return self._dash_state.generations
 
     @override
     def on_event(self, state: _TrainingState, event: Event) -> None:

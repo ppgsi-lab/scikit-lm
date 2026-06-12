@@ -29,12 +29,15 @@ def _stable(text: str) -> float:
 
 class FakeBackend:
     """Deterministic backend: ``value`` fixes ``generate``; ``scores`` (or a stable
-    hash) fixes ``score``. Records what it was asked to do for white-box assertions."""
+    hash) fixes ``score``. When ``scores`` is given, a continuation missing from it
+    raises (a silent fallback would hide tests scoring the wrong encoding). Records
+    what it was asked to do for white-box assertions."""
 
     def __init__(self, *, value: str = "0", scores: dict[str, float] | None = None) -> None:
         self.value = value
         self.scores = scores
         self.fit_calls = 0
+        self.epoch_texts: Callable[[int], list] | None = None
         self.last_epoch_texts: list[str] | None = None
         self.last_examples: list | None = None
         self.last_eval_examples: list | None = None
@@ -52,6 +55,7 @@ class FakeBackend:
         eval_examples: list | None = None,
     ) -> None:
         self.fit_calls += 1
+        self.epoch_texts = epoch_texts
         examples = epoch_texts(0)
         self.last_examples = examples
         self.last_epoch_texts = [ex.text for ex in examples]
@@ -64,7 +68,10 @@ class FakeBackend:
     def score(self, prompts: Sequence[str], continuations: Sequence[str]) -> list[float]:
         self.score_batches.append(len(prompts))
         if self.scores is not None:
-            return [self.scores.get(c, -100.0) for c in continuations]
+            missing = sorted({c for c in continuations if c not in self.scores})
+            if missing:
+                raise KeyError(f"continuations not covered by FakeBackend.scores: {missing}")
+            return [self.scores[c] for c in continuations]
         return [-_stable(c) for c in continuations]
 
 

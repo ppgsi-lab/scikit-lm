@@ -180,7 +180,10 @@ class TrainingConfig(BaseEstimator):
         Default ``1.0``.
     optimizer : {"adamw", "adamw_8bit", "paged_adamw_8bit", "adafactor", "lion"}
         Optimizer. The 8-bit variants require bitsandbytes + CUDA and fall back
-        to plain AdamW elsewhere. Default ``"adamw"``.
+        to plain AdamW elsewhere. ``"lion"`` diverges per backend: the HF
+        backend runs it 8-bit (bitsandbytes ``lion_8bit`` on CUDA,
+        mps-bitsandbytes ``Lion8bit`` on MPS, the plain-AdamW fallback on CPU),
+        while the MLX backend runs full-precision ``Lion``. Default ``"adamw"``.
     label_smoothing : float
         Cross-entropy label-smoothing factor in ``[0, 1)``. Default ``0.0``.
     neftune_noise_alpha : float or None
@@ -386,7 +389,7 @@ class GenerationConfig(BaseEstimator):
     repetition_penalty: float | None = None
     inference_batch_size: int | None = None
     n_samples: int = 1
-    permute_order: bool = True
+    permute_order: bool = False
     aggregate: Callable[[list[object], bool], object] = aggregate_default
     score_pool: Callable[[list[Sequence[float]]], Sequence[float]] | None = None
 
@@ -422,12 +425,20 @@ class DiscretizationConfig(BaseEstimator):
         How the scored distribution collapses to a prediction. ``"mean"``
         (default) is the probability-weighted expectation over the candidates;
         ``"mode"`` is the single most likely candidate (argmax).
+    sharpness : float, optional
+        Temperature applied to the scored distribution before ``estimate``:
+        probabilities are raised to this power and renormalized. ``1.0``
+        (default) keeps the distribution as scored; larger values concentrate
+        mass on the top candidates, so ``"mean"`` interpolates continuously
+        toward ``"mode"`` as sharpness grows. ``"mode"`` (argmax) is invariant
+        to it. Useful when the scored distribution is underconfident.
     """
 
     bins: int | float = 0
     strategy: Literal["quantile", "uniform"] = "quantile"
     representative: Literal["median", "mode", "mean"] = "median"
     estimate: Literal["mean", "mode"] = "mean"
+    sharpness: float = 1.0
 
     def __post_init__(self) -> None:
         if isinstance(self.bins, bool):
@@ -437,6 +448,8 @@ class DiscretizationConfig(BaseEstimator):
                 raise ValueError(f"a float bins must be a fraction in [0.0, 1.0], got {self.bins}")
         elif self.bins < 0:
             raise ValueError(f"an int bins must be non-negative, got {self.bins}")
+        if self.sharpness <= 0.0:
+            raise ValueError(f"sharpness must be a positive float, got {self.sharpness}")
 
     def resolve_k(self, n_unique: int) -> int:
         """Number of candidates to draw from ``n_unique`` distinct observed values.

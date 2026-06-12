@@ -21,6 +21,8 @@ from __future__ import annotations
 import contextlib
 import gc
 import io
+import os
+import shutil
 import sys
 import tempfile
 import warnings
@@ -31,7 +33,7 @@ from typing import Any
 
 import numpy as np
 
-from .backend import resolve_max_new_tokens, resolve_max_seq_length
+from .backend import common_token_prefix, resolve_max_new_tokens, resolve_max_seq_length
 from .callbacks import Callback
 from .config import GenerationConfig, LoRAConfig, ModelConfig, QuantizationConfig, TrainingConfig
 from .serialize import TrainingExample
@@ -181,12 +183,18 @@ class MLXBackend:
         # ``train`` counts micro-steps as ``iters`` and applies the optimizer
         # every ``grad_accumulation_steps``; scale so ``max_steps`` stays an
         # optimizer-step ceiling (the documented TrainingConfig semantics).
-        micro_per_epoch = max(1, len(dataset) // training.batch_size)
+        micro_per_epoch = -(-len(dataset) // training.batch_size)
         iters = micro_per_epoch * training.epochs
         if training.max_steps is not None:
             iters = min(iters, training.max_steps * training.grad_accumulation_steps)
 
-        optimizer = _build_optimizer(training, iters, training.resolved_learning_rate(model_config))
+        # The LR schedule advances once per optimizer.update (every
+        # grad_accumulation_steps micro-steps), so it is sized in optimizer steps.
+        optimizer = _build_optimizer(
+            training,
+            max(1, iters // training.grad_accumulation_steps),
+            training.resolved_learning_rate(model_config),
+        )
         iterate_fn = _make_iterate_batches(random_state)
         loss_fn = _make_loss(training.label_smoothing) if training.label_smoothing > 0 else None
         patience = training.early_stopping_patience
@@ -204,8 +212,10 @@ class MLXBackend:
                 adapter_file=str(Path(ckpt_dir) / "adapters.safetensors"),
                 steps_per_report=1,
                 steps_per_eval=micro_per_epoch if val_dataset is not None else iters + 1,
+                # steps_per_save is consumed in micro-steps; checkpoint_steps is
+                # documented in optimizer steps (as on the HF backend).
                 steps_per_save=(
-                    training.checkpoint_steps
+                    training.checkpoint_steps * training.grad_accumulation_steps
                     if training.checkpoint_steps is not None
                     else iters + 1
                 ),
@@ -296,12 +306,7 @@ class MLXBackend:
         for prompt, continuation in zip(prompts, continuations, strict=True):
             prompt_ids = self._tokenizer.encode(prompt)
             full = self._tokenizer.encode(prompt + continuation)[: self._max_seq_length]
-            start = 0
-            while (
-                start < len(prompt_ids) and start < len(full) and prompt_ids[start] == full[start]
-            ):
-                start += 1
-            starts.append(max(start, 1))
+            starts.append(max(common_token_prefix(prompt_ids, full), 1))
             fulls.append(full)
         max_len = max(len(f) for f in fulls)
         # Right padding with 0: causal attention keeps real tokens unaffected by
@@ -372,11 +377,8 @@ class _MLXTextDataset:
         offset = 0
         if ex.prompt:
             prompt_ids = self._tok.encode(ex.prompt)
-            for a, b in zip(prompt_ids, ids, strict=False):
-                if a != b:
-                    break
-                offset += 1
-            offset = min(offset, len(ids) - 1)  # always supervise >=1 token
+            # Always supervise >=1 token.
+            offset = min(common_token_prefix(prompt_ids, ids), len(ids) - 1)
         result = (ids, offset)
         self._cache[idx] = result
         return result
@@ -468,9 +470,7 @@ def _make_iterate_batches(random_state: int | None) -> Callable[..., Iterator[An
                 dataset.reshuffle()
             first = False
             order = rng.permutation(len(dataset))
-            batch_idx = [
-                order[i : i + batch_size] for i in range(0, len(order) - batch_size + 1, batch_size)
-            ]
+            batch_idx = [order[i : i + batch_size] for i in range(0, len(order), batch_size)]
             for indices in batch_idx:
                 batch = [dataset[int(j)] for j in indices]
                 ids_batch = [b[0] for b in batch]
@@ -478,20 +478,25 @@ def _make_iterate_batches(random_state: int | None) -> Callable[..., Iterator[An
                 lengths = [len(x) for x in ids_batch]
                 pad_to = 32
                 max_len = min(1 + pad_to * ((max(lengths) + pad_to - 1) // pad_to), max_seq_length)
-                arr = np.zeros((batch_size, max_len), dtype=np.int32)
+                # The last batch of an epoch may be short (len(indices) < batch_size);
+                # unlike mlx-lm's default batcher, no row is dropped -- the loss
+                # masks padding via lengths, so a short batch is safe.
+                arr = np.zeros((len(indices), max_len), dtype=np.int32)
                 trunc = []
-                for j in range(batch_size):
+                for j in range(len(indices)):
                     t = min(lengths[j], max_seq_length)
                     arr[j, :t] = ids_batch[j][:t]
                     trunc.append(t)
-                yield mx.array(arr), mx.array([(offsets[j], trunc[j]) for j in range(batch_size)])
+                yield mx.array(arr), mx.array(list(zip(offsets, trunc, strict=True)))
             if not loop:
                 break
 
     return iterate_batches
 
 
-def _build_optimizer(training: TrainingConfig, iters: int, lr: float) -> Any:
+def _build_optimizer(training: TrainingConfig, steps: int, lr: float) -> Any:
+    """Build the optimizer with its LR schedule sized over ``steps`` optimizer
+    steps (schedules advance once per ``optimizer.update``, not per micro-step)."""
     import mlx.core as mx
     import mlx.optimizers as opt
 
@@ -506,15 +511,15 @@ def _build_optimizer(training: TrainingConfig, iters: int, lr: float) -> Any:
             case _:
                 raise ValueError(f"unknown lr_scheduler {training.lr_scheduler!r}")
 
-    warmup_n = min(round(iters * training.warmup_ratio), iters) if training.warmup_ratio > 0 else 0
+    warmup_n = min(round(steps * training.warmup_ratio), steps) if training.warmup_ratio > 0 else 0
     if warmup_n > 0:
         schedule: Any = opt.join_schedules(
-            [opt.linear_schedule(0.0, lr, warmup_n), main_schedule(iters - warmup_n)], [warmup_n]
+            [opt.linear_schedule(0.0, lr, warmup_n), main_schedule(steps - warmup_n)], [warmup_n]
         )
     elif training.lr_scheduler == "constant":
         schedule = lr
     else:
-        schedule = main_schedule(iters)
+        schedule = main_schedule(steps)
 
     match training.optimizer:
         case "adamw" | "adamw_8bit" | "paged_adamw_8bit":
@@ -600,7 +605,12 @@ def _convert_quantized(
 ) -> str:
     """Convert ``model_name`` to MLX's native ``q_bits``-bit format, cached under
     ``~/.cache/sklm/mlx``. Requires an mlx-convertible HF repo (safetensors) or a
-    pre-converted ``mlx-community`` model."""
+    pre-converted ``mlx-community`` model.
+
+    The conversion writes into a temporary sibling directory and is renamed into
+    the cache path only once complete, so an interrupted convert never leaves a
+    half-written cache behind (``mlx_lm`` writes ``config.json`` before the
+    tokenizer files, so the files' mere presence proves nothing)."""
     from mlx_lm import convert
 
     slug = model_name.replace("/", "--")
@@ -609,16 +619,26 @@ def _convert_quantized(
     if (cache / "config.json").exists():
         return str(cache)
     cache.parent.mkdir(parents=True, exist_ok=True)
+    if cache.exists():
+        # A partial directory from a convert interrupted before this rename
+        # scheme existed; rebuild it.
+        shutil.rmtree(cache)
     convert_kwargs: dict[str, Any] = {
         "hf_path": model_name,
-        "mlx_path": str(cache),
         "quantize": True,
         "q_bits": q_bits,
         "dtype": _DTYPE_NAMES[precision],
     }
     if group_size is not None:
         convert_kwargs["q_group_size"] = group_size
-    convert(**convert_kwargs)
+    staging = Path(tempfile.mkdtemp(dir=cache.parent, prefix=f"{cache.name}.tmp"))
+    try:
+        # convert refuses to write into an existing directory, hence the child.
+        out = staging / "model"
+        convert(mlx_path=str(out), **convert_kwargs)
+        os.replace(out, cache)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
     return str(cache)
 
 

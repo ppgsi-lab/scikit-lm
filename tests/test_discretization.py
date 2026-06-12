@@ -100,6 +100,38 @@ def test_reduce_estimate_mode_is_argmax_candidate() -> None:
     assert reduce_estimate(proba, [10.0, 20.0], DiscretizationConfig(estimate="mode")) == 20.0
 
 
+def test_reduce_estimate_sharpness_tempers_the_mean() -> None:
+    proba = np.array([0.25, 0.75])
+    sharpened = reduce_estimate(
+        proba, [10.0, 20.0], DiscretizationConfig(estimate="mean", sharpness=2.0)
+    )
+    # p**2 renormalized = [0.1, 0.9] -> 10*0.1 + 20*0.9
+    assert sharpened == pytest.approx(19.0)
+
+
+def test_reduce_estimate_sharpness_one_keeps_the_plain_mean() -> None:
+    proba = np.array([0.25, 0.75])
+    plain = reduce_estimate(proba, [10.0, 20.0], DiscretizationConfig(estimate="mean"))
+    assert plain == pytest.approx(17.5)
+
+
+def test_reduce_estimate_high_sharpness_converges_to_mode() -> None:
+    proba = np.array([0.4, 0.6])
+    cfg = DiscretizationConfig(estimate="mean", sharpness=200.0)
+    assert reduce_estimate(proba, [10.0, 20.0], cfg) == pytest.approx(20.0, abs=1e-6)
+
+
+def test_reduce_estimate_mode_is_invariant_to_sharpness() -> None:
+    proba = np.array([0.2, 0.8])
+    cfg = DiscretizationConfig(estimate="mode", sharpness=8.0)
+    assert reduce_estimate(proba, [10.0, 20.0], cfg) == 20.0
+
+
+def test_discretization_rejects_non_positive_sharpness() -> None:
+    with pytest.raises(ValueError, match="sharpness"):
+        DiscretizationConfig(sharpness=0.0)
+
+
 # --- regressor scoring branch ---------------------------------------------
 
 
@@ -187,7 +219,7 @@ def _mixed_frame() -> pd.DataFrame:
 
 def test_imputer_discretized_scores_numeric_generates_categorical() -> None:
     out = LanguageModelImputer(
-        backend=FakeBackend(value='"z"', scores={"10": 0.0, "20": 0.0}),  # equal -> 0.5/0.5
+        backend=FakeBackend(value='"z"', scores={"10.0": 0.0, "20.0": 0.0}),  # equal -> 0.5/0.5
         discretization=DiscretizationConfig(bins=1.0, estimate="mean"),
     ).fit_transform(_mixed_frame())
     assert isinstance(out, pd.DataFrame)
@@ -198,7 +230,7 @@ def test_imputer_discretized_scores_numeric_generates_categorical() -> None:
 def test_imputer_discretized_routes_score_and_generate() -> None:
     X = _mixed_frame()
 
-    on = FakeBackend(value='"z"', scores={"10": 0.0, "20": 0.0})
+    on = FakeBackend(value='"z"', scores={"10.0": 0.0, "20.0": 0.0})
     LanguageModelImputer(backend=on, discretization=DiscretizationConfig(bins=2)).fit_transform(X)
     assert on.score_batches and on.generate_batches  # numeric scored, categorical generated
 
@@ -214,7 +246,7 @@ def test_imputer_discretized_single_config_scores_all_numeric() -> None:
             "b": [10.0, 20.0, 10.0, 20.0, np.nan],
         }
     )
-    fake = FakeBackend(scores={"1": 0.0, "2": 0.0, "10": 0.0, "20": 0.0})
+    fake = FakeBackend(scores={"1.0": 0.0, "2.0": 0.0, "10.0": 0.0, "20.0": 0.0})
     out = LanguageModelImputer(
         backend=fake, discretization=DiscretizationConfig(bins=1.0, estimate="mean")
     ).fit_transform(X)
@@ -231,7 +263,7 @@ def test_imputer_discretized_map_scores_only_listed_column() -> None:
             "b": [10.0, 20.0, 10.0, 20.0, np.nan],
         }
     )
-    fake = FakeBackend(value="0", scores={"1": 0.0, "2": 0.0})
+    fake = FakeBackend(value="0", scores={"1.0": 0.0, "2.0": 0.0})
     LanguageModelImputer(
         backend=fake, discretization={"a": DiscretizationConfig(bins=1.0)}
     ).fit_transform(X)
@@ -264,7 +296,7 @@ def test_imputer_discretized_is_batch_size_invariant() -> None:
             "c": ["x", "y", "x", "y", np.nan, np.nan, np.nan, np.nan],
         }
     )
-    fake = FakeBackend(value='"z"', scores={"10": 0.0, "20": -1.0, "30": -2.0, "40": -3.0})
+    fake = FakeBackend(value='"z"', scores={"10.0": 0.0, "20.0": -1.0, "30.0": -2.0, "40.0": -3.0})
     imp = LanguageModelImputer(backend=fake, discretization=DiscretizationConfig(bins=4)).fit(X)
     imp.generation = GenerationConfig(inference_batch_size=1)
     one = imp.transform(X)
@@ -281,7 +313,7 @@ def test_imputer_discretized_scores_within_batch_cap() -> None:
             "c": ["x", "y", "x", "y", "x", "y", "x", "y"],  # fully observed -> only "n" imputed
         }
     )
-    fake = FakeBackend(scores={"10": 0.0, "20": 0.0, "30": 0.0, "40": 0.0})
+    fake = FakeBackend(scores={"10.0": 0.0, "20.0": 0.0, "30.0": 0.0, "40.0": 0.0})
     LanguageModelImputer(
         backend=fake,
         discretization=DiscretizationConfig(bins=4),
@@ -295,7 +327,7 @@ def test_imputer_discretized_scores_within_batch_cap() -> None:
 def test_imputer_discretized_generation_failure_raises_runtime_error() -> None:
     X = _mixed_frame()
     imp = LanguageModelImputer(
-        backend=FakeBackend(value="garbage", scores={"10": 0.0, "20": 0.0}),
+        backend=FakeBackend(value="garbage", scores={"10.0": 0.0, "20.0": 0.0}),
         discretization=DiscretizationConfig(bins=2),
     ).fit(X)
     with pytest.raises(RuntimeError, match="generation failed"):

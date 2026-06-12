@@ -41,6 +41,10 @@ _JUP_TK_NUM = "var(--jp-mirror-editor-number-color,#1565c0)"
 _JUP_TK_KW = "var(--jp-mirror-editor-keyword-color,#9c27b0)"
 _JUP_TK_PUNCT = _JUP_DIM
 _JUP_OTHERS = "#b8b8b0"
+_JUP_ROW_BORDER = f"border-bottom:0.5px solid {_JUP_BORDER}"
+_JUP_TH = (
+    f"font-weight:600;font-size:10px;letter-spacing:.04em;text-transform:uppercase;color:{_JUP_DIM}"
+)
 _JUP_ICON = (
     '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
     'stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'
@@ -52,22 +56,12 @@ _JUP_ICON = (
 )
 
 
-def _jtoken(value: object) -> str:
-    """A single JSON scalar wrapped in its theme-colored span."""
-    if isinstance(value, str):
-        return f'<span style="color:{_JUP_TK_STR}">{html.escape(json.dumps(value))}</span>'
-    if isinstance(value, bool) or value is None:
-        return f'<span style="color:{_JUP_TK_KW}">{json.dumps(value)}</span>'
-    if isinstance(value, (int, float)):
-        return f'<span style="color:{_JUP_TK_NUM}">{json.dumps(value)}</span>'
-    return html.escape(json.dumps(value))
-
-
 def _highlight_json(text: str) -> str | None:
     """Render a JSON object string as a theme-colored, one-line HTML fragment.
 
     Returns ``None`` when ``text`` is not a JSON object, so the caller can fall
-    back to the plain serialized line for non-JSON serializers.
+    back to the plain serialized line for non-JSON serializers. The coloring
+    itself is delegated to :func:`_highlight_json_fragment`.
     """
     try:
         obj = json.loads(text)
@@ -75,16 +69,7 @@ def _highlight_json(text: str) -> str | None:
         return None
     if not isinstance(obj, dict):
         return None
-
-    def punct(text: str) -> str:
-        return f'<span style="color:{_JUP_TK_PUNCT}">{text}</span>'
-
-    pairs = [
-        f'<span style="color:{_JUP_TK_KEY}">{html.escape(json.dumps(k))}</span>'
-        f"{punct(': ')}{_jtoken(v)}"
-        for k, v in obj.items()
-    ]
-    return punct("{") + punct(", ").join(pairs) + punct("}")
+    return _highlight_json_fragment(text)
 
 
 _JSON_TOKEN = re.compile(
@@ -292,14 +277,11 @@ class HtmlRenderer:
         header = next(c for c in dashboard.children if isinstance(c, Header))
         cards = next(c for c in dashboard.children if isinstance(c, StatCards))
         predictions = next(c for c in dashboard.children if isinstance(c, Predictions))
+        retry = self._retry_card_html(predictions)
         if predictions.scoring:
-            cards_html = self._score_cards_html(cards, predictions)
+            cards_html = self._score_cards_html(cards, predictions, extra=retry)
         else:
-            cards_html = (
-                '<div style="display:grid;'
-                "grid-template-columns:repeat(auto-fit,minmax(120px,1fr));"
-                f'gap:12px;margin-bottom:20px">{self._card_from_stat(cards)}</div>'
-            )
+            cards_html = self._cards_html(cards, extra=retry)
         body = (
             self._header_html(header)
             + cards_html
@@ -356,14 +338,17 @@ class HtmlRenderer:
 
     # ---------------------------------------------------------------------- cards
 
-    def _cards_html(self, cards: StatCards) -> str:
-        body = "".join(
-            self._card_html(
-                s.label,
-                f"{s.value}{self._suffix(s.suffix)}",
-                mono=s.mono,
+    def _cards_html(self, cards: StatCards, extra: str = "") -> str:
+        body = (
+            "".join(
+                self._card_html(
+                    s.label,
+                    f"{s.value}{self._suffix(s.suffix)}",
+                    mono=s.mono,
+                )
+                for s in cards.cards
             )
-            for s in cards.cards
+            + extra
         )
         return (
             '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(120px,1fr));'
@@ -383,16 +368,18 @@ class HtmlRenderer:
             f'<div style="font-size:24px;font-weight:500{font}">{value}</div></div>'
         )
 
-    def _card_from_stat(self, cards: StatCards) -> str:
-        s = cards.cards[0]
-        return self._card_html(s.label, f"{s.value}{self._suffix(s.suffix)}", mono=s.mono)
+    def _retry_card_html(self, predictions: Predictions) -> str:
+        """A ``retries`` card, or ``""`` until the first malformed generation."""
+        if not predictions.retries:
+            return ""
+        return self._card_html("retries", str(predictions.retries))
 
-    def _score_cards_html(self, cards: StatCards, predictions: Predictions) -> str:
+    def _score_cards_html(self, cards: StatCards, predictions: Predictions, extra: str = "") -> str:
         body = "".join(
             self._card_html(s.label, f"{s.value}{self._suffix(s.suffix)}", mono=s.mono)
             for s in cards.cards
         )
-        body += self._bins_card_html(predictions)
+        body += self._bins_card_html(predictions) + extra
         return (
             '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));'
             f'gap:12px;margin-bottom:20px">{body}</div>'
@@ -661,16 +648,11 @@ class HtmlRenderer:
     def _examples_table_html(
         self, columns: Sequence[str], rows: Sequence[dict[str, object]]
     ) -> str:
-        th = (
-            f'<th style="text-align:left;font-weight:600;font-size:10px;letter-spacing:.04em;'
-            f"text-transform:uppercase;color:{_JUP_DIM};padding:0 12px 8px 0;"
-            f'border-bottom:0.5px solid {_JUP_BORDER}">#</th>'
-        )
+        th = f'<th style="text-align:left;{_JUP_TH};padding:0 12px 8px 0;{_JUP_ROW_BORDER}">#</th>'
         for c in columns:
             th += (
-                f'<th style="text-align:right;font-weight:600;font-size:10px;letter-spacing:.04em;'
-                f"text-transform:uppercase;color:{_JUP_DIM};padding:0 0 8px 12px;"
-                f'border-bottom:0.5px solid {_JUP_BORDER}">{html.escape(c)}</th>'
+                f'<th style="text-align:right;{_JUP_TH};padding:0 0 8px 12px;'
+                f'{_JUP_ROW_BORDER}">{html.escape(c)}</th>'
             )
         body = "".join(self._examples_table_row(i, columns, r) for i, r in enumerate(rows))
         return (
@@ -685,7 +667,7 @@ class HtmlRenderer:
     ) -> str:
         cells = (
             f'<td style="text-align:left;color:{_JUP_DIM};padding:7px 12px 7px 0;'
-            f'border-bottom:0.5px solid {_JUP_BORDER}">{index + 1:02d}</td>'
+            f'{_JUP_ROW_BORDER}">{index + 1:02d}</td>'
         )
         for c in columns:
             if c not in row:
@@ -697,7 +679,7 @@ class HtmlRenderer:
             tint = f";color:{color}" if color else ""
             cells += (
                 f'<td style="text-align:right;padding:7px 0 7px 12px;'
-                f'border-bottom:0.5px solid {_JUP_BORDER}{tint}">{value}</td>'
+                f'{_JUP_ROW_BORDER}{tint}">{value}</td>'
             )
         return f"<tr>{cells}</tr>"
 
@@ -721,9 +703,8 @@ class HtmlRenderer:
         )
         cols = ("step", "epoch", "train loss", "eval loss", "lr", "grad norm", "steps/s")
         header = "".join(
-            f'<th style="text-align:{"left" if i < 2 else "right"};font-weight:600;'
-            f"font-size:10px;letter-spacing:.04em;text-transform:uppercase;color:{_JUP_DIM};"
-            f'padding:0 0 8px;border-bottom:0.5px solid {_JUP_BORDER}">{c}</th>'
+            f'<th style="text-align:{"left" if i < 2 else "right"};{_JUP_TH};'
+            f'padding:0 0 8px;{_JUP_ROW_BORDER}">{c}</th>'
             for i, c in enumerate(cols)
         )
         rows = "".join(self._log_row_html(r) for r in log.rows)
@@ -755,8 +736,8 @@ class HtmlRenderer:
             (sps or "—", "right", _JUP_DIM),
         ]
         tds = "".join(
-            f'<td style="text-align:{align};padding:7px 0;border-bottom:0.5px solid '
-            f'{_JUP_BORDER}{f";color:{color}" if color else ""}">{value}</td>'
+            f'<td style="text-align:{align};padding:7px 0;'
+            f'{_JUP_ROW_BORDER}{f";color:{color}" if color else ""}">{value}</td>'
             for value, align, color in cells
         )
         return f"<tr>{tds}</tr>"
@@ -802,7 +783,7 @@ class HtmlRenderer:
         cols = "".join(
             f'<th style="text-align:left;font-weight:500;color:{_JUP_DIM};font-size:10.5px;'
             "letter-spacing:.05em;text-transform:uppercase;padding:0 12px 8px 0;"
-            f'border-bottom:0.5px solid {_JUP_BORDER}{f";width:{w}" if w else ""}">{c}</th>'
+            f'{_JUP_ROW_BORDER}{f";width:{w}" if w else ""}">{c}</th>'
             for c, w in columns
         )
         return (
@@ -815,7 +796,7 @@ class HtmlRenderer:
         # text-align:left is explicit because Jupyter's rendered-HTML CSS defaults
         # table cells to right, which would split them from the left-aligned headers.
         return (
-            f'<td style="padding:9px 12px 9px 0;border-bottom:0.5px solid {_JUP_BORDER};'
+            f'<td style="padding:9px 12px 9px 0;{_JUP_ROW_BORDER};'
             f'text-align:left;vertical-align:middle;{extra}">{inner}</td>'
         )
 

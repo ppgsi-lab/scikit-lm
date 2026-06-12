@@ -8,7 +8,7 @@ is just a choice of which columns go in the prompt and which the model produces.
 
 import os
 
-os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 import logging
 

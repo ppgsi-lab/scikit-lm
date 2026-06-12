@@ -123,6 +123,7 @@ Optional extras:
 | `hqq`      | hqq                                    | 2-/3-bit quantized HF base weights via HQQ (CUDA or CPU)      |
 | `tqdm`     | tqdm                                   | live progress bars (`TqdmCallback`)                           |
 | `rich`     | rich, plotext                          | live fine-tuning dashboard (`RichCallback`)                  |
+| `jupyter`  | ipywidgets                             | notebook-native live dashboard (`JupyterCallback`)            |
 | `optuna`   | optuna, optuna-integration             | `OptunaSearchCV` hyperparameter tuning                        |
 
 Extras combine, e.g. `pip install "scikit-lm[hf,quant,tqdm]"`. The `all` extra pulls every optional dependency at once — platform markers keep it resolvable on any OS: `pip install "scikit-lm[all]"`.
@@ -206,7 +207,7 @@ The `sampling_strategy` parameter is forwarded to imbalanced-learn (string, floa
 
 ## The shared core: `TabularLanguageModel`
 
-Every estimator is a thin adapter over one fitted object, `TabularLanguageModel`, which exposes the two conditional primitives directly. Reach for it when you want to query *any* column from *any* subset without committing to a single estimator's task.
+Every estimator is a thin adapter over one fitted object, `TabularLanguageModel`, which exposes the conditional primitives directly. It is a scikit-learn estimator in its own right — clonable, tunable through the nested-parameter convention (`set_params(training__epochs=10)`) — in the mold of the library's generators such as `KernelDensity`: `fit` learns the joint distribution, `sample` draws rows from it. Reach for it when you want to query *any* column from *any* subset without committing to a single estimator's task.
 
 ```python
 from sklearn.datasets import load_iris
@@ -223,7 +224,7 @@ lm = TabularLanguageModel(
     backend=HFBackend(),
     serializer=JSONSerializer(),
     training=TrainingConfig(epochs=40),
-    model_config=ModelConfig(model="distilgpt2"),
+    model=ModelConfig(model="distilgpt2"),
     random_state=0,
 ).fit(frame)
 
@@ -240,44 +241,35 @@ lm.complete({"species": "setosa"}, ["petal length (cm)"], GenerationConfig())
 
 | Method                 | Does                                                            |
 |------------------------|----------------------------------------------------------------|
-| `fit(frame, *, target_cols=…)` | fine-tune on the table; `target_cols` marks which columns are supervised under `loss_on_target_only` |
+| `fit(X, y=None, *, target_cols=…)` | fine-tune on the table (`y` is ignored — the model is joint, so a supervised target enters as a column of `X`); `target_cols` marks which columns are supervised under `loss_on_target_only` |
 | `predict_proba(known, target, candidates)`     | rank `candidates` for `target` by likelihood (single row) |
 | `predict_proba_many(knowns, target, candidates, generation)` | the same, batched across rows |
 | `complete(known, targets, generation)`         | generate each `target` column in turn (single row) |
 | `complete_many(knowns, targets, generation)`   | the same, batched across rows |
+| `sample(n_samples, *, condition=…, generation=…)` | draw whole rows from the learned joint distribution ([below](#tabular-synthesis)) |
 
-The completion methods return `None` for a row whose targets stay malformed after `max_retries` (default 15); the estimators turn that `None` into the loud `RuntimeError` described above.
+The completion methods return `None` for a row whose targets stay malformed after `max_retries` (default 15); the estimators — and `sample` — turn that `None` into the loud `RuntimeError` described above.
 
 ### Tabular synthesis
 
-The four estimators each fix *which* columns go in the prompt. Fix *none* of them and the same fitted model becomes a **tabular synthesizer**: generate every column from an empty context, so each row is a draw from the learned joint $p(\text{features}, \text{label})$ — the first column sampled from its marginal, every later one conditioning on the cells already produced. No new estimator class is involved; it is `complete_many` called with empty (or label-only) contexts.
+The four estimators each fix *which* columns go in the prompt. Fix *none* of them and the same fitted model becomes a **tabular synthesizer**: generate every column from an empty context, so each row is a draw from the learned joint $p(\text{features}, \text{label})$ — the first column sampled from its marginal, every later one conditioning on the cells already produced. No new estimator class is involved; `sample` is a method of the fitted model, the conditional counterpart to `KernelDensity.sample`.
 
 ```python
-import pandas as pd
 from sklm import TabularLanguageModel, GenerationConfig
 
 lm = TabularLanguageModel(...).fit(frame)   # fit on the whole table, no target_cols
-columns = list(frame.columns)
 
-# Unconditional — sample whole rows from p(features, label):
-rows = lm.complete_many(
-    [{}] * 150,                       # empty context per row
-    [columns] * 150,                  # produce every column, in order
-    GenerationConfig(temperature=0.7),
-)
+# Unconditional — whole rows from p(features, label):
+synth = lm.sample(150, generation=GenerationConfig(temperature=0.7))
 
 # Conditional — pin a column and synthesize the rest (e.g. class-balanced rows):
-features = [c for c in columns if c != "species"]
-rows = lm.complete_many(
-    [{"species": "setosa"}] * 50,
-    [features] * 50,
-    GenerationConfig(temperature=0.7),
+synth = lm.sample(
+    condition=[{"species": s} for s in iris.target_names for _ in range(50)],
+    generation=GenerationConfig(temperature=0.7),
 )
-
-synth = pd.DataFrame([r for r in rows if r is not None])
 ```
 
-Sampling with `temperature > 0` is what gives the rows their diversity (greedy decoding would collapse every row to the same mode). Each result is a dict, or `None` if it stayed malformed after retries, so filter before building the frame. [`examples/08-synthesizer.ipynb`](examples/08-synthesizer.ipynb) runs the conditional path end to end and checks the synthesized per-feature moments and class balance against the real Iris table.
+A single `condition` mapping is broadcast to all `n_samples` rows; a sequence gives one mapping per row (and overrides `n_samples`). Sampling with `temperature > 0` is what gives the rows their diversity (greedy decoding would collapse every row to the same mode). `sample` returns a DataFrame with the training columns and raises `RuntimeError` if any row stays malformed after retries; for row-level tolerance (keep the valid rows, drop the rest) call `complete_many` directly and filter the `None`s. [`examples/08-synthesizer.ipynb`](examples/08-synthesizer.ipynb) runs the conditional path end to end and checks the synthesized per-feature moments and class balance against the real Iris table.
 
 ---
 
@@ -379,6 +371,8 @@ LanguageModelRegressor(
         strategy="quantile",   # "quantile" (equal-mass) | "uniform" (equal-width)
         representative="median", # candidate per partition: "median" | "mode" | "mean"
         estimate="mean",       # collapse the scored distribution: "mean" (expectation) | "mode" (argmax)
+        sharpness=1.0,         # temper the distribution (p**α, renormalized) before "mean";
+                               #   1.0 = as scored, larger sharpens toward "mode"
     ),
 )
 ```
@@ -389,6 +383,8 @@ Where it applies:
 - **Imputer** — pass a single `DiscretizationConfig` (applies to every numeric column) or a `Mapping[str, DiscretizationConfig]` for per-column control; columns absent from the mapping stay on the generative path. Categorical cells always generate.
 
 `bins` is the on/off switch as well as the candidate count: `0` (default) keeps the generative path; an `int` `K` scores `K` candidates (capped at the number of distinct observed values); a `float` in `(0, 1]` keeps that fraction of the distinct support (`1.0` = every distinct value).
+
+`sharpness` interpolates continuously between the two `estimate` extremes: the scored probabilities are raised to that power and renormalized before the expectation, so `1.0` (default) is the plain mean and large values converge to the argmax (`"mode"` itself is invariant). Useful when the scored distribution is underconfident — mass concentrates around the right value but spreads over its neighbors, and the plain expectation gets dragged toward the column's center by the long tail of implausible candidates. Sharpen (α ≈ 2–8) only when the target is genuinely predictable from the other columns; on a noisy target the spread is honest uncertainty and tempering it hurts.
 
 ### LoRA & model loading
 
@@ -543,7 +539,6 @@ If you use scikit-lm in your research, please cite it. GitHub's "Cite this repos
 @software{dos_santos_silva_scikit_lm,
   author  = {dos Santos Silva, Gabriel Francisco},
   title   = {scikit-lm: scikit-learn estimators backed by language models},
-  version = {0.0.1},
   year    = {2026},
   url     = {https://github.com/ppgsi-lab/scikit-lm},
   abstract = {scikit-lm provides scikit-learn-compatible estimators backed by a fine-tuned autoregressive language model for tabular data. A single mechanism underlies all of them: each row is serialized to text and the model is fine-tuned while the column order is permuted throughout training, so it learns the conditional distribution of any column given any subset of the others. From this one fitted model the library exposes four estimators (a classifier, a regressor, a missing-value imputer, and a minority-class oversampler), as well as conditional and unconditional tabular synthesis. It runs on Hugging Face Transformers or Apple MLX backends, while the core estimators depend only on the lightweight NumPy, pandas, and scikit-learn stack.}

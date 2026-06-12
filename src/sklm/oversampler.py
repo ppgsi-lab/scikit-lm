@@ -16,6 +16,11 @@ import pandas as pd
 from imblearn.over_sampling.base import BaseOverSampler
 from imblearn.utils import check_target_type
 
+# imbalanced-learn redefines Tags (adding sampler_tags) and offers no public re-export;
+# sklearn's Tags is not assignable to the BaseSampler.__sklearn_tags__ return type.
+from imblearn.utils._tags import Tags
+from sklearn.utils.validation import check_consistent_length
+
 from .base import forget, make_tabular_lm, to_frame, unique_name
 from .config import GenerationConfig
 from .params import AnnotatedDefault, OversamplerArgs, _FlatParams
@@ -45,7 +50,8 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
     generation : GenerationConfig, optional
         Sampling hyperparameters (temperature, token budget).
     serializer : str or Serializer, optional
-        ``"json"`` or a custom :class:`~sklm.Serializer`. Default ``"json"``.
+        ``"json"``, ``"key-value"``, ``"bracket"``, or a custom
+        :class:`~sklm.Serializer`. Default ``"json"``.
     max_decimals : int or None, optional
         Round numeric cells to at most this many decimal places when
         serializing. Applies only to the string ``serializer`` selectors; a
@@ -102,7 +108,10 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
         # forwarded unchanged and the stub mismatch is suppressed.
         super().__init__(sampling_strategy=sampling_strategy)  # pyright: ignore[reportArgumentType]
         self.model = model
-        for key, value in AnnotatedDefault.create_with_defaults(OversamplerArgs, **kwargs).items():
+        defaults = AnnotatedDefault.create_with_defaults(
+            OversamplerArgs, valid_params=self._get_param_names(), **kwargs
+        )
+        for key, value in defaults.items():
             setattr(self, key, value)
 
     @override
@@ -139,6 +148,7 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
         X_df = to_frame(X, getattr(self, "feature_names_in_", None))
         X_df = X_df.set_axis([str(c) for c in X_df.columns], axis=1)
         y_arr = np.asarray(y)
+        check_consistent_length(X_df, y_arr)
         feature_cols = [str(c) for c in X_df.columns]
         int_cols = {c for c in feature_cols if pd.api.types.is_integer_dtype(X_df[c])}
         target_col = unique_name("target", feature_cols)
@@ -204,3 +214,12 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
         X_res = pd.concat([X_df, synth_df], ignore_index=True)
         y_res = np.concatenate([y_arr, np.asarray(synth_y, dtype=y_arr.dtype)])
         return X_res.to_numpy(), y_res
+
+    @override
+    def __sklearn_tags__(self) -> Tags:
+        tags = super().__sklearn_tags__()
+        tags.input_tags.string = True
+        tags.input_tags.categorical = True
+        tags.input_tags.allow_nan = True
+        tags.input_tags.sparse = False
+        return tags

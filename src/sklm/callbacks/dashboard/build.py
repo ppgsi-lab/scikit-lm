@@ -188,7 +188,7 @@ def _fit_metrics(state: TrainingState, cfg: RenderConfig) -> Metrics:
     if state.mem is not None:
         rows.append(MetricRow("mem", _format_bytes(state.mem)))
         rows.append(MetricRow("peak", _format_bytes(state.peak_mem)))
-    return Metrics(rows, cfg.loss_window)
+    return Metrics(rows)
 
 
 def _hyperparameters(state: TrainingState, dash: DashboardState) -> KeyValues:
@@ -295,6 +295,7 @@ def _predictions(dash: DashboardState) -> Predictions:
         rows=_prediction_rows(dash),
         bins=bins,
         bins_label=bins_label,
+        retries=dash.retries,
     )
 
 
@@ -320,7 +321,7 @@ def build_fit_dashboard(state: TrainingState, dash: DashboardState, cfg: RenderC
     Returns
     -------
     Dashboard
-        The fit tree, with ``phase`` taken from ``state``.
+        The fit tree.
     """
     children: list[Widget] = [
         _header(state, dash),
@@ -333,7 +334,7 @@ def build_fit_dashboard(state: TrainingState, dash: DashboardState, cfg: RenderC
         children.append(_examples_panel(state, cfg))
     if cfg.n_log_rows and dash.log:
         children.append(_log_table(dash, cfg))
-    return Dashboard(state.phase, children)
+    return Dashboard(children)
 
 
 def build_predict_dashboard(
@@ -357,7 +358,7 @@ def build_predict_dashboard(
     Returns
     -------
     Dashboard
-        The predict tree, with ``phase`` taken from ``state``.
+        The predict tree.
     """
     predictions = _predictions(dash)
     if dash.score_count:
@@ -372,4 +373,4 @@ def build_predict_dashboard(
     else:
         cards = StatCards([_step_stat("rows", dash)])
     children: list[Widget] = [_header(state, dash), cards, predictions]
-    return Dashboard(state.phase, children)
+    return Dashboard(children)

@@ -131,6 +131,8 @@ class RichCallback(Callback):
             uncertain_threshold=0.6,
             log_every="epoch",
         )
+        # n_log_rows=0 / uid="" disable the HTML-only widgets (the training-log
+        # table and the CSS-tab examples panel) the Rich renderer never draws.
         self._render_cfg = RenderConfig(
             n_train_examples=n_train_examples,
             examples_view="raw",
@@ -151,6 +153,16 @@ class RichCallback(Callback):
         self._task: TaskID | None = None
         # Jupyter path: an HTML widget the dashboard is rendered into in place.
         self._jupyter = self._detect_jupyter()
+        if self._jupyter:
+            # ipywidgets is provided by the optional 'jupyter' extra; failing here
+            # keeps _auto_callback's fall-through to LoggingCallback working.
+            try:
+                import ipywidgets  # noqa: F401
+            except ImportError as exc:
+                raise ImportError(
+                    "RichCallback in a Jupyter kernel needs the 'jupyter' extra: "
+                    "pip install scikit-lm[jupyter]"
+                ) from exc
         self._min_interval = 1.0 / refresh_per_second if refresh_per_second > 0 else 0.0
         self._last_refresh = 0.0
         self._render: Callable[[], RenderableType] | None = None
@@ -226,13 +238,7 @@ class RichCallback(Callback):
                 self._refresh_output()
 
     def _start_output(self, render: Callable[[], RenderableType], total: int | None) -> None:
-        try:
-            import ipywidgets as w
-        except ImportError as exc:
-            raise ImportError(
-                "RichCallback in a Jupyter kernel needs the 'jupyter' extra: "
-                "pip install scikit-lm[jupyter]"
-            ) from exc
+        import ipywidgets as w
         from IPython.display import display
 
         self._console = self._jupyter_console()

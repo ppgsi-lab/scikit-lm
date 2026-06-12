@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import contextlib
 import importlib.util
 import platform
 from collections.abc import Collection, Mapping, Sequence
@@ -10,7 +9,6 @@ from typing import Literal, Protocol
 
 import numpy as np
 import pandas as pd
-from sklearn.utils.validation import check_array
 
 from .backend import LanguageModelBackend
 from .callbacks import Callback, resolve_callback
@@ -23,7 +21,7 @@ from .config import (
     QuantizationConfig,
     TrainingConfig,
 )
-from .core import TabularLanguageModel
+from .core import TabularLanguageModel, forget, to_frame
 from .hf_backend import HFBackend
 from .serialize import (
     BracketSerializer,
@@ -274,30 +272,6 @@ def records(frame: pd.DataFrame) -> list[dict[str, object]]:
     return frame.to_dict("records")
 
 
-def forget(obj: object, name: str) -> None:
-    """Delete attribute ``name`` from ``obj`` if present (no-op otherwise)."""
-    with contextlib.suppress(AttributeError):
-        delattr(obj, name)
-
-
-def to_frame(X: object, columns: Sequence[str] | None = None) -> pd.DataFrame:
-    """Coerce array-like input to a DataFrame, naming columns ``x0..`` (or with
-    ``columns``) when the input is not already a DataFrame.
-
-    Non-DataFrame input is validated with scikit-learn's ``check_array`` in a mode
-    that still admits string/categorical cells and NaN (``dtype=None``,
-    ``ensure_all_finite=False``), so sparse, complex, empty, and 1-D inputs are
-    rejected with scikit-learn's standard messages while text tables pass through.
-    """
-    if isinstance(X, pd.DataFrame):
-        return X
-    # dtype=None keeps string/object cells & NaN; sklearn infers check_array's dtype as str
-    check_array(X, dtype=None, ensure_all_finite=False)  # pyright: ignore[reportArgumentType]
-    arr = np.asarray(X)
-    names = list(columns) if columns is not None else [f"x{i}" for i in range(arr.shape[1])]
-    return pd.DataFrame(arr, columns=names)
-
-
 def align_features(estimator: _Fitted, X: object) -> pd.DataFrame:
     """Return ``X`` with columns set to ``estimator.feature_cols_``.
 
@@ -406,6 +380,9 @@ def reduce_estimate(
 
     ``config.estimate == "mean"`` returns the probability-weighted expectation
     over ``candidates``; ``"mode"`` returns the single most likely candidate.
+    ``config.sharpness`` re-tempers the distribution first (probabilities are
+    raised to that power and renormalized), pulling the expectation toward the
+    top candidates; the argmax is invariant to it.
 
     Parameters
     ----------
@@ -424,7 +401,11 @@ def reduce_estimate(
     """
     c = np.asarray(candidates, dtype=float)
     if config.estimate == "mean":
-        return float(np.dot(np.asarray(proba_row, dtype=float), c))
+        p = np.asarray(proba_row, dtype=float)
+        if config.sharpness != 1.0:
+            p = p**config.sharpness
+            p = p / p.sum()
+        return float(np.dot(p, c))
     return float(c[int(np.argmax(proba_row))])
 
 

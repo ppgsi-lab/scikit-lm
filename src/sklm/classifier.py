@@ -14,7 +14,7 @@ import pandas as pd
 from sklearn.base import BaseEstimator, ClassifierMixin
 from sklearn.utils import Tags
 from sklearn.utils.multiclass import check_classification_targets
-from sklearn.utils.validation import check_is_fitted, column_or_1d
+from sklearn.utils.validation import check_consistent_length, check_is_fitted, column_or_1d
 
 from .base import align_features, forget, make_tabular_lm, records, to_frame, unique_name
 from .callbacks import predict_batches
@@ -45,7 +45,8 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
         (``temperature``, ``top_p``, ``top_k``, ``repetition_penalty``,
         ``max_new_tokens``) are inert.
     serializer : str or Serializer, optional
-        ``"json"`` or a custom :class:`~sklm.Serializer`. Default ``"json"``.
+        ``"json"``, ``"key-value"``, ``"bracket"``, or a custom
+        :class:`~sklm.Serializer`. Default ``"json"``.
     max_decimals : int or None, optional
         Round numeric cells to at most this many decimal places when
         serializing. Applies only to the string ``serializer`` selectors; a
@@ -93,7 +94,10 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
 
     def __init__(self, model: str = "distilgpt2", **kwargs: Unpack[EstimatorArgs]) -> None:
         self.model = model
-        for key, value in AnnotatedDefault.create_with_defaults(EstimatorArgs, **kwargs).items():
+        defaults = AnnotatedDefault.create_with_defaults(
+            EstimatorArgs, valid_params=self._get_param_names(), **kwargs
+        )
+        for key, value in defaults.items():
             setattr(self, key, value)
 
     def fit(self, X: object, y: object) -> Self:
@@ -119,6 +123,7 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
         """
         X_df = to_frame(X)
         y_arr = column_or_1d(y, warn=True)
+        check_consistent_length(X_df, y_arr)
         check_classification_targets(y_arr)
         self.classes_ = np.unique(y_arr)
         self.n_features_in_ = X_df.shape[1]
@@ -170,7 +175,11 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
         proba = np.empty((len(rows), len(candidates)))
         for start, stop in predict_batches(cb, len(rows), batch_size):
             proba[start:stop] = self.lm_.predict_proba_many(
-                knowns[start:stop], self.target_col_, candidates, generation
+                knowns[start:stop],
+                self.target_col_,
+                candidates,
+                generation,
+                row_ids=range(start, stop),
             )
         return proba
 

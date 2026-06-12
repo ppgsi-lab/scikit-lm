@@ -69,6 +69,8 @@ class Stat:
 class StatCards:
     """A row of :class:`Stat` cards.
 
+    Rendered only by the HTML renderer; the Rich one shows :class:`Metrics` instead.
+
     Parameters
     ----------
     cards : sequence of Stat
@@ -100,6 +102,9 @@ class KeyValue:
 @dataclass(frozen=True)
 class KeyValues:
     """A label/value table, plus an optional elapsed/ETA footer.
+
+    Rendered only by the HTML renderer (the hyperparameters panel); the Rich one
+    ignores it.
 
     Parameters
     ----------
@@ -151,12 +156,9 @@ class Metrics:
     ----------
     rows : sequence of MetricRow
         The metric lines, in display order; only the populated ones are present.
-    loss_window : int
-        How many recent steps the ``last N`` row averaged over, for its label.
     """
 
     rows: Sequence[MetricRow]
-    loss_window: int
 
 
 @dataclass(frozen=True)
@@ -254,6 +256,9 @@ class LogRow:
 class LogTable:
     """The recent training-log rows, newest first.
 
+    Rendered only by the HTML renderer; the Rich one ignores it (the
+    :class:`RichCallback` disables it with ``n_log_rows=0``).
+
     Parameters
     ----------
     rows : sequence of LogRow
@@ -336,12 +341,16 @@ class Predictions:
         grouped into an ``others`` entry when needed.
     bins_label : str
         Caption for the bins card (``"predicted bins"`` or its ``· top 5`` form).
+    retries : int
+        How many malformed-generation retries the phase has seen so far; renderers
+        surface it only when nonzero.
     """
 
     scoring: bool
     rows: Sequence[PredictionRow]
     bins: Sequence[BinShare]
     bins_label: str
+    retries: int = 0
 
 
 type Widget = (
@@ -355,13 +364,10 @@ class Dashboard:
 
     Parameters
     ----------
-    phase : {"fitting", "predicting", "idle"}
-        The run phase, mirrored from :class:`TrainingState`.
     children : sequence of Widget
         Top-level widgets in display order. The renderer may also pick named
         sub-sections out of this list (the Jupyter layout splits the examples panel
         and the log into their own widgets).
     """
 
-    phase: Literal["fitting", "predicting", "idle"]
     children: Sequence[Widget]

@@ -1,15 +1,18 @@
 """The shared fitted model behind every estimator.
 
 ``TabularLanguageModel`` fine-tunes one backend on serialized rows with dynamic
-feature-order permutation, then exposes two conditional primitives:
+feature-order permutation, then exposes the conditional primitives:
 
 - :meth:`complete` -- open-ended generation of target columns given known ones
   (imputer, oversampler, regressor).
 - :meth:`predict_proba` -- rank a fixed candidate set by likelihood (classifier).
+- :meth:`sample` -- draw whole rows from the learned joint distribution,
+  optionally holding columns fixed (tabular synthesis).
 """
 
 from __future__ import annotations
 
+import contextlib
 import math
 import os
 import warnings
@@ -20,7 +23,10 @@ from typing import Self
 
 import numpy as np
 import pandas as pd
+from sklearn.base import BaseEstimator
 from sklearn.model_selection import train_test_split
+from sklearn.utils import Tags
+from sklearn.utils.validation import check_array, check_is_fitted
 
 from .backend import LanguageModelBackend
 from .callbacks import Callback
@@ -28,13 +34,42 @@ from .config import GenerationConfig, ModelConfig, TrainingConfig
 from .hf_backend import HFBackend
 from .serialize import Field, JSONSerializer, Serializer, TrainingExample, is_missing
 
-__all__ = ["TabularLanguageModel"]
+__all__ = ["TabularLanguageModel", "forget", "to_frame"]
 
 _ENUMERATE_CAP = 5040  # 7!
 
 # Per-epoch serialized rows surfaced to the callback for preview; the full epoch
 # list is already in memory, so this only bounds how many are handed over.
 _TRAIN_PREVIEW = 16
+
+
+def forget(obj: object, name: str) -> None:
+    """Delete attribute ``name`` from ``obj`` if present (no-op otherwise)."""
+    with contextlib.suppress(AttributeError):
+        delattr(obj, name)
+
+
+def to_frame(X: object, columns: Sequence[str] | None = None) -> pd.DataFrame:
+    """Coerce array-like input to a DataFrame, naming columns ``x0..`` (or with
+    ``columns``) when the input is not already a DataFrame.
+
+    Non-DataFrame input is validated with scikit-learn's ``check_array`` in a mode
+    that still admits string/categorical cells and NaN (``dtype=None``,
+    ``ensure_all_finite=False``), so sparse, complex, empty, and 1-D inputs are
+    rejected with scikit-learn's standard messages while text tables pass through.
+    A DataFrame skips ``check_array`` but is still rejected when it has 0 rows.
+    """
+    if isinstance(X, pd.DataFrame):
+        if len(X) == 0:
+            raise ValueError(
+                f"Found array with 0 sample(s) (shape={X.shape}) while a minimum of 1 is required."
+            )
+        return X
+    # dtype=None keeps string/object cells & NaN; sklearn infers check_array's dtype as str
+    check_array(X, dtype=None, ensure_all_finite=False)  # pyright: ignore[reportArgumentType]
+    arr = np.asarray(X)
+    names = list(columns) if columns is not None else [f"x{i}" for i in range(arr.shape[1])]
+    return pd.DataFrame(arr, columns=names)
 
 
 def _distinct_orders(columns: list[str], k: int, rng: np.random.Generator) -> list[list[str]]:
@@ -142,6 +177,15 @@ def _split_indices(
     return np.asarray(train_idx).tolist(), np.asarray(eval_idx).tolist()
 
 
+def _native(value: object) -> object:
+    """Unbox a NumPy scalar into its native Python equivalent.
+
+    Inference inputs (knowns, candidates, sample conditions) arrive from user
+    code and often carry NumPy scalars; serializers must see native types
+    (``repr(np.float64(1.5))`` is ``"np.float64(1.5)"`` on NumPy >= 2)."""
+    return value.item() if isinstance(value, np.generic) else value
+
+
 @dataclass(frozen=True, slots=True)
 class _ScoreSpec:
     """How to fill one scored numeric column: candidates to rank and a reducer.
@@ -156,8 +200,14 @@ class _ScoreSpec:
 
 
 @dataclass(kw_only=True)
-class TabularLanguageModel:
+class TabularLanguageModel(BaseEstimator):
     """The fitted model shared by every estimator.
+
+    A scikit-learn :class:`~sklearn.base.BaseEstimator` in its own right
+    (clonable, ``get_params``/``set_params`` with the nested-config ``__``
+    convention), in the mold of the library's generators such as
+    :class:`~sklearn.neighbors.KernelDensity`: ``fit`` learns the joint
+    distribution and :meth:`sample` draws rows from it.
 
     Parameters
     ----------
@@ -182,6 +232,10 @@ class TabularLanguageModel:
         Training column order, recorded at :meth:`fit`.
     numeric_cols_ : frozenset[str]
         Names of the numeric columns, recorded at :meth:`fit`.
+    n_features_in_ : int
+        Number of columns seen at :meth:`fit`.
+    feature_names_in_ : numpy.ndarray
+        Column names seen at :meth:`fit`; only set for DataFrame input.
     """
 
     backend: LanguageModelBackend = field(default_factory=HFBackend)
@@ -198,7 +252,9 @@ class TabularLanguageModel:
         # estimator stays picklable, restoring a no-op on load.
         return {**self.__dict__, "callback": Callback()}
 
-    def fit(self, frame: pd.DataFrame, *, target_cols: frozenset[str] = frozenset()) -> Self:
+    def fit(
+        self, X: object, y: object = None, *, target_cols: frozenset[str] = frozenset()
+    ) -> Self:
         """Fine-tune the backend on serialized rows.
 
         Each epoch re-permutes the column order per row (NaN cells are dropped),
@@ -206,8 +262,13 @@ class TabularLanguageModel:
 
         Parameters
         ----------
-        frame : pandas.DataFrame
-            Training table; numeric columns are detected via dtype.
+        X : array-like or pandas.DataFrame of shape (n_samples, n_features)
+            Training table; numeric columns are detected via dtype. Array-like
+            input gets ``x0..`` column names.
+        y : ignored
+            Present for scikit-learn API compatibility. The model learns the
+            joint distribution over every column, so a supervised target enters
+            as a column of ``X`` (the estimators append it before calling this).
         target_cols : frozenset of str, optional
             Columns to treat as targets when ``training.loss_on_target_only`` is
             enabled: each row's observed target cells are serialized last and the
@@ -222,14 +283,20 @@ class TabularLanguageModel:
         Raises
         ------
         ValueError
-            If ``frame`` has duplicate column names (which would make
+            If ``X`` has duplicate column names (which would make
             row serialization last-wins and break per-column indexing).
         """
+        frame = to_frame(X)
         duplicates = frame.columns[frame.columns.duplicated()].unique().tolist()
         if duplicates:
             raise ValueError(f"duplicate column names are not supported: {duplicates}")
         self.columns_ = list(frame.columns)
         self.numeric_cols_ = frozenset(frame.select_dtypes(include="number").columns)
+        self.n_features_in_ = frame.shape[1]
+        if isinstance(X, pd.DataFrame):
+            self.feature_names_in_ = np.asarray(X.columns, dtype=object)
+        else:
+            forget(self, "feature_names_in_")
         # sklearn convention: random_state=None is non-deterministic. Draw one base
         # seed per fit so each epoch's permutation is seeded on (base_seed, epoch) --
         # idempotent within the fit, fresh across fits when None.
@@ -305,7 +372,17 @@ class TabularLanguageModel:
         return self
 
     def _fields(self, known: Mapping[str, object]) -> list[Field]:
-        return [Field(c, v, c in self.numeric_cols_) for c, v in known.items()]
+        return [Field(c, _native(v), c in self.numeric_cols_) for c, v in known.items()]
+
+    def _order_rng(self, row_id: int) -> np.random.Generator:
+        """RNG for one row's column-order draws, seeded on ``(random_state, row_id)``.
+
+        Seeding on the row's absolute identity rather than its position within
+        one call keeps order draws invariant to how callers chunk rows across
+        calls -- the batch-size invariance the estimators promise.
+        """
+        base = self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
+        return np.random.default_rng([base, row_id])
 
     def _resolve_batch_size(self, generation: GenerationConfig) -> int:
         """Inference batch size: ``generation.inference_batch_size`` or training ``batch_size``."""
@@ -321,12 +398,15 @@ class TabularLanguageModel:
         Requests are generated in chunks of ``inference_batch_size``; malformed
         decodings are re-batched and retried (firing ``on_retry`` each round)
         until they parse or ``max_retries`` is exhausted, where they stay
-        ``None``. Per-request attempt budget matches the unbatched path.
+        ``None``. Per-request attempt budget matches the unbatched path. With
+        greedy decoding (``generation.temperature <= 0``) every retry would
+        reproduce the same text byte for byte, so a single attempt is made.
         """
         results: list[object | None] = [None] * len(requests)
         pending = list(range(len(requests)))
         batch_size = self._resolve_batch_size(generation)
-        for attempt in range(1, self.max_retries + 1):
+        max_attempts = 1 if generation.temperature <= 0 else self.max_retries
+        for attempt in range(1, max_attempts + 1):
             if not pending:
                 break
             still: list[int] = []
@@ -343,7 +423,7 @@ class TabularLanguageModel:
                     else:
                         results[i] = value
             for i in still:
-                self.callback.on_retry(requests[i][1], attempt, self.max_retries)
+                self.callback.on_retry(requests[i][1], attempt, max_attempts)
             pending = still
         return results
 
@@ -423,18 +503,85 @@ class TabularLanguageModel:
         """
         return self.complete_many([known], [targets], generation)[0]
 
+    def sample(
+        self,
+        n_samples: int = 1,
+        *,
+        condition: Mapping[str, object] | Sequence[Mapping[str, object]] | None = None,
+        generation: GenerationConfig = GenerationConfig(),
+    ) -> pd.DataFrame:
+        """Draw rows from the learned joint distribution.
+
+        Each row is generated one column at a time in the training column
+        order, every cell conditioning on ``condition`` plus the cells already
+        produced -- the autoregressive factorization the permuted fine-tune was
+        trained for.
+
+        Parameters
+        ----------
+        n_samples : int, optional
+            Number of rows to draw. Default ``1``.
+        condition : mapping, sequence of mappings, or None, optional
+            Columns to hold fixed. A single mapping is broadcast to all
+            ``n_samples`` rows; a sequence gives one mapping per row and
+            overrides ``n_samples``. ``None`` (default) samples
+            unconditionally.
+        generation : GenerationConfig, optional
+            Sampling hyperparameters (and ``inference_batch_size``).
+
+        Returns
+        -------
+        pandas.DataFrame
+            One row per draw, columns in the training order; numeric columns
+            are cast to float.
+
+        Raises
+        ------
+        ValueError
+            If ``condition`` references a column not seen at fit.
+        RuntimeError
+            If any row keeps a malformed cell after ``max_retries`` -- never a
+            silent partial table.
+        """
+        check_is_fitted(self, "columns_")
+        if condition is None:
+            knowns: list[Mapping[str, object]] = [{}] * n_samples
+        elif isinstance(condition, Mapping):
+            knowns = [condition] * n_samples
+        else:
+            knowns = list(condition)
+        seen = set(self.columns_)
+        unknown = sorted({c for known in knowns for c in known if c not in seen})
+        if unknown:
+            raise ValueError(f"condition references columns not seen at fit: {unknown}")
+        targets = [[c for c in self.columns_ if c not in known] for known in knowns]
+        rows = self.complete_many(knowns, targets, generation)
+        completed = [r for r in rows if r is not None]
+        if len(completed) != len(rows):
+            raise RuntimeError(
+                f"{len(rows) - len(completed)} of {len(rows)} sampled rows stayed "
+                f"malformed after {self.max_retries} attempts"
+            )
+        out = pd.DataFrame(completed, columns=self.columns_)
+        numeric = [c for c in self.columns_ if c in self.numeric_cols_]
+        out[numeric] = out[numeric].astype(float)
+        return out
+
     def sample_aggregate_many(
         self,
         knowns: Sequence[Mapping[str, object]],
         targets: Sequence[Sequence[str]],
         generation: GenerationConfig,
+        *,
+        row_ids: Sequence[int] | None = None,
     ) -> list[dict[str, object] | None]:
         """Draw ``generation.n_samples`` completions per row and aggregate them.
 
         Each row is expanded into ``n_samples`` independent completion requests
         (optionally re-permuting the conditioning columns' order per draw when
-        ``generation.permute_order``), generated through :meth:`complete_many`,
-        then collapsed cell by cell with ``generation.aggregate`` -- numeric
+        ``generation.permute_order`` and ``n_samples > 1``), generated through
+        :meth:`complete_many`, then collapsed cell by cell with
+        ``generation.aggregate`` -- numeric
         columns and the rest routed by :attr:`numeric_cols_`. This is the
         ensemble-and-aggregate counterpart to :meth:`complete_many`, used by the
         estimators that average over draws (regressor, imputer).
@@ -448,6 +595,11 @@ class TabularLanguageModel:
         generation : GenerationConfig
             Carries ``n_samples``, ``permute_order``, ``aggregate`` and the
             sampling hyperparameters.
+        row_ids : Sequence[int] or None, optional
+            Absolute row identities (within the caller's full prediction set)
+            used to seed the per-row order draws, so chunked calls produce the
+            same orders as a single call. ``None`` (default) numbers the rows
+            ``0..len(knowns)-1``.
 
         Returns
         -------
@@ -457,13 +609,13 @@ class TabularLanguageModel:
             malformed after ``max_retries``.
         """
         n = generation.n_samples
-        rng = np.random.default_rng(self.random_state)
+        ids = row_ids if row_ids is not None else range(len(knowns))
         flat_knowns: list[Mapping[str, object]] = []
         flat_targets: list[Sequence[str]] = []
-        for known, target in zip(knowns, targets, strict=True):
+        for known, target, row_id in zip(knowns, targets, ids, strict=True):
             cols = list(known)
-            if generation.permute_order and len(cols) > 1:
-                distinct = _distinct_orders(cols, n, rng)
+            if generation.permute_order and n > 1 and len(cols) > 1:
+                distinct = _distinct_orders(cols, n, self._order_rng(row_id))
                 orders = [distinct[j % len(distinct)] for j in range(n)]
             else:
                 orders = [cols] * n
@@ -491,6 +643,7 @@ class TabularLanguageModel:
         generation: GenerationConfig,
         *,
         score: Mapping[str, _ScoreSpec],
+        row_ids: Sequence[int] | None = None,
     ) -> list[dict[str, object] | None]:
         """Fill each row's targets cell by cell, scoring some and generating the rest.
 
@@ -514,6 +667,11 @@ class TabularLanguageModel:
         score : Mapping[str, _ScoreSpec]
             Columns to fill by candidate scoring, each carrying its candidates and
             a reduction closure. Columns absent from this mapping are generated.
+        row_ids : Sequence[int] or None, optional
+            Absolute row identities (within the caller's full prediction set)
+            used to seed the per-row order draws, so chunked calls produce the
+            same orders as a single call. ``None`` (default) numbers the rows
+            ``0..len(knowns)-1``.
 
         Returns
         -------
@@ -522,6 +680,7 @@ class TabularLanguageModel:
             ``None`` if one of that row's generated cells stayed malformed after
             ``max_retries``.
         """
+        ids = row_ids if row_ids is not None else range(len(knowns))
         filled = [dict(k) for k in knowns]
         alive = [True] * len(knowns)
         max_steps = max((len(t) for t in targets), default=0)
@@ -538,7 +697,11 @@ class TabularLanguageModel:
             for col, rows in score_by_col.items():
                 spec = score[col]
                 proba = self.predict_proba_many(
-                    [filled[i] for i in rows], col, spec.candidates, generation
+                    [filled[i] for i in rows],
+                    col,
+                    spec.candidates,
+                    generation,
+                    row_ids=[ids[i] for i in rows],
                 )
                 for j, i in enumerate(rows):
                     filled[i][col] = spec.reduce(proba[j], spec.candidates)
@@ -548,6 +711,7 @@ class TabularLanguageModel:
                     [filled[i] for i in gen_rows],
                     [[gen_cols[i]] for i in gen_rows],
                     generation,
+                    row_ids=[ids[i] for i in gen_rows],
                 )
                 for j, i in enumerate(gen_rows):
                     out = outs[j]
@@ -560,15 +724,10 @@ class TabularLanguageModel:
     def _distribution(self, logprobs: np.ndarray) -> np.ndarray:
         """Softmax a candidate log-likelihood vector into a probability row.
 
-        Falls back to a uniform distribution when no candidate is finite, and
-        puts all mass on the ``+inf`` candidates when any has infinite
-        log-likelihood.
+        Falls back to a uniform distribution when no candidate is finite.
         """
         n = len(logprobs)
         uniform = np.full(n, 1.0 / n)
-        if np.isposinf(logprobs).any():
-            mass = np.where(np.isposinf(logprobs), 1.0, 0.0)
-            return mass / mass.sum()
         finite = np.isfinite(logprobs)
         if not finite.any():
             return uniform
@@ -583,6 +742,8 @@ class TabularLanguageModel:
         target: str,
         candidates: Sequence[object],
         generation: GenerationConfig,
+        *,
+        row_ids: Sequence[int] | None = None,
     ) -> np.ndarray:
         """Rank ``candidates`` for ``target`` across many rows at once.
 
@@ -602,6 +763,11 @@ class TabularLanguageModel:
             Carries ``inference_batch_size`` and, for order marginalization,
             ``permute_order`` / ``n_samples`` / ``score_pool``. The temperature
             sampling fields are unused (scoring is deterministic).
+        row_ids : Sequence[int] or None, optional
+            Absolute row identities (within the caller's full prediction set)
+            used to seed the per-row order draws, so chunked calls produce the
+            same orders as a single call. ``None`` (default) numbers the rows
+            ``0..len(knowns)-1``.
 
         Returns
         -------
@@ -626,22 +792,22 @@ class TabularLanguageModel:
         if not candidates:
             raise ValueError("candidates must be non-empty to rank")
         numeric = target in self.numeric_cols_
-        encoded = [self.serializer.encode_value(c, numeric=numeric) for c in candidates]
-        rng = np.random.default_rng(self.random_state)
+        encoded = [self.serializer.encode_value(_native(c), numeric=numeric) for c in candidates]
+        ids = row_ids if row_ids is not None else range(len(knowns))
         multi = generation.permute_order and generation.n_samples > 1
         n_cand = len(candidates)
         row_prompts: list[list[str]] = []
-        for k in knowns:
+        for k, row_id in zip(knowns, ids, strict=True):
             cols = list(k)
             orders = (
-                _distinct_orders(cols, generation.n_samples, rng)
+                _distinct_orders(cols, generation.n_samples, self._order_rng(row_id))
                 if multi and len(cols) > 1
                 else [cols]
             )
             row_prompts.append(
                 [
                     self.serializer.prefix(
-                        [Field(c, k[c], c in self.numeric_cols_) for c in order], target
+                        [Field(c, _native(k[c]), c in self.numeric_cols_) for c in order], target
                     )
                     for order in orders
                 ]
@@ -696,9 +862,7 @@ class TabularLanguageModel:
 
         Notes
         -----
-        Falls back to a uniform distribution when no candidate is finite, and
-        puts all mass on the ``+inf`` candidates when any has infinite
-        log-likelihood.
+        Falls back to a uniform distribution when no candidate is finite.
         """
         return self.predict_proba_many([known], target, candidates, GenerationConfig())[0]
 
@@ -715,3 +879,10 @@ class TabularLanguageModel:
                 )
             )
         return scores
+
+    def __sklearn_tags__(self) -> Tags:
+        tags = super().__sklearn_tags__()
+        tags.input_tags.string = True
+        tags.input_tags.categorical = True
+        tags.input_tags.allow_nan = True
+        return tags

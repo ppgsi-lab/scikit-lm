@@ -66,7 +66,8 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
         cells are deterministic, generated cells draw and aggregate
         ``generation.n_samples`` per cell.
     serializer : str or Serializer, optional
-        ``"json"`` or a custom :class:`~sklm.Serializer`. Default ``"json"``.
+        ``"json"``, ``"key-value"``, ``"bracket"``, or a custom
+        :class:`~sklm.Serializer`. Default ``"json"``.
     max_decimals : int or None, optional
         Round numeric cells to at most this many decimal places when
         serializing. Applies only to the string ``serializer`` selectors; a
@@ -115,7 +116,10 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
 
     def __init__(self, model: str = "distilgpt2", **kwargs: Unpack[ImputerArgs]) -> None:
         self.model = model
-        for key, value in AnnotatedDefault.create_with_defaults(ImputerArgs, **kwargs).items():
+        defaults = AnnotatedDefault.create_with_defaults(
+            ImputerArgs, valid_params=self._get_param_names(), **kwargs
+        )
+        for key, value in defaults.items():
             setattr(self, key, value)
 
     def fit(self, X: object, y: object = None) -> Self:
@@ -225,11 +229,15 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
         for start, stop in predict_batches(cb, len(rows), batch_size):
             if score:
                 filled = self.lm_.impute_many(
-                    knowns[start:stop], targets[start:stop], generation, score=score
+                    knowns[start:stop],
+                    targets[start:stop],
+                    generation,
+                    score=score,
+                    row_ids=range(start, stop),
                 )
             else:
                 filled = self.lm_.sample_aggregate_many(
-                    knowns[start:stop], targets[start:stop], generation
+                    knowns[start:stop], targets[start:stop], generation, row_ids=range(start, stop)
                 )
             for j, i in enumerate(range(start, stop)):
                 row = filled[j]

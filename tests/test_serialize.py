@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from sklm import (
@@ -31,6 +32,20 @@ def test_encode_value() -> None:
     assert s.encode_value(39.0, numeric=True) == "39.0"
     assert s.encode_value(3.5, numeric=True) == "3.5"
     assert s.encode_value("a, b", numeric=False) == '"a, b"'
+
+
+def test_numeric_encode_unboxes_numpy_scalars() -> None:
+    # repr(np.float64(1.5)) is "np.float64(1.5)" on numpy >= 2; encoding it
+    # verbatim would silently corrupt the serialized text
+    s = JSONSerializer()
+    assert s.encode_value(np.float64(1.5), numeric=True) == "1.5"
+    assert s.encode_value(np.float32(1.5), numeric=True) == "1.5"
+    assert s.encode_value(np.int64(7), numeric=True) == "7"
+
+
+def test_numeric_encode_rejects_non_numbers() -> None:
+    with pytest.raises(TypeError, match="numeric cell"):
+        JSONSerializer().encode_value("39", numeric=True)
 
 
 def test_decode_value_tolerates_trailing_text() -> None:

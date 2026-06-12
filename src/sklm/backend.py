@@ -18,7 +18,42 @@ from .callbacks import Callback
 from .config import GenerationConfig, ModelConfig, TrainingConfig
 from .serialize import TrainingExample
 
-__all__ = ["LanguageModelBackend", "resolve_max_new_tokens", "resolve_max_seq_length"]
+__all__ = [
+    "LanguageModelBackend",
+    "common_token_prefix",
+    "resolve_max_new_tokens",
+    "resolve_max_seq_length",
+]
+
+
+def common_token_prefix(prompt_ids: Sequence[int], ids: Sequence[int]) -> int:
+    """Length of the longest token prefix ``prompt_ids`` shares with ``ids``.
+
+    Both backends locate the prompt/continuation boundary this way -- in
+    ``score`` and in the loss-on-target-only prompt mask -- because tokenizing
+    ``prompt + continuation`` may BPE-merge tokens at the prompt's trailing
+    edge, so ``len(prompt_ids)`` alone over- or under-shoots. Returns the raw
+    prefix length; each call site applies its own clamp (``score`` keeps at
+    least one continuation token, the datasets supervise at least one token).
+
+    Parameters
+    ----------
+    prompt_ids : Sequence[int]
+        Token ids of the prompt alone.
+    ids : Sequence[int]
+        Token ids of the full ``prompt + continuation`` text.
+
+    Returns
+    -------
+    int
+        Number of leading tokens identical in both sequences.
+    """
+    n = 0
+    for a, b in zip(prompt_ids, ids, strict=False):
+        if a != b:
+            break
+        n += 1
+    return n
 
 
 def resolve_max_new_tokens(generation: GenerationConfig, max_seq_length: int) -> int:

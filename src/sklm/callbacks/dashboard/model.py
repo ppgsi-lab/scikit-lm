@@ -13,6 +13,7 @@ from ..events import (
     FitStart,
     Generation,
     PredictStart,
+    Retry,
     RowEnd,
     Score,
     TrainingState,
@@ -46,8 +47,8 @@ class DashboardState:
     Rich one-line detail and a Jupyter widget can both be built from them), the
     aggregated training-log rows plus the open interval, the eval-by-step map, the
     verdict aggregates (count, confidence sum, uncertain count, bin counts and the
-    candidate colors) and the progress cursor (done / total / start time) with the
-    log-bucket cursor.
+    candidate colors), the malformed-generation retry count and the progress cursor
+    (done / total / start time) with the log-bucket cursor.
 
     Both live callbacks (:class:`JupyterCallback` and :class:`RichCallback`) fold
     events through this same accumulator; :class:`build.build_fit_dashboard` /
@@ -81,6 +82,7 @@ class DashboardState:
         self.uncertain = 0
         self.bin_counts: dict[object, int] = {}
         self.cand_colors: dict[object, str] = {}
+        self.retries = 0
         self.log: list[dict[str, Any]] = []
         self.pending: list[dict[str, Any]] = []
         self.eval_by_step: dict[int, float] = {}
@@ -114,6 +116,7 @@ class DashboardState:
                 self.score_count, self.conf_sum, self.uncertain = 0, 0.0, 0
                 self.bin_counts = {}
                 self.cand_colors = {}
+                self.retries = 0
                 self.done, self.total, self.t0 = 0, n, monotonic()
             case FitEnd():
                 self.flush_log()
@@ -153,6 +156,8 @@ class DashboardState:
                 for candidate in candidates:
                     self.color_for(candidate)
                 self.generations.append({"kind": "score", "prompt": prompts[0], "ranking": ranking})
+            case Retry():
+                self.retries += 1
             case _:
                 pass
 

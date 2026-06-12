@@ -180,6 +180,9 @@ class RichRenderer:
     def predict(self, dashboard: Dashboard, *, progress: Progress) -> RenderableType:
         """The inference dashboard: header, progress bar and recent predictions.
 
+        A ``retries N`` line appears between the bar and the table once a
+        malformed generation forces a retry, so a stalling predict is visible.
+
         Parameters
         ----------
         dashboard : Dashboard
@@ -197,12 +200,11 @@ class RichRenderer:
 
         header = _pick(dashboard, Header)
         predictions = _pick(dashboard, Predictions)
-        return Group(
-            self._header(header),
-            progress,
-            Text(""),
-            self._section("recent predictions", self._prediction_lines(predictions)),
-        )
+        blocks: list[RenderableType] = [self._header(header), progress, Text("")]
+        if predictions.retries:
+            blocks.append(Text(f"retries {predictions.retries}", style="yellow"))
+        blocks.append(self._section("recent predictions", self._prediction_lines(predictions)))
+        return Group(*blocks)
 
     # --------------------------------------------------------------------- header
 

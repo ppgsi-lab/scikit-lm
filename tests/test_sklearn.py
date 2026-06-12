@@ -1,8 +1,9 @@
 """scikit-learn conformance, run against a real (MLX) backend.
 
 ``parametrize_with_checks`` runs the official estimator-check suite against the
-classifier, regressor, and imputer wired to a real MLX backend -- no test double,
-so the genuine serialize / fine-tune / infer path is exercised. The bulk fits a
+classifier, regressor, imputer, and the core ``TabularLanguageModel`` wired to a
+real MLX backend -- no test double, so the genuine serialize / fine-tune / infer
+path is exercised. The bulk fits a
 single epoch (a real but shallow fit): only the two learning checks need a
 trained model, and those are split into ``test_sklearn_learns_mlx`` at full
 epochs. Inference is kept deterministic -- the classifier scores candidates, the
@@ -44,6 +45,8 @@ from sklm import (
     LanguageModelImputer,
     LanguageModelOverSampler,
     LanguageModelRegressor,
+    ModelConfig,
+    TabularLanguageModel,
     TrainingConfig,
 )
 
@@ -60,14 +63,20 @@ requires_mlx = pytest.mark.skipif(
 
 def _bulk_clf() -> LanguageModelClassifier:
     return LanguageModelClassifier(
-        model=_MLX_MODEL, backend="mlx", random_state=0, callback=[],
+        model=_MLX_MODEL,
+        backend="mlx",
+        random_state=0,
+        callback=[],
         training=TrainingConfig(epochs=1, batch_size=8),
     )
 
 
 def _bulk_reg() -> LanguageModelRegressor:
     return LanguageModelRegressor(
-        model=_MLX_MODEL, backend="mlx", random_state=0, callback=[],
+        model=_MLX_MODEL,
+        backend="mlx",
+        random_state=0,
+        callback=[],
         training=TrainingConfig(epochs=1, batch_size=8),
         discretization=DiscretizationConfig(bins=64),
     )
@@ -75,17 +84,37 @@ def _bulk_reg() -> LanguageModelRegressor:
 
 def _bulk_imp() -> LanguageModelImputer:
     return LanguageModelImputer(
-        model=_MLX_MODEL, backend="mlx", random_state=0, callback=[],
+        model=_MLX_MODEL,
+        backend="mlx",
+        random_state=0,
+        callback=[],
         training=TrainingConfig(epochs=1, batch_size=8),
         generation=GenerationConfig(temperature=0.0),
     )
 
 
-_CHECKED: list[BaseEstimator] = [_bulk_clf(), _bulk_reg(), _bulk_imp()]
+def _bulk_lm() -> TabularLanguageModel:
+    from sklm import MLXBackend
+
+    return TabularLanguageModel(
+        backend=MLXBackend(),
+        model=ModelConfig(model=_MLX_MODEL),
+        training=TrainingConfig(epochs=1, batch_size=8),
+        random_state=0,
+    )
+
+
+_CHECKED: list[BaseEstimator] = [_bulk_clf(), _bulk_reg(), _bulk_imp()] + (
+    [_bulk_lm()] if _has_mlx() else []
+)
 
 _KWARGS = "PEP 692 Unpack init: sklearn introspects the raw signature (only `model` + **kwargs)"
 _NONDET = "compares two fits; MLX training is not bitwise-deterministic (GPU reduction order)"
 _LEARN = "a one-epoch bulk fit can't clear the threshold; run for real in test_sklearn_learns_mlx"
+_PROBA = (
+    "the core's predict_proba is the candidate-ranking primitive "
+    "(known, target, candidates), not the sklearn classifier method the check probes"
+)
 
 _KWARGS_CHECKS = {
     "check_no_attributes_set_in_init": _KWARGS,
@@ -105,6 +134,25 @@ _EXPECTED_FAILED: dict[str, dict[str, str]] = {
         "check_regressors_train": _LEARN,
     },
     "LanguageModelImputer": dict(_KWARGS_CHECKS),
+    "TabularLanguageModel": {
+        "check_parameters_default_constructible": (
+            "dataclass default_factory params: mutable configs must be fresh per "
+            "instance, so the init signature carries factory sentinels"
+        ),
+        "check_estimators_overwrite_params": (
+            "the backend param is a stateful execution engine: fit loads the "
+            "fine-tuned model into it by design"
+        ),
+        "check_estimators_unfitted": _PROBA,
+        "check_estimators_dtypes": _PROBA,
+        "check_estimators_pickle": _PROBA,
+        "check_n_features_in_after_fitting": _PROBA,
+        "check_methods_sample_order_invariance": _PROBA,
+        "check_methods_subset_invariance": _PROBA,
+        "check_dict_unchanged": _PROBA,
+        "check_fit_idempotent": _PROBA,
+        "check_fit2d_predict1d": _PROBA,
+    },
 }
 
 
@@ -131,14 +179,20 @@ def test_sklearn_compatible(estimator: BaseEstimator, check) -> None:
 
 def _learn_clf() -> LanguageModelClassifier:
     return LanguageModelClassifier(
-        model=_MLX_MODEL, backend="mlx", random_state=0, callback=[],
+        model=_MLX_MODEL,
+        backend="mlx",
+        random_state=0,
+        callback=[],
         training=TrainingConfig(epochs=25, batch_size=8),
     )
 
 
 def _learn_reg() -> LanguageModelRegressor:
     return LanguageModelRegressor(
-        model=_MLX_MODEL, backend="mlx", random_state=0, callback=[],
+        model=_MLX_MODEL,
+        backend="mlx",
+        random_state=0,
+        callback=[],
         training=TrainingConfig(
             epochs=10, batch_size=8, loss_on_target_only=True, augmentation_factor=16
         ),
@@ -166,10 +220,11 @@ def test_sklearn_learns_mlx(
     check(name, estimator)
 
 
-# --- shared estimator contract (all four, including the sampler) ----------
+# --- shared estimator contract (all five, including the sampler and core) --
 #
 # Constructor / clone / set_params plumbing only -- no fit, so a string backend
-# selector is enough and these stay fast and backend-agnostic.
+# selector (or the core's default backend, never loaded) is enough and these
+# stay fast and backend-agnostic.
 
 
 def _estimators() -> list[BaseEstimator]:
@@ -178,6 +233,7 @@ def _estimators() -> list[BaseEstimator]:
         LanguageModelRegressor(backend="mlx"),
         LanguageModelImputer(backend="mlx"),
         LanguageModelOverSampler(backend="mlx"),
+        TabularLanguageModel(),
     ]
 
 
@@ -200,6 +256,7 @@ def test_set_params_roundtrip(est: BaseEstimator) -> None:
         LanguageModelRegressor,
         LanguageModelImputer,
         LanguageModelOverSampler,
+        TabularLanguageModel,
     ],
 )
 def test_unknown_constructor_kwarg_raises(cls: type[BaseEstimator]) -> None:

@@ -1,7 +1,8 @@
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
 """Backend-specific paths that the parametrized contract cannot cover: LoRA
-adapters and quantization differ by backend. Each test is slow (it fine-tunes a
-real model) and self-skips without its dependency.
+adapters and quantization differ by backend. Tests marked ``slow`` fine-tune or
+load a real model and self-skip without their dependency; the
+``resolve_backend`` tests are fast and run everywhere.
 """
 
 from __future__ import annotations
@@ -22,10 +23,11 @@ from sklm import (
     ModelConfig,
     TrainingConfig,
 )
+from sklm import base as sklm_base
+from sklm.backend import LanguageModelBackend
+from sklm.base import resolve_backend
 
-from .conftest import _has_hf, _has_mlx
-
-pytestmark = pytest.mark.slow
+from .conftest import FakeBackend, _has_hf, _has_mlx
 
 _MLX_MODEL = "gabfssilva/distilgpt2"
 
@@ -48,6 +50,7 @@ def _clf_xy() -> tuple[pd.DataFrame, np.ndarray]:
 # --- HuggingFace ----------------------------------------------------------
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not _has_hf(), reason="requires the 'hf' extra")
 def test_hf_lora_and_training_knobs() -> None:
     """LoRA adapters (GPT-2 ``c_attn``) plus a non-default optimizer schedule."""
@@ -67,6 +70,7 @@ def test_hf_lora_and_training_knobs() -> None:
     assert set(clf.predict(X.head(3))).issubset(set(clf.classes_))
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not _has_hf(), reason="requires the 'hf' extra")
 def test_hf_generation_knobs() -> None:
     """top_p / top_k / repetition_penalty reach the sampler without error."""
@@ -81,6 +85,7 @@ def test_hf_generation_knobs() -> None:
     assert out.isna().sum().sum() == 0
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not _has_mps_bnb(), reason="requires MPS + mps-bitsandbytes")
 def test_hf_qlora_mps() -> None:
     """QLoRA on Apple Silicon: 4-bit quantization + LoRA + an 8-bit optimizer."""
@@ -98,6 +103,7 @@ def test_hf_qlora_mps() -> None:
 # --- MLX ------------------------------------------------------------------
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon")
 def test_mlx_lora_all_linear() -> None:
     """ "all-linear" auto-discovers LoRA targets (portable across backends)."""
@@ -112,6 +118,7 @@ def test_mlx_lora_all_linear() -> None:
     assert set(clf.predict(X.head(3))).issubset(set(clf.classes_))
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon")
 @pytest.mark.parametrize("quantization", ["2bit", "3bit", "4bit", "6bit", "8bit"])
 def test_mlx_quantization(quantization: str) -> None:
@@ -148,11 +155,120 @@ def _score_truncates_right(backend: HFBackend | MLXBackend, model: str) -> None:
     assert overflow == float("-inf")
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not _has_hf(), reason="requires the 'hf' extra")
 def test_hf_score_truncates_right() -> None:
     _score_truncates_right(HFBackend(), "distilgpt2")
 
 
+@pytest.mark.slow
 @pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon")
 def test_mlx_score_truncates_right() -> None:
     _score_truncates_right(MLXBackend(), _MLX_MODEL)
+
+
+# --- HF/MLX score rank parity on shared weights ----------------------------
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(
+    not (_has_hf() and _has_mlx()),
+    reason="requires both the 'hf' and 'mlx' extras on Apple Silicon",
+)
+def test_score_ranks_identically_across_backends() -> None:
+    """Convention: ``HFBackend.score`` and ``MLXBackend.score`` are behaviorally
+    identical. On the unmodified base model (``gabfssilva/distilgpt2`` mirrors
+    distilgpt2's GPT-2 weights in an mlx-loadable layout) both backends must rank
+    a candidate set the same way -- including a prompt ending in a space, where
+    BPE merges the space into the continuation's first token and the
+    longest-common-token-prefix boundary diverges from the character boundary.
+    """
+    hf = HFBackend()
+    hf._load("distilgpt2", ModelConfig())
+    mlx = MLXBackend()
+    mlx._load(_MLX_MODEL, ModelConfig())
+
+    candidates = ["Paris", "London", "banana", "the the the"]
+    for prompt in ["The capital of France is ", "The capital of France is"]:
+        prompts = [prompt] * len(candidates)
+        hf_scores = hf.score(prompts, candidates)
+        mlx_scores = mlx.score(prompts, candidates)
+        assert np.argsort(hf_scores).tolist() == np.argsort(mlx_scores).tolist(), prompt
+        # observed cross-stack drift is ~0.02 in mean per-token log-likelihood
+        np.testing.assert_allclose(hf_scores, mlx_scores, atol=0.1)
+
+
+# --- resolve_backend (fast, no torch/mlx needed) ----------------------------
+
+
+def test_resolve_backend_unknown_selector_raises() -> None:
+    with pytest.raises(ValueError, match="unknown backend 'nope'"):
+        resolve_backend("nope")
+
+
+def test_resolve_backend_passes_instances_through() -> None:
+    backend = FakeBackend()
+    assert resolve_backend(backend) is backend
+
+
+class _SentinelMLXBackend(FakeBackend):
+    """Stands in for the lazily imported MLX backend in resolution tests."""
+
+
+def _resolve_auto_with(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    system: str,
+    hf: bool = False,
+    mlx: bool = False,
+    hf_gpu: bool = False,
+    mlx_gpu: bool = False,
+) -> LanguageModelBackend:
+    monkeypatch.setattr(sklm_base.platform, "system", lambda: system)
+    monkeypatch.setattr(sklm_base, "_has_hf", lambda: hf)
+    monkeypatch.setattr(sklm_base, "_has_mlx", lambda: mlx)
+    monkeypatch.setattr(sklm_base, "_hf_gpu_available", lambda: hf_gpu)
+    monkeypatch.setattr(sklm_base, "_mlx_gpu_available", lambda: mlx_gpu)
+    monkeypatch.setattr(sklm_base, "_mlx_backend", _SentinelMLXBackend)
+    return resolve_backend("auto")
+
+
+def test_resolve_auto_darwin_prefers_mlx(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolved = _resolve_auto_with(monkeypatch, system="Darwin", hf=True, mlx=True, hf_gpu=True)
+    assert isinstance(resolved, _SentinelMLXBackend)
+
+
+def test_resolve_auto_darwin_without_mlx_falls_back_to_hf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = _resolve_auto_with(monkeypatch, system="Darwin", hf=True)
+    assert isinstance(resolved, HFBackend)
+
+
+def test_resolve_auto_linux_prefers_hf_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolved = _resolve_auto_with(
+        monkeypatch, system="Linux", hf=True, mlx=True, hf_gpu=True, mlx_gpu=True
+    )
+    assert isinstance(resolved, HFBackend)
+
+
+def test_resolve_auto_linux_mlx_gpu_beats_hf_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolved = _resolve_auto_with(monkeypatch, system="Linux", hf=True, mlx=True, mlx_gpu=True)
+    assert isinstance(resolved, _SentinelMLXBackend)
+
+
+def test_resolve_auto_linux_hf_cpu_beats_mlx_cpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolved = _resolve_auto_with(monkeypatch, system="Linux", hf=True, mlx=True)
+    assert isinstance(resolved, HFBackend)
+
+
+def test_resolve_auto_linux_mlx_cpu_last(monkeypatch: pytest.MonkeyPatch) -> None:
+    resolved = _resolve_auto_with(monkeypatch, system="Linux", mlx=True)
+    assert isinstance(resolved, _SentinelMLXBackend)
+
+
+def test_resolve_auto_nothing_installed_falls_back_to_hf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    resolved = _resolve_auto_with(monkeypatch, system="Linux")
+    assert isinstance(resolved, HFBackend)

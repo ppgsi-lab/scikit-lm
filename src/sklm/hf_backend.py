@@ -20,7 +20,7 @@ from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from typing import Any
 
-from .backend import resolve_max_new_tokens, resolve_max_seq_length
+from .backend import common_token_prefix, resolve_max_new_tokens, resolve_max_seq_length
 from .callbacks import Callback
 from .config import (
     GenerationConfig,
@@ -247,6 +247,8 @@ class HFBackend:
 
     def generate(self, prompts: Sequence[str], generation: GenerationConfig) -> list[str]:
         """Sample a continuation per prompt (greedy when ``temperature <= 0``)."""
+        if not prompts:
+            return []
         tok, lm = self._tokenizer, self._model
         tok.padding_side = "left"
         tok.truncation_side = "left"
@@ -309,10 +311,7 @@ class HFBackend:
             ids = tok(prompt + continuation, truncation=True, max_length=self._max_seq_length)[
                 "input_ids"
             ]
-            start = 0
-            while start < len(prompt_ids) and start < len(ids) and prompt_ids[start] == ids[start]:
-                start += 1
-            starts.append(max(start, 1))
+            starts.append(max(common_token_prefix(prompt_ids, ids), 1))
             full_ids.append(ids)
         enc = tok.pad({"input_ids": full_ids}, return_tensors="pt").to(device)
         input_ids, attention_mask = enc["input_ids"], enc["attention_mask"]
@@ -673,11 +672,7 @@ def _text_dataset(
             }
             if ex.prompt:
                 prompt_ids = tokenizer(ex.prompt)["input_ids"]
-                n = 0
-                for a, b in zip(prompt_ids, enc["input_ids"], strict=False):
-                    if a != b:
-                        break
-                    n += 1
+                n = common_token_prefix(prompt_ids, enc["input_ids"])
                 # Always supervise at least one token to avoid an all-masked row.
                 item["prompt_len"] = min(n, len(enc["input_ids"]) - 1)
             return item
