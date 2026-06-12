@@ -934,8 +934,13 @@ pure table synthesizer.
   columns, long text cells, or subtle conditionals — and add LoRA + bf16 at
   that point.
 - **`batch_size` is the main speed lever**, for fitting and (via the
-  `inference_batch_size` default) for inference. Raise it until memory says
-  stop; results don't depend on it.
+  `inference_batch_size` default) for inference. The two halves differ on
+  safety: inference results are batch-size-invariant by construction (the
+  same prompts score the same however they are chunked), so raise
+  `inference_batch_size` until memory says stop. The training `batch_size`
+  is a normal SGD hyperparameter — it changes the optimizer-step count and
+  the gradient noise, which matters on small tables where epochs are few;
+  if you change it substantially, revisit `learning_rate`/`epochs`.
 - **Watch validation, not vibes.** `validation_split=0.1` plus
   `early_stopping_patience` turns "how many epochs?" into a measured answer,
   and the auto-dashboard plots both losses live.
