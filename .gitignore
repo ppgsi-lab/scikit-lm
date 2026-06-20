@@ -16,8 +16,14 @@ src/sklm/_version.py
 .pytest_cache/
 .ruff_cache/
 
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
 # IDE
 .idea/
 
 # Local article export, not part of the package
 llm-tabular-estimator.html
+
+# Scratch space
+scratch/

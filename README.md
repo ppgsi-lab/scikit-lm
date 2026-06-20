@@ -70,7 +70,9 @@ A tabular row is turned into a short piece of text (JSON by default), and a smal
 
 Because an autoregressive model predicts each token from the tokens before it, and because every column shows up in every position across epochs, the model is forced to learn to predict **any column from any subset of the others**:
 
-$$p(\text{any column} \mid \text{any subset of the other columns})$$
+$$
+p(\text{any column} \mid \text{any subset of the other columns})
+$$
 
 That single conditional distribution is all four estimators need. Each one is just a choice of *which columns go into the prompt* and *which column the model produces*:
 
@@ -536,7 +538,7 @@ If you use scikit-lm in your research, please cite it. GitHub's "Cite this repos
 (backed by [`CITATION.cff`](CITATION.cff)) exports BibTeX and APA automatically, or use:
 
 ```bibtex
-@software{dos_santos_silva_scikit_lm,
+@software{scikitlm2026,
   author  = {dos Santos Silva, Gabriel Francisco},
   title   = {scikit-lm: scikit-learn estimators backed by language models},
   year    = {2026},

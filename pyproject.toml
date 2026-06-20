@@ -79,10 +79,14 @@ optuna = [
 ]
 # Plotting + Jupyter toolchain for the notebooks under examples/.
 examples = ["seaborn>=0.13", "jupyterlab>=4.0", "ipywidgets"]
+# Baseline libraries the notebooks/benchmarks compare against (e.g. pyampute
+# masking, xgboost imputer).
+extras = ["pyampute>=0.0.3", "xgboost>=2.1"]
+
 # Everything; platform markers in the referenced extras keep this resolvable
 # anywhere (mlx/mps-bitsandbytes drop off Linux, mlx-cpu/bitsandbytes drop off
 # macOS). The CUDA MLX variants stay opt-in so `all` never pulls CUDA libraries.
-all = ["scikit-lm[hf,quant,hqq,mlx,mlx-cpu,tqdm,rich,jupyter,optuna,examples]"]
+all = ["scikit-lm[hf,quant,hqq,mlx,mlx-cpu,tqdm,rich,jupyter,optuna,extras,examples]"]
 
 [build-system]
 requires = ["hatchling", "hatch-vcs"]
