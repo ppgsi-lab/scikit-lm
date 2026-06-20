@@ -47,3 +47,17 @@ jobs:
         run: uv sync --extra all
       - name: Type check
         run: uv run pyright
+
+  integration-mlx:
+    name: integration (MLX / macOS arm64)
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: uv sync --extra mlx
+      - name: Integration tests
+        run: uv run pytest -m slow
