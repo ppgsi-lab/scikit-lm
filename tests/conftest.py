@@ -33,9 +33,16 @@ class FakeBackend:
     raises (a silent fallback would hide tests scoring the wrong encoding). Records
     what it was asked to do for white-box assertions."""
 
-    def __init__(self, *, value: str = "0", scores: dict[str, float] | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        value: str = "0",
+        scores: dict[str, float] | None = None,
+        token_counts: dict[str, int] | None = None,
+    ) -> None:
         self.value = value
         self.scores = scores
+        self.token_counts = token_counts or {}
         self.fit_calls = 0
         self.epoch_texts: Callable[[int], list] | None = None
         self.last_epoch_texts: list[str] | None = None
@@ -65,14 +72,28 @@ class FakeBackend:
         self.generate_batches.append(len(prompts))
         return [self.value for _ in prompts]
 
-    def score(self, prompts: Sequence[str], continuations: Sequence[str]) -> list[float]:
+    def score(
+        self,
+        prompts: Sequence[str],
+        continuations: Sequence[str],
+        *,
+        reduce: str = "mean",
+    ) -> list[float]:
         self.score_batches.append(len(prompts))
         if self.scores is not None:
             missing = sorted({c for c in continuations if c not in self.scores})
             if missing:
                 raise KeyError(f"continuations not covered by FakeBackend.scores: {missing}")
-            return [self.scores[c] for c in continuations]
-        return [-_stable(c) for c in continuations]
+            means = [self.scores[c] for c in continuations]
+        else:
+            means = [-_stable(c) for c in continuations]
+        # `scores` values are per-token means; sum scales by the stubbed token count
+        # (default 1), so length effects only surface when a test sets token_counts.
+        if reduce == "sum":
+            return [
+                m * self.token_counts.get(c, 1) for m, c in zip(means, continuations, strict=True)
+            ]
+        return means
 
 
 @pytest.fixture

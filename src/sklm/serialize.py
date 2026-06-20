@@ -24,6 +24,7 @@ import pandas as pd
 __all__ = [
     "BracketSerializer",
     "Field",
+    "IfThenSerializer",
     "JSONSerializer",
     "KeyValueSerializer",
     "NumberFormat",
@@ -382,6 +383,71 @@ class BracketSerializer:
 
     def decode_value(self, text: str, *, numeric: bool) -> object | None:
         span = text.split("]", 1)[0].strip()
+        if numeric:
+            return self.number.decode(span)
+        return span or None
+
+
+class IfThenSerializer:
+    """Serialize rows as a natural-language rule, e.g.
+    ``if x is 12, y is 24 and a is 6, then target is 32``.
+
+    The fields are read in order: every field but the last becomes a condition
+    in the ``if`` clause (comma-separated, the last two joined by ``and``), and
+    the final field becomes the ``then`` consequent -- which is exactly the
+    target the model is trained to produce last. A single-field row drops the
+    ``if`` clause (``then x is 12``).
+
+    Categorical values are written verbatim (unquoted) and decoding reads up to
+    the first comma, so values containing a comma cannot be recovered -- use
+    :class:`JSONSerializer` when that matters.
+
+    Parameters
+    ----------
+    number : NumberFormat, optional
+        How numeric cells are rendered. Defaults to :class:`PlainNumber`.
+    """
+
+    def __init__(self, *, number: NumberFormat = PlainNumber()) -> None:
+        self.number = number
+
+    def encode_value(self, value: object, *, numeric: bool) -> str:
+        return self.number.encode(value) if numeric else str(value)
+
+    def _pair(self, field: Field) -> str:
+        return f"{field.name!s} is {self.encode_value(field.value, numeric=field.numeric)}"
+
+    @staticmethod
+    def _connector(index: int, n: int) -> str:
+        """Text that precedes field ``index`` in an ``n``-field rule."""
+        if index == 0:
+            return "then " if n == 1 else "if "
+        if index == n - 1:
+            return ", then "
+        return " and " if index == n - 2 else ", "
+
+    def serialize(self, fields: Sequence[Field]) -> str:
+        n = len(fields)
+        return "".join(self._connector(i, n) + self._pair(f) for i, f in enumerate(fields))
+
+    def prefix(self, known: Sequence[Field], target: object) -> str:
+        n = len(known) + 1
+        head = "".join(self._connector(i, n) + self._pair(f) for i, f in enumerate(known))
+        return head + self._connector(n - 1, n) + f"{target!s} is "
+
+    def split(self, context: Sequence[Field], target: Sequence[Field]) -> tuple[str, str]:
+        full = [*context, *target]
+        n = len(full)
+        c = len(context)
+        prompt = "".join(self._connector(i, n) + self._pair(full[i]) for i in range(c))
+        prompt += self._connector(c, n)
+        completion = self._pair(full[c]) + "".join(
+            self._connector(i, n) + self._pair(full[i]) for i in range(c + 1, n)
+        )
+        return prompt, completion
+
+    def decode_value(self, text: str, *, numeric: bool) -> object | None:
+        span = text.split(",", 1)[0].strip()
         if numeric:
             return self.number.decode(span)
         return span or None

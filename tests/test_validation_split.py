@@ -13,8 +13,14 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
+from sklearn.base import clone
 
-from sklm import LanguageModelClassifier, LanguageModelRegressor, TrainingConfig
+from sklm import (
+    CheckpointConfig,
+    LanguageModelClassifier,
+    LanguageModelRegressor,
+    TrainingConfig,
+)
 from sklm.core import _split_indices, _strata
 
 from .conftest import FakeBackend
@@ -29,9 +35,36 @@ def test_validation_split_out_of_range_raises() -> None:
         TrainingConfig(validation_split=-0.1)
 
 
-def test_checkpoint_steps_must_be_positive() -> None:
-    with pytest.raises(ValueError, match="checkpoint_steps"):
-        TrainingConfig(checkpoint_steps=0)
+def test_checkpoint_config_defaults() -> None:
+    ckpt = CheckpointConfig()
+    assert ckpt.each == 1
+    assert ckpt.on == "step"
+    assert ckpt.dir is None
+    assert ckpt.keep == 1
+
+
+def test_checkpoint_each_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="each"):
+        CheckpointConfig(each=0)
+
+
+def test_checkpoint_keep_must_be_positive_or_none() -> None:
+    with pytest.raises(ValueError, match="keep"):
+        CheckpointConfig(keep=0)
+    assert CheckpointConfig(keep=None).keep is None
+
+
+def test_checkpoint_nested_set_params_recurses() -> None:
+    clf = LanguageModelClassifier(
+        training=TrainingConfig(checkpoint=CheckpointConfig(each=2, on="epoch"))
+    )
+    clf.set_params(training__checkpoint__each=4)
+    ckpt = clf.training.checkpoint
+    assert ckpt is not None and ckpt.each == 4
+    cloned = clone(clf)
+    assert isinstance(cloned, LanguageModelClassifier)
+    cloned_ckpt = cloned.training.checkpoint
+    assert cloned_ckpt is not None and cloned_ckpt.on == "epoch"
 
 
 def test_early_stopping_requires_validation_split() -> None:

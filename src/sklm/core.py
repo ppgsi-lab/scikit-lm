@@ -16,7 +16,7 @@ import contextlib
 import math
 import os
 import warnings
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from itertools import permutations
 from typing import Self
@@ -188,15 +188,17 @@ def _native(value: object) -> object:
 
 @dataclass(frozen=True, slots=True)
 class _ScoreSpec:
-    """How to fill one scored numeric column: candidates to rank and a reducer.
+    """How to fill one scored column: candidates to rank and a reducer.
 
-    Lets :meth:`TabularLanguageModel.impute_many` stay agnostic of the
-    discretization configuration -- the imputer injects, per column, the candidate
-    set and a ``(proba_row, candidates) -> value`` reduction closure.
+    Lets :meth:`TabularLanguageModel.impute_many` stay agnostic of what makes a
+    column discrete -- the imputer injects, per column, the candidate set (a
+    numeric grid or a categorical's observed levels) and a
+    ``(proba_row, candidates) -> value`` reduction closure (the numeric estimate
+    or a categorical argmax).
     """
 
-    candidates: Sequence[float]
-    reduce: Callable[[np.ndarray, Sequence[float]], object]
+    candidates: Sequence[object]
+    reduce: Callable[[np.ndarray, Sequence[object]], object]
 
 
 @dataclass(kw_only=True)
@@ -232,6 +234,9 @@ class TabularLanguageModel(BaseEstimator):
         Training column order, recorded at :meth:`fit`.
     numeric_cols_ : frozenset[str]
         Names of the numeric columns, recorded at :meth:`fit`.
+    categories_ : dict[str, list]
+        Observed levels of each non-numeric column, recorded at :meth:`fit`;
+        the candidate set used to score (rather than generate) that column.
     n_features_in_ : int
         Number of columns seen at :meth:`fit`.
     feature_names_in_ : numpy.ndarray
@@ -270,10 +275,11 @@ class TabularLanguageModel(BaseEstimator):
             joint distribution over every column, so a supervised target enters
             as a column of ``X`` (the estimators append it before calling this).
         target_cols : frozenset of str, optional
-            Columns to treat as targets when ``training.loss_on_target_only`` is
-            enabled: each row's observed target cells are serialized last and the
-            preceding context tokens are masked out of the loss. Empty (default)
-            keeps loss on every token regardless of the flag.
+            Columns to treat as targets when ``training.loss_on_target_only`` or
+            ``training.target_at_end`` is enabled: each row's observed target cells
+            are serialized last. ``loss_on_target_only`` additionally masks the
+            preceding context out of the loss; ``target_at_end`` keeps loss on the
+            whole row. Empty (default) leaves the column order fully permuted.
 
         Returns
         -------
@@ -292,6 +298,13 @@ class TabularLanguageModel(BaseEstimator):
             raise ValueError(f"duplicate column names are not supported: {duplicates}")
         self.columns_ = list(frame.columns)
         self.numeric_cols_ = frozenset(frame.select_dtypes(include="number").columns)
+        # The discrete space of every non-numeric column: its observed levels,
+        # scored like the classifier ranks ``classes_`` rather than generated.
+        self.categories_ = {
+            c: sorted((_native(v) for v in pd.unique(frame[c].dropna().to_numpy())), key=str)
+            for c in self.columns_
+            if c not in self.numeric_cols_
+        }
         self.n_features_in_ = frame.shape[1]
         if isinstance(X, pd.DataFrame):
             self.feature_names_in_ = np.asarray(X.columns, dtype=object)
@@ -304,6 +317,7 @@ class TabularLanguageModel(BaseEstimator):
             self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
         )
         masking = self.training.loss_on_target_only and bool(target_cols)
+        target_last = masking or (self.training.target_at_end and bool(target_cols))
 
         def _ordered_fields(row: Mapping[str, object], order: Sequence[str]) -> list[Field]:
             return [Field(c, row[c], c in self.numeric_cols_) for c in order]
@@ -312,19 +326,27 @@ class TabularLanguageModel(BaseEstimator):
             row: Mapping[str, object], rng: np.random.Generator, aug: int
         ) -> list[TrainingExample]:
             present = [c for c in self.columns_ if not is_missing(row[c])]
-            tgt_present = [c for c in present if c in target_cols] if masking else []
+            tgt_present = [c for c in present if c in target_cols] if target_last else []
             if not tgt_present:
                 return [
                     TrainingExample("", self.serializer.serialize(_ordered_fields(row, order)))
                     for order in _distinct_orders(present, aug, rng)
                 ]
             ctx_cols = [c for c in present if c not in target_cols]
-            return [
-                TrainingExample(
-                    *self.serializer.split(_ordered_fields(row, ctx), _ordered_fields(row, tgt))
+            examples: list[TrainingExample] = []
+            for ctx, tgt in _distinct_block_orders(ctx_cols, tgt_present, aug, rng):
+                prompt, completion = self.serializer.split(
+                    _ordered_fields(row, ctx), _ordered_fields(row, tgt)
                 )
-                for ctx, tgt in _distinct_block_orders(ctx_cols, tgt_present, aug, rng)
-            ]
+                # The prompt boundary is the loss mask: masking supervises only the
+                # target (context lives in the prompt); otherwise the loss stays on
+                # the whole row (empty prompt) but the target is still fixed last.
+                examples.append(
+                    TrainingExample(prompt, completion)
+                    if masking
+                    else TrainingExample("", prompt + completion)
+                )
+            return examples
 
         all_rows = frame.to_dict("records")
         if self.training.validation_split > 0:
@@ -384,6 +406,16 @@ class TabularLanguageModel(BaseEstimator):
         base = self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
         return np.random.default_rng([base, row_id])
 
+    def _sample_rng(self, row_id: int, step: int) -> np.random.Generator:
+        """RNG for drawing one categorical cell, seeded on ``(random_state, row_id, step)``.
+
+        Keyed on the row's absolute identity and the target step so the draw is
+        reproducible and invariant to how callers chunk rows -- the batch-size
+        invariance the estimators promise -- while differing across cells.
+        """
+        base = self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
+        return np.random.default_rng([base, row_id, step])
+
     def _resolve_batch_size(self, generation: GenerationConfig) -> int:
         """Inference batch size: ``generation.inference_batch_size`` or training ``batch_size``."""
         return generation.inference_batch_size or self.training.batch_size
@@ -432,47 +464,86 @@ class TabularLanguageModel(BaseEstimator):
         knowns: Sequence[Mapping[str, object]],
         targets: Sequence[Sequence[str]],
         generation: GenerationConfig = GenerationConfig(),
+        *,
+        sample_categorical: Collection[str] = frozenset(),
+        row_ids: Sequence[int] | None = None,
     ) -> list[dict[str, object] | None]:
         """Complete many rows at once, batching across rows at each target step.
 
         Targets stay sequential *within* a row (each conditions on the prior
-        outputs of that row), but the same step across all rows is generated in
+        outputs of that row), but the same step across all rows is processed in
         one batched pass, so the backend sees ``inference_batch_size`` prompts
         per call instead of one.
+
+        A target column named in ``sample_categorical`` is filled by **scoring**
+        its observed levels (:attr:`categories_`) and drawing one from the
+        resulting conditional distribution, instead of generating free text --
+        the synthesis counterpart to the imputer's argmax over the same scores.
+        Every other column is generated.
 
         Parameters
         ----------
         knowns : Sequence[Mapping[str, object]]
             Observed columns to condition on, one mapping per row.
         targets : Sequence[Sequence[str]]
-            Columns to generate per row, in order.
+            Columns to produce per row, in order.
         generation : GenerationConfig
             Sampling hyperparameters (and ``inference_batch_size``).
+        sample_categorical : Collection[str], optional
+            Categorical columns to fill by scoring-and-sampling their levels
+            rather than generating. Default empty (every column is generated, the
+            historical behavior); the synthesis paths pass :attr:`categories_`.
+        row_ids : Sequence[int] or None, optional
+            Absolute row identities used to seed each categorical draw, so chunked
+            calls produce the same samples as a single call. ``None`` (default)
+            numbers the rows ``0..len(knowns)-1``.
 
         Returns
         -------
         list[dict[str, object] or None]
-            One result per row: ``known`` merged with its generated targets, or
-            ``None`` if any of that row's targets stayed malformed after
-            ``max_retries``.
+            One result per row: ``known`` merged with its produced targets, or
+            ``None`` if any of that row's *generated* targets stayed malformed
+            after ``max_retries`` (scored categorical cells always yield a value).
         """
+        ids = row_ids if row_ids is not None else range(len(knowns))
         filled = [dict(k) for k in knowns]
         alive = [True] * len(knowns)
         max_steps = max((len(t) for t in targets), default=0)
         for step in range(max_steps):
             active = [i for i in range(len(knowns)) if alive[i] and step < len(targets[i])]
-            if not active:
-                continue
-            tgt = {i: targets[i][step] for i in active}
-            requests = [
-                (self.serializer.prefix(self._fields(filled[i]), tgt[i]), tgt[i]) for i in active
-            ]
-            values = self._generate_values(requests, generation)
-            for i, value in zip(active, values, strict=True):
-                if value is None:
-                    alive[i] = False
+            cat_by_col: dict[str, list[int]] = {}
+            gen_rows: list[int] = []
+            for i in active:
+                col = targets[i][step]
+                if col in sample_categorical and self.categories_.get(col):
+                    cat_by_col.setdefault(col, []).append(i)
                 else:
-                    filled[i][tgt[i]] = value
+                    gen_rows.append(i)
+            for col, rows in cat_by_col.items():
+                candidates = self.categories_[col]
+                proba = self.predict_proba_many(
+                    [filled[i] for i in rows],
+                    col,
+                    candidates,
+                    generation,
+                    row_ids=[ids[i] for i in rows],
+                )
+                for j, i in enumerate(rows):
+                    p = proba[j] / proba[j].sum()
+                    drawn = self._sample_rng(ids[i], step).choice(len(candidates), p=p)
+                    filled[i][col] = candidates[int(drawn)]
+            if gen_rows:
+                gen_cols = {i: targets[i][step] for i in gen_rows}
+                requests = [
+                    (self.serializer.prefix(self._fields(filled[i]), gen_cols[i]), gen_cols[i])
+                    for i in gen_rows
+                ]
+                values = self._generate_values(requests, generation)
+                for i, value in zip(gen_rows, values, strict=True):
+                    if value is None:
+                        alive[i] = False
+                    else:
+                        filled[i][gen_cols[i]] = value
         return [filled[i] if alive[i] else None for i in range(len(knowns))]
 
     def complete(
@@ -555,7 +626,13 @@ class TabularLanguageModel(BaseEstimator):
         if unknown:
             raise ValueError(f"condition references columns not seen at fit: {unknown}")
         targets = [[c for c in self.columns_ if c not in known] for known in knowns]
-        rows = self.complete_many(knowns, targets, generation)
+        rows = self.complete_many(
+            knowns,
+            targets,
+            generation,
+            sample_categorical=frozenset(self.categories_),
+            row_ids=range(len(knowns)),
+        )
         completed = [r for r in rows if r is not None]
         if len(completed) != len(rows):
             raise RuntimeError(
@@ -869,13 +946,18 @@ class TabularLanguageModel(BaseEstimator):
     def _score_pairs(
         self, prompts: Sequence[str], continuations: Sequence[str], generation: GenerationConfig
     ) -> list[float]:
-        """Mean log-likelihood of each ``(prompt, continuation)`` pair, batched."""
+        """Log-likelihood of each ``(prompt, continuation)`` pair, batched.
+
+        Reduced per ``generation.candidate_scoring`` (mean or sum log-likelihood).
+        """
         batch_size = self._resolve_batch_size(generation)
         scores: list[float] = []
         for start in range(0, len(prompts), batch_size):
             scores.extend(
                 self.backend.score(
-                    prompts[start : start + batch_size], continuations[start : start + batch_size]
+                    prompts[start : start + batch_size],
+                    continuations[start : start + batch_size],
+                    reduce=generation.candidate_scoring,
                 )
             )
         return scores

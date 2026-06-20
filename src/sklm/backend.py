@@ -12,7 +12,7 @@ lightweight fake backend instead.
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
-from typing import Protocol, runtime_checkable
+from typing import Literal, Protocol, runtime_checkable
 
 from .callbacks import Callback
 from .config import GenerationConfig, ModelConfig, TrainingConfig
@@ -128,17 +128,27 @@ class LanguageModelBackend(Protocol):
         validation loss is comparable across epochs. When provided, the backend
         evaluates on it and reports the loss through
         :meth:`~sklm.Callback.on_eval_report`, drives ``early_stopping_patience``
-        off it, and checkpoints per ``checkpoint_steps`` / ``checkpoint_dir``."""
+        off it, and checkpoints per ``training.checkpoint``."""
         ...
 
     def generate(self, prompts: Sequence[str], generation: GenerationConfig) -> list[str]:
         """Sample a continuation for each prompt (the generated text only)."""
         ...
 
-    def score(self, prompts: Sequence[str], continuations: Sequence[str]) -> list[float]:
-        """Mean per-token log-likelihood of ``continuations[i]`` given ``prompts[i]``.
+    def score(
+        self,
+        prompts: Sequence[str],
+        continuations: Sequence[str],
+        *,
+        reduce: Literal["mean", "sum"] = "mean",
+    ) -> list[float]:
+        """Per-token log-likelihood of ``continuations[i]`` given ``prompts[i]``.
 
         The two sequences are paired element-wise (equal length) and scored as a
         single batch, so callers chunk by ``inference_batch_size`` and score many
-        prompts at once."""
+        prompts at once. ``reduce`` selects how each pair's per-token
+        log-likelihoods collapse to one number: ``"mean"`` (default,
+        length-normalized) or ``"sum"`` (total log-likelihood). The two reductions
+        must be implemented identically across backends so candidate ranking
+        matches (invariant #3)."""
         ...

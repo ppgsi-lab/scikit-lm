@@ -1,9 +1,11 @@
 """Language-model oversampler (imbalanced-learn compatible).
 
 Fits on the labeled table, then balances classes by conditioning generation on
-each minority label and synthesizing the remaining features. Unlike SMOTE it
-operates on text, so categorical columns and feature correlations need no
-numeric encoding.
+each minority label and synthesizing the remaining features. Numeric features
+are generated; categorical features are drawn from their conditional
+distribution over observed levels (scored, then sampled to keep the synthetic
+rows diverse). Unlike SMOTE it operates on text, so categorical columns and
+feature correlations need no numeric encoding.
 """
 
 from __future__ import annotations
@@ -154,11 +156,19 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
         target_col = unique_name("target", feature_cols)
         frame = X_df.copy()
         frame[target_col] = y_arr
-        if self.training.loss_on_target_only:
+        ignored = [
+            flag
+            for flag, on in (
+                ("loss_on_target_only", self.training.loss_on_target_only),
+                ("target_at_end", self.training.target_at_end),
+            )
+            if on
+        ]
+        if ignored:
             warnings.warn(
-                "loss_on_target_only has no effect on the oversampler: it conditions "
-                "generation on the label and produces the features, so there is no "
-                "fixed target column to supervise. Ignoring the flag.",
+                f"{' and '.join(ignored)} {'have' if len(ignored) > 1 else 'has'} no effect on "
+                "the oversampler: it conditions generation on the label and produces the "
+                "features, so there is no fixed target column. Ignoring.",
                 RuntimeWarning,
                 stacklevel=2,
             )
@@ -182,7 +192,11 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
                 want = min(n_to_generate - made, budget - attempts, batch_size)
                 attempts += want
                 outs = self.lm_.complete_many(
-                    [{target_col: label}] * want, [feature_cols] * want, self.generation
+                    [{target_col: label}] * want,
+                    [feature_cols] * want,
+                    self.generation,
+                    sample_categorical=frozenset(self.lm_.categories_),
+                    row_ids=range(attempts - want, attempts),
                 )
                 for out in outs:
                     if out is None:

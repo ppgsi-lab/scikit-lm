@@ -25,6 +25,7 @@ from .core import TabularLanguageModel, forget, to_frame
 from .hf_backend import HFBackend
 from .serialize import (
     BracketSerializer,
+    IfThenSerializer,
     JSONSerializer,
     KeyValueSerializer,
     PlainNumber,
@@ -97,6 +98,7 @@ def resolve_serializer(serializer: str | Serializer, max_decimals: int | None = 
             "json": JSONSerializer,
             "key-value": KeyValueSerializer,
             "bracket": BracketSerializer,
+            "if-then": IfThenSerializer,
         }
         builder = builders.get(serializer)
         if builder is None:
@@ -374,7 +376,7 @@ def select_candidates(values: np.ndarray, config: DiscretizationConfig) -> list[
 
 
 def reduce_estimate(
-    proba_row: np.ndarray, candidates: Sequence[float], config: DiscretizationConfig
+    proba_row: np.ndarray, candidates: Sequence[object], config: DiscretizationConfig
 ) -> float:
     """Collapse a candidate probability distribution into one prediction.
 
@@ -436,3 +438,34 @@ def resolve_discretization(
     if isinstance(discretization, DiscretizationConfig):
         return {c: discretization for c in numeric_cols} if discretization.bins else {}
     return {c: cfg for c, cfg in discretization.items() if cfg.bins and c in numeric_cols}
+
+
+def resolve_categorical(
+    discretization: DiscretizationConfig | Mapping[str, DiscretizationConfig],
+    categorical_cols: Collection[str],
+) -> frozenset[str]:
+    """Categorical columns to *score* over their observed levels.
+
+    A categorical column is a finite discrete space, so it is scored by default
+    (the dual of ``resolve_discretization``, where numeric columns are generated
+    unless a non-zero ``bins`` opts them in). A single
+    :class:`~sklm.DiscretizationConfig` leaves every categorical scored; a mapping
+    can switch one off with a ``bins == 0`` entry, routing that column back to
+    free-text generation.
+
+    Parameters
+    ----------
+    discretization : DiscretizationConfig or Mapping[str, DiscretizationConfig]
+        The estimator's ``discretization`` parameter.
+    categorical_cols : Collection of str
+        Names of the categorical columns (their levels are the candidate set).
+
+    Returns
+    -------
+    frozenset[str]
+        Categorical columns to score; the rest generate.
+    """
+    if isinstance(discretization, DiscretizationConfig):
+        return frozenset(categorical_cols)
+    disabled = {c for c, cfg in discretization.items() if c in categorical_cols and not cfg.bins}
+    return frozenset(categorical_cols) - disabled

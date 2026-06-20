@@ -43,6 +43,7 @@ from .callbacks import (
 )
 from .classifier import LanguageModelClassifier
 from .config import (
+    CheckpointConfig,
     DiscretizationConfig,
     GenerationConfig,
     LoRAConfig,
@@ -65,6 +66,7 @@ from .regressor import LanguageModelRegressor
 from .serialize import (
     BracketSerializer,
     Field,
+    IfThenSerializer,
     JSONSerializer,
     KeyValueSerializer,
     NumberFormat,
@@ -79,6 +81,7 @@ __all__ = [
     "__version__",
     "BracketSerializer",
     "Callback",
+    "CheckpointConfig",
     "CompositeCallback",
     "DiscretizationConfig",
     "EstimatorArgs",
@@ -91,6 +94,7 @@ __all__ = [
     "GenerationConfig",
     "Generation",
     "HFBackend",
+    "IfThenSerializer",
     "ImputerArgs",
     "JSONSerializer",
     "JupyterCallback",

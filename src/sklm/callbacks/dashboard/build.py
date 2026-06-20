@@ -236,16 +236,20 @@ def _cadence(log_every: int | float | Literal["epoch"]) -> str:
 
 def _log_table(dash: DashboardState, cfg: RenderConfig) -> LogTable:
     start = max(len(dash.log) - cfg.n_log_rows, 0)
+    eval_steps = sorted(dash.eval_by_step)
     rows: list[LogRow] = []
     for i in reversed(range(start, len(dash.log))):
         r = dash.log[i]
+        prev = dash.log[i - 1] if i > 0 else None
         sps = None
-        if i > 0:
-            prev = dash.log[i - 1]
+        if prev is not None:
             dt = r["t"] - prev["t"]
             dstep = r["step"] - prev["step"]
             if dt > 0 and dstep > 0:
                 sps = dstep / dt
+        lo = prev["step"] if prev is not None else -1
+        within = [s for s in eval_steps if lo < s <= r["step"]]
+        eval_loss = dash.eval_by_step[within[-1]] if within else None
         rows.append(
             LogRow(
                 step=r["step"],
@@ -254,7 +258,7 @@ def _log_table(dash: DashboardState, cfg: RenderConfig) -> LogTable:
                 std=r["std"],
                 lr=r["lr"],
                 grad_norm=r["grad_norm"],
-                eval_loss=dash.eval_by_step.get(r["step"]),
+                eval_loss=eval_loss,
                 steps_per_second=sps,
             )
         )

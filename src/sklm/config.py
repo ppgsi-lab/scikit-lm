@@ -21,6 +21,7 @@ from typing import Literal
 from sklearn.base import BaseEstimator
 
 __all__ = [
+    "CheckpointConfig",
     "Device",
     "DiscretizationConfig",
     "GenerationConfig",
@@ -70,7 +71,6 @@ class LoRAConfig(BaseEstimator):
     """
 
     rank: int = 16
-    # Independent of ``rank`` (no auto-tracking); set both explicitly.
     alpha: int = 32
     dropout: float = 0.0
     target_modules: str | list[str] | None = None
@@ -149,6 +149,47 @@ class ModelConfig:
 
 
 @dataclass
+class CheckpointConfig(BaseEstimator):
+    """When and where to persist model checkpoints during fine-tuning.
+
+    Both backends write numbered ``checkpoint-<step>`` snapshots into ``dir`` on
+    the cadence set by ``each``/``on``, keeping the ``keep`` most recent. When a
+    validation set is held out (``TrainingConfig.validation_split > 0``) the
+    lowest-validation-loss checkpoint is additionally tracked and protected from
+    pruning, so it is always available to restore. ``dir`` is read as well as
+    written: if it already holds ``checkpoint-*`` snapshots, ``fit`` resumes from
+    the most recent one instead of starting from the base model.
+
+    Parameters
+    ----------
+    each : int
+        Cadence count, in the unit set by ``on``. Default ``1``.
+    on : {"step", "epoch"}
+        Cadence unit: every ``each`` optimizer steps, or every ``each`` epochs.
+        Default ``"step"``.
+    dir : str or None
+        Directory checkpoints are written to and resumed from. ``None`` (default)
+        writes them to a temporary directory removed when ``fit`` returns, so
+        checkpoints serve only the best-model restore.
+    keep : int or None
+        Number of most-recent snapshots to retain (the best is kept on top of
+        these when a validation set exists). ``None`` keeps every snapshot (the
+        full training trajectory). Default ``1``.
+    """
+
+    each: int = 1
+    on: Literal["step", "epoch"] = "step"
+    dir: str | None = None
+    keep: int | None = 1
+
+    def __post_init__(self) -> None:
+        if self.each <= 0:
+            raise ValueError(f"each must be a positive integer, got {self.each}")
+        if self.keep is not None and self.keep <= 0:
+            raise ValueError(f"keep must be a positive integer or None, got {self.keep}")
+
+
+@dataclass
 class TrainingConfig(BaseEstimator):
     """Fine-tuning hyperparameters.
 
@@ -210,7 +251,17 @@ class TrainingConfig(BaseEstimator):
         context tokens are masked out with ``-100``, so the model is supervised
         only on what it must predict at inference. Rows with no observed target
         column are supervised in full. Default ``False`` (loss on every token).
+        Implies ``target_at_end`` (masking requires the target to be last).
         Inert for the oversampler.
+    target_at_end : bool
+        When ``True``, the target columns are serialized last in every row while
+        the context columns keep getting permuted among themselves, but the loss
+        stays on every token. Decouples target *position* from loss *scope*:
+        ``loss_on_target_only`` already fixes the target last (and additionally
+        masks the context), so it implies this; set ``target_at_end`` alone to
+        pin the target's position while still supervising the whole row. No
+        effect on rows without an observed target column, or on the oversampler.
+        Default ``False`` (the target is permuted freely with the rest).
     validation_split : float
         Fraction of training rows held out for validation each ``fit``, in
         ``[0.0, 1.0)``. ``0.0`` (default) trains on every row and reports no eval
@@ -224,15 +275,11 @@ class TrainingConfig(BaseEstimator):
         split. Falls back to a random split when stratification is infeasible
         (e.g. a class too rare to appear on both sides) or when the estimator has
         no single fully-observed target (imputer, oversampler). Default ``True``.
-    checkpoint_steps : int or None
-        Save a model checkpoint every this many optimizer steps. ``None``
-        (default) saves only what early stopping needs. Combined with
-        ``validation_split``, the checkpoint with the lowest validation loss is
-        the one early stopping restores.
-    checkpoint_dir : str or None
-        Directory to persist checkpoints in. ``None`` (default) writes them to a
-        temporary directory removed when ``fit`` returns (so checkpoints serve
-        only early stopping's best-model restore); set a path to keep them.
+    checkpoint : CheckpointConfig or None
+        When and where to persist checkpoints (cadence, directory, retention) and
+        the directory to resume from. ``None`` (default) saves only what
+        early stopping needs, to a temporary directory removed when ``fit``
+        returns. See :class:`CheckpointConfig`.
     early_stopping_patience : int or None
         Stop training after this many consecutive validations without improvement
         in validation loss, restoring the best checkpoint. Requires
@@ -255,10 +302,10 @@ class TrainingConfig(BaseEstimator):
     max_seq_length: int | None = None
     augmentation_factor: int = 1
     loss_on_target_only: bool = False
+    target_at_end: bool = False
     validation_split: float = 0.0
     stratify: bool = True
-    checkpoint_steps: int | None = None
-    checkpoint_dir: str | None = None
+    checkpoint: CheckpointConfig | None = None
     early_stopping_patience: int | None = None
 
     def __post_init__(self) -> None:
@@ -274,10 +321,6 @@ class TrainingConfig(BaseEstimator):
             )
         if not 0.0 <= self.validation_split < 1.0:
             raise ValueError(f"validation_split must be in [0.0, 1.0), got {self.validation_split}")
-        if self.checkpoint_steps is not None and self.checkpoint_steps <= 0:
-            raise ValueError(
-                f"checkpoint_steps must be a positive integer or None, got {self.checkpoint_steps}"
-            )
         if self.early_stopping_patience is not None:
             if self.early_stopping_patience <= 0:
                 raise ValueError(
@@ -380,6 +423,16 @@ class GenerationConfig(BaseEstimator):
         ``Sequence[float]`` per column order) into one probability row. ``None``
         (default) averages the per-order softmax distributions (proper order
         marginalization). Inert unless ``permute_order`` is enabled.
+    candidate_scoring : {"mean", "sum"}
+        How the candidate-ranking path (classifier, imputer/oversampler
+        categorical cells, numeric cells scored under discretization) reduces a
+        candidate's per-token log-likelihoods before the softmax. ``"mean"``
+        (default) is length-normalized: it favours levels that BPE-split into
+        more, individually-predictable tokens. ``"sum"`` is the total
+        log-likelihood -- the proper probability of the candidate string over a
+        closed set -- which removes that bias but penalises longer candidates.
+        Inert for the generative path (regressor; generated imputer/oversampler
+        cells), which samples rather than scores.
     """
 
     temperature: float = 0.7
@@ -392,6 +445,7 @@ class GenerationConfig(BaseEstimator):
     permute_order: bool = False
     aggregate: Callable[[list[object], bool], object] = aggregate_default
     score_pool: Callable[[list[Sequence[float]]], Sequence[float]] | None = None
+    candidate_scoring: Literal["mean", "sum"] = "mean"
 
 
 @dataclass

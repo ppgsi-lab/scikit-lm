@@ -6,6 +6,7 @@ import pytest
 from sklm import (
     BracketSerializer,
     Field,
+    IfThenSerializer,
     JSONSerializer,
     KeyValueSerializer,
     PlainNumber,
@@ -182,6 +183,25 @@ def test_bracket_spaced_digits_decode() -> None:
     assert s.decode_value("1 2 5 0] x[1]", numeric=True) == 1250.0
 
 
+# --- IfThenSerializer -----------------------------------------------------
+
+
+def test_if_then_serialize_and_prefix() -> None:
+    s = IfThenSerializer()
+    fields = [Field("x", 12, True), Field("y", 24, True), Field("a", 6, True), Field("t", 32, True)]
+    assert s.serialize(fields) == "if x is 12, y is 24 and a is 6, then t is 32"
+    assert s.prefix(fields[:-1], "t") == "if x is 12, y is 24 and a is 6, then t is "
+    assert s.serialize([Field("t", 32, True)]) == "then t is 32"
+    assert s.prefix([], "t") == "then t is "
+    assert s.serialize(fields[:2]) == "if x is 12, then y is 24"
+
+
+def test_if_then_decode_value() -> None:
+    s = IfThenSerializer()
+    assert s.decode_value("32", numeric=True) == 32.0
+    assert s.decode_value("yes, then z is 1", numeric=False) == "yes"
+
+
 # --- non-string field names -----------------------------------------------
 
 
@@ -205,6 +225,8 @@ def _serializers() -> list[Serializer]:
         KeyValueSerializer(key_value_separator="=", pair_separator=";"),
         BracketSerializer(),
         BracketSerializer(number=SpacedDigits()),
+        IfThenSerializer(),
+        IfThenSerializer(number=SpacedDigits()),
     ]
 
 
@@ -243,6 +265,7 @@ def test_prefix_then_value_recovers_through_decode(s: Serializer) -> None:
         ("json", JSONSerializer),
         ("key-value", KeyValueSerializer),
         ("bracket", BracketSerializer),
+        ("if-then", IfThenSerializer),
     ],
 )
 def test_resolve_serializer_selectors(selector: str, cls: type) -> None:

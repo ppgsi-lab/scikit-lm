@@ -125,6 +125,32 @@ def test_classifier_impossible_candidate_gets_zero_mass(clf_data) -> None:
     assert set(clf.predict(X)) == {"no"}
 
 
+def test_classifier_candidate_scoring_mean_is_length_blind(clf_data) -> None:
+    X, y = clf_data
+    # equal per-token mean, but "no" spans 3 tokens to "yes"'s 1
+    backend = FakeBackend(
+        scores={'"yes"': -1.0, '"no"': -1.0}, token_counts={'"yes"': 1, '"no"': 3}
+    )
+    clf = LanguageModelClassifier(backend=backend).fit(X, y)  # default "mean"
+    proba = clf.predict_proba(X)
+    yes, no = list(clf.classes_).index("yes"), list(clf.classes_).index("no")
+    np.testing.assert_allclose(proba[:, yes], proba[:, no])
+
+
+def test_classifier_candidate_scoring_sum_uses_total_loglik(clf_data) -> None:
+    X, y = clf_data
+    backend = FakeBackend(
+        scores={'"yes"': -1.0, '"no"': -1.0}, token_counts={'"yes"': 1, '"no"': 3}
+    )
+    clf = LanguageModelClassifier(
+        backend=backend, generation=GenerationConfig(candidate_scoring="sum")
+    ).fit(X, y)
+    proba = clf.predict_proba(X)
+    yes, no = list(clf.classes_).index("yes"), list(clf.classes_).index("no")
+    # summing total log-likelihood penalises the longer candidate
+    assert (proba[:, yes] > proba[:, no]).all()
+
+
 def test_classifier_duplicate_columns_raise() -> None:
     X = pd.DataFrame([[1, 2, 3], [4, 5, 6]], columns=["age", "age", "score"])
     y = np.array(["yes", "no"])

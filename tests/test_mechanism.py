@@ -36,6 +36,7 @@ def _fit(
     target_cols: set[str] | None = None,
     augmentation_factor: int = 1,
     loss_on_target_only: bool = True,
+    target_at_end: bool = False,
     random_state: int = 0,
 ) -> list:
     fake = FakeBackend()
@@ -46,6 +47,7 @@ def _fit(
             augmentation_factor=augmentation_factor,
             epochs=1,
             loss_on_target_only=loss_on_target_only,
+            target_at_end=target_at_end,
         ),
         model=ModelConfig(model="m"),
         random_state=random_state,
@@ -139,6 +141,15 @@ def test_masking_splits_context_and_target_last() -> None:
         assert ex.prompt != ""
         assert ex.prompt + ex.completion == ex.text
         assert list(json.loads(ex.text).keys())[-1] == "t"  # target serialized last
+
+
+def test_target_at_end_fixes_position_without_masking() -> None:
+    frame = pd.DataFrame({"a": [1, 2, 3], "b": ["x", "y", "z"], "t": [0, 1, 0]})
+    examples = _fit(frame, target_cols={"t"}, loss_on_target_only=False, target_at_end=True)
+    assert len(examples) == len(frame)
+    for ex in examples:
+        assert ex.prompt == ""  # loss stays on the whole row
+        assert list(json.loads(ex.text).keys())[-1] == "t"  # but the target is fixed last
 
 
 def test_masking_skips_rows_with_missing_target() -> None:
@@ -333,9 +344,11 @@ class _ScoreRecordingBackend(FakeBackend):
         super().__init__()
         self.scored_prompts: list[str] = []
 
-    def score(self, prompts: Sequence[str], continuations: Sequence[str]) -> list[float]:
+    def score(
+        self, prompts: Sequence[str], continuations: Sequence[str], *, reduce: str = "mean"
+    ) -> list[float]:
         self.scored_prompts.extend(prompts)
-        return super().score(prompts, continuations)
+        return super().score(prompts, continuations, reduce=reduce)
 
 
 def test_classifier_permute_order_is_noop_when_scores_ignore_order(clf_data) -> None:
@@ -376,7 +389,9 @@ def test_classifier_permute_order_scores_multiple_column_orders(clf_data) -> Non
 class _PromptSensitiveBackend(FakeBackend):
     """Hash the prompt into every result, so outputs expose which orders were drawn."""
 
-    def score(self, prompts: Sequence[str], continuations: Sequence[str]) -> list[float]:
+    def score(
+        self, prompts: Sequence[str], continuations: Sequence[str], *, reduce: str = "mean"
+    ) -> list[float]:
         self.score_batches.append(len(prompts))
         return [-_stable(p + c) for p, c in zip(prompts, continuations, strict=True)]
 

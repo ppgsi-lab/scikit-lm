@@ -18,7 +18,7 @@ import tempfile
 import warnings
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, Literal
 
 from .backend import common_token_prefix, resolve_max_new_tokens, resolve_max_seq_length
 from .callbacks import Callback
@@ -173,6 +173,7 @@ class HFBackend:
             TrainingArguments,
         )
         from transformers.trainer_callback import PrinterCallback, ProgressCallback
+        from transformers.trainer_utils import get_last_checkpoint
 
         training = replace(training, learning_rate=training.resolved_learning_rate(model_config))
 
@@ -203,7 +204,8 @@ class HFBackend:
         self._max_seq_length = seq_len
 
         with tempfile.TemporaryDirectory(prefix="sklm_hf_") as tmp:
-            output_dir = training.checkpoint_dir or tmp
+            ckpt = training.checkpoint
+            output_dir = (ckpt.dir if ckpt is not None else None) or tmp
             dataset = _text_dataset(epoch_texts, tok, seq_len)
             eval_dataset = (
                 _text_dataset(lambda _: eval_examples, tok, seq_len) if eval_examples else None
@@ -241,8 +243,16 @@ class HFBackend:
             with contextlib.suppress(ValueError):
                 trainer.remove_callback(PrinterCallback)
                 trainer.remove_callback(ProgressCallback)
+            # When ``dir`` already holds checkpoints, resume from the most recent
+            # one (weights + optimizer + scheduler + step) instead of the base
+            # model; ``get_last_checkpoint`` returns None for an empty/new dir.
+            resume = (
+                get_last_checkpoint(output_dir)
+                if ckpt is not None and ckpt.dir is not None and os.path.isdir(output_dir)
+                else None
+            )
             lm.train()
-            trainer.train()
+            trainer.train(resume_from_checkpoint=resume)
             lm.eval()
 
     def generate(self, prompts: Sequence[str], generation: GenerationConfig) -> list[str]:
@@ -287,13 +297,21 @@ class HFBackend:
         generated = out[:, enc["input_ids"].shape[1] :]
         return tok.batch_decode(generated, skip_special_tokens=True)
 
-    def score(self, prompts: Sequence[str], continuations: Sequence[str]) -> list[float]:
-        """Mean per-token log-likelihood of ``continuations[i]`` given ``prompts[i]``.
+    def score(
+        self,
+        prompts: Sequence[str],
+        continuations: Sequence[str],
+        *,
+        reduce: Literal["mean", "sum"] = "mean",
+    ) -> list[float]:
+        """Per-token log-likelihood of ``continuations[i]`` given ``prompts[i]``.
 
         Pairs are scored as one right-padded batch in a single forward pass. The
         continuation boundary per pair is the end of the longest token prefix
         shared with its prompt, so a BPE merge at the prompt's trailing space
-        (the boundary token) is scored rather than dropped.
+        (the boundary token) is scored rather than dropped. ``reduce`` collapses
+        each pair's per-token log-likelihoods to the ``"mean"`` (default) or the
+        ``"sum"`` -- kept identical to :meth:`MLXBackend.score` (invariant #3).
         """
         if not prompts:
             return []
@@ -326,7 +344,10 @@ class HFBackend:
                 # token_logprobs[row, j] scores token j+1; right padding keeps the
                 # continuation span (start..len(ids)-1) before any pad position.
                 cont = token_logprobs[row, starts[row] - 1 : len(ids) - 1]
-                scores.append(float(cont.mean()) if cont.numel() else float("-inf"))
+                if not cont.numel():
+                    scores.append(float("-inf"))
+                else:
+                    scores.append(float(cont.sum() if reduce == "sum" else cont.mean()))
         return scores
 
     def _device_memory_bytes(self) -> int | None:
@@ -586,33 +607,45 @@ def _training_kwargs(
 
 
 def _apply_eval_kwargs(kwargs: dict[str, Any], training: TrainingConfig, has_eval: bool) -> None:
-    """Layer the validation / checkpoint / early-stopping args onto ``kwargs``.
+    """Layer the validation / checkpoint / best-model args onto ``kwargs``.
 
-    ``checkpoint_steps`` sets a step-based save cadence; a held-out set adds
-    per-epoch evaluation. Early stopping additionally restores the best
-    checkpoint, which the HF ``Trainer`` requires to be saved on the same cadence
-    it evaluates -- so the save and eval strategies are forced to match (steps
-    when ``checkpoint_steps`` is set, else per epoch).
+    A :class:`~sklm.CheckpointConfig` sets the save cadence (steps or epochs),
+    directory and retention. A held-out set adds evaluation on the same cadence
+    and tracks the lowest-validation-loss checkpoint: the ``Trainer`` requires the
+    save and eval strategies to match for ``load_best_model_at_end``, so a save
+    cadence is forced on (per epoch into the tmp ``output_dir``) even when no
+    explicit checkpoint config was given.
     """
-    early_stop = training.early_stopping_patience is not None
-    if training.checkpoint_steps is not None:
-        kwargs["save_strategy"] = "steps"
-        kwargs["save_steps"] = training.checkpoint_steps
+    ckpt = training.checkpoint
+    if ckpt is not None and ckpt.on == "step":
+        save_strategy, save_steps = "steps", ckpt.each
+    else:
+        save_strategy, save_steps = "epoch", None
+
+    if ckpt is not None:
+        kwargs["save_strategy"] = save_strategy
+        if save_steps is not None:
+            kwargs["save_steps"] = save_steps
+        kwargs["save_total_limit"] = ckpt.keep
+
     if not has_eval:
         return
     kwargs["per_device_eval_batch_size"] = training.batch_size
-    if early_stop and training.checkpoint_steps is not None:
+    if save_strategy == "steps":
         kwargs["eval_strategy"] = "steps"
-        kwargs["eval_steps"] = training.checkpoint_steps
+        kwargs["eval_steps"] = save_steps
     else:
         kwargs["eval_strategy"] = "epoch"
-        if early_stop:
-            kwargs["save_strategy"] = "epoch"
-    if early_stop:
-        kwargs["load_best_model_at_end"] = True
-        kwargs["metric_for_best_model"] = "eval_loss"
-        kwargs["greater_is_better"] = False
+    # A validation set means a "best" checkpoint exists: track and restore it
+    # (HF protects it from ``save_total_limit`` pruning). Saving must be on for
+    # the restore; default to per-epoch saves in the tmp dir when no checkpoint
+    # config was given.
+    if ckpt is None:
+        kwargs["save_strategy"] = save_strategy
         kwargs["save_total_limit"] = 1
+    kwargs["load_best_model_at_end"] = True
+    kwargs["metric_for_best_model"] = "eval_loss"
+    kwargs["greater_is_better"] = False
 
 
 def _causal_collator(tokenizer: Any) -> Callable[[list[dict[str, Any]]], dict[str, Any]]:

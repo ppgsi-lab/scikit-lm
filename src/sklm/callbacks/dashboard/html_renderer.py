@@ -746,11 +746,7 @@ class HtmlRenderer:
 
     def _generations_html(self, predictions: Predictions) -> str:
         scoring = predictions.scoring
-        tag = (
-            "given fields → predicted distribution"
-            if scoring
-            else "given fields → most likely next field"
-        )
+        tag = "given fields → predicted distribution" if scoring else "given fields → sampled value"
         head = (
             '<div style="display:flex;align-items:baseline;justify-content:space-between;'
             'gap:8px;margin-bottom:12px"><span style="font-weight:500;font-size:14px">'
@@ -774,7 +770,7 @@ class HtmlRenderer:
                 if isinstance(r, ScoreRow)
             )
         else:
-            columns = (("#", "36px"), ("given", None), ("next", "38%"))
+            columns = (("#", "36px"), ("given", None), ("sampled", "38%"))
             body = "".join(
                 self._gen_row(i, r)
                 for i, r in enumerate(predictions.rows)

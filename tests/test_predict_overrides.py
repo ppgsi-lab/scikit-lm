@@ -105,11 +105,12 @@ def test_classifier_predict_proba_override_is_batch_invariant(clf_data) -> None:
 
 def test_imputer_transform_discretization_override_routes_scoring() -> None:
     frame = _mixed_frame()
-    fake = FakeBackend(value='"z"', scores={"10.0": 0.0, "20.0": 0.0})
-    imp = LanguageModelImputer(backend=fake).fit(frame)  # default: all-generative
+    fake = FakeBackend()  # stable-hash scores cover both the numeric and categorical candidates
+    imp = LanguageModelImputer(backend=fake).fit(frame)  # default: numeric generated, `c` scored
 
+    # the override scores the numeric column too, so nothing is generated this call
     imp.transform(frame, discretization=DiscretizationConfig(bins=2))
-    assert fake.score_batches and fake.generate_batches  # numeric scored, categorical generated
+    assert fake.score_batches and not fake.generate_batches
     assert isinstance(imp.discretization, DiscretizationConfig)
     assert imp.discretization.bins == 0  # estimator attribute untouched
 

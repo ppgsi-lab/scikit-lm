@@ -15,6 +15,7 @@ import pytest
 
 from sklm import (
     Callback,
+    CheckpointConfig,
     EvalReport,
     Event,
     LanguageModelClassifier,
@@ -105,13 +106,31 @@ def _checkpoint_dir_persists(model: str, backend: str, tmp_path: Path) -> None:
         model=model,
         backend=backend,
         training=TrainingConfig(
-            epochs=2, batch_size=8, checkpoint_steps=2, checkpoint_dir=str(ckpt)
+            epochs=2,
+            batch_size=8,
+            checkpoint=CheckpointConfig(each=2, on="step", dir=str(ckpt), keep=None),
         ),
         random_state=0,
     )
     clf.fit(X, y)
     assert ckpt.is_dir()
-    assert any(ckpt.iterdir()), "expected checkpoint artifacts to be persisted"
+    snapshots = list(ckpt.glob("checkpoint-*"))
+    assert len(snapshots) >= 2, "expected numbered checkpoint snapshots to persist"
+
+
+def _checkpoint_resumes_from_dir(model: str, backend: str, tmp_path: Path) -> None:
+    X, y = _clf_xy()
+    ckpt = tmp_path / "ckpts"
+    cfg = TrainingConfig(
+        epochs=2, batch_size=8, checkpoint=CheckpointConfig(each=2, on="step", dir=str(ckpt))
+    )
+    LanguageModelClassifier(model=model, backend=backend, training=cfg, random_state=0).fit(X, y)
+    before = {p.name for p in ckpt.glob("checkpoint-*")}
+    # A second fit pointed at the same dir resumes and keeps writing there.
+    LanguageModelClassifier(model=model, backend=backend, training=cfg, random_state=0).fit(X, y)
+    assert ckpt.is_dir()
+    assert any(ckpt.glob("checkpoint-*")), "expected checkpoints after resume"
+    assert before, "first fit should have produced checkpoints"
 
 
 # --- HuggingFace ----------------------------------------------------------
@@ -132,6 +151,11 @@ def test_hf_checkpoint_dir_persists(tmp_path: Path) -> None:
     _checkpoint_dir_persists("distilgpt2", "huggingface", tmp_path)
 
 
+@pytest.mark.skipif(not _has_hf(), reason="requires the 'hf' extra")
+def test_hf_checkpoint_resumes_from_dir(tmp_path: Path) -> None:
+    _checkpoint_resumes_from_dir("distilgpt2", "huggingface", tmp_path)
+
+
 # --- MLX ------------------------------------------------------------------
 
 
@@ -148,3 +172,8 @@ def test_mlx_early_stopping_stops_short() -> None:
 @pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon")
 def test_mlx_checkpoint_dir_persists(tmp_path: Path) -> None:
     _checkpoint_dir_persists(_MLX_MODEL, "mlx", tmp_path)
+
+
+@pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon")
+def test_mlx_checkpoint_resumes_from_dir(tmp_path: Path) -> None:
+    _checkpoint_resumes_from_dir(_MLX_MODEL, "mlx", tmp_path)

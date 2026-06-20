@@ -124,12 +124,14 @@ def test_generation_event_exposes_prompt_and_output(nan_data: pd.DataFrame) -> N
     imp = LanguageModelImputer(backend=FakeBackend(value="7"), callback=rec).fit(nan_data)
     rec.events.clear()
     imp.transform(nan_data)
-    assert len(rec.generations) == 3  # nan_data has 3 missing cells; "7" parses, no retries
+    # nan_data misses two numeric `age` cells (generated) and one `city` cell (scored,
+    # which rides a score event, not a generation one)
+    assert len(rec.generations) == 2
     assert "retry" not in rec.names()
     for prompt, completion, target, value in rec.generations:
         assert completion == "7"
-        assert target in ("age", "city")
-        assert f'"{target}": ' in prompt
+        assert target == "age"
+        assert '"age": ' in prompt
         assert value is not None  # the decoded value rides on the event
 
 

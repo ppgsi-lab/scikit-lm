@@ -49,6 +49,8 @@ def _format_params(training: TrainingConfig) -> str:
         parts.append(f"val={training.validation_split:g}")
     if training.loss_on_target_only:
         parts.append("target-only")
+    elif training.target_at_end:
+        parts.append("target-last")
     return " · ".join(parts)
 
 

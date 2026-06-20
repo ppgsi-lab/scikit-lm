@@ -29,7 +29,7 @@ import warnings
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -199,10 +199,33 @@ class MLXBackend:
         loss_fn = _make_loss(training.label_smoothing) if training.label_smoothing > 0 else None
         patience = training.early_stopping_patience
 
-        report = _loss_report_callback(callback, lm, optimizer, iters, patience)
+        ckpt = training.checkpoint
         with tempfile.TemporaryDirectory(prefix="sklm_mlx_") as tmpdir:
-            ckpt_dir = training.checkpoint_dir or tmpdir
+            ckpt_dir = (ckpt.dir if ckpt is not None else None) or tmpdir
             Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+            # Resume: when ``dir`` already holds snapshots, load the most recent
+            # weights before training instead of starting from the base model.
+            if ckpt is not None and ckpt.dir is not None:
+                _resume_weights(lm, ckpt_dir)
+            # Cadence in micro-steps (mlx-lm counts micro-steps): an optimizer
+            # step is ``grad_accumulation_steps`` micro-steps, an epoch is
+            # ``micro_per_epoch``. ``None`` disables trajectory saving (no config).
+            save_every = (
+                None
+                if ckpt is None
+                else ckpt.each
+                * (training.grad_accumulation_steps if ckpt.on == "step" else micro_per_epoch)
+            )
+            report = _loss_report_callback(
+                callback,
+                lm,
+                optimizer,
+                iters,
+                patience,
+                ckpt_dir=ckpt_dir,
+                save_every=save_every,
+                keep=ckpt.keep if ckpt is not None else None,
+            )
             args = TrainingArgs(
                 batch_size=training.batch_size,
                 iters=iters,
@@ -212,13 +235,9 @@ class MLXBackend:
                 adapter_file=str(Path(ckpt_dir) / "adapters.safetensors"),
                 steps_per_report=1,
                 steps_per_eval=micro_per_epoch if val_dataset is not None else iters + 1,
-                # steps_per_save is consumed in micro-steps; checkpoint_steps is
-                # documented in optimizer steps (as on the HF backend).
-                steps_per_save=(
-                    training.checkpoint_steps * training.grad_accumulation_steps
-                    if training.checkpoint_steps is not None
-                    else iters + 1
-                ),
+                # mlx-lm's own saving is disabled; the report callback writes
+                # numbered checkpoint-<step>.safetensors snapshots instead.
+                steps_per_save=iters + 1,
                 val_batches=-1,
             )
             train_kwargs: dict[str, Any] = {
@@ -243,7 +262,7 @@ class MLXBackend:
             if report.best is not None:
                 lm.update(tree_unflatten(report.best))
                 mx.eval(lm.parameters())
-                if training.checkpoint_dir is not None:
+                if ckpt is not None and ckpt.dir is not None:
                     mx.save_safetensors(str(Path(ckpt_dir) / "best.safetensors"), dict(report.best))
         lm.eval()
 
@@ -285,15 +304,22 @@ class MLXBackend:
         """
         return [self._tokenizer.encode(p.rstrip())[-self._max_seq_length :] for p in prompts]
 
-    def score(self, prompts: Sequence[str], continuations: Sequence[str]) -> list[float]:
-        """Mean per-token log-likelihood of ``continuations[i]`` given ``prompts[i]``.
+    def score(
+        self,
+        prompts: Sequence[str],
+        continuations: Sequence[str],
+        *,
+        reduce: Literal["mean", "sum"] = "mean",
+    ) -> list[float]:
+        """Per-token log-likelihood of ``continuations[i]`` given ``prompts[i]``.
 
         Pairs are scored as one right-padded batch in a single forward pass. The
         continuation boundary per pair is the end of the longest token prefix
         shared with its prompt (so a BPE merge at the prompt's trailing space is
         scored rather than dropped) -- identical semantics to
         :meth:`HFBackend.score`, so the classifier ranks verbalizers the same way
-        on both backends.
+        on both backends. ``reduce`` collapses each pair's per-token
+        log-likelihoods to the ``"mean"`` (default) or the ``"sum"``.
         """
         if not prompts:
             return []
@@ -328,7 +354,8 @@ class MLXBackend:
             if len(full) < 2 or cont.size == 0:
                 scores.append(float("-inf"))
             else:
-                scores.append(float(mx.mean(cont).item()))
+                pooled = mx.sum(cont) if reduce == "sum" else mx.mean(cont)
+                scores.append(float(pooled.item()))
         return scores
 
 
@@ -384,8 +411,58 @@ class _MLXTextDataset:
         return result
 
 
+def _save_checkpoint(ckpt_dir: str, step: int, params: Any, keep: int | None) -> None:
+    """Write a ``checkpoint-<step>.safetensors`` snapshot and prune to ``keep``.
+
+    ``params`` is a ``tree_flatten`` list of ``(path, array)``. Only the numbered
+    snapshots are pruned (oldest first); ``best.safetensors`` is named apart, so
+    it survives. ``keep`` of ``None`` retains every snapshot.
+    """
+    import mlx.core as mx
+
+    mx.save_safetensors(str(Path(ckpt_dir) / f"checkpoint-{step}.safetensors"), dict(params))
+    if keep is not None:
+        existing = sorted(
+            Path(ckpt_dir).glob("checkpoint-*.safetensors"),
+            key=lambda p: int(p.stem.split("-")[1]),
+        )
+        for old in existing[:-keep]:
+            old.unlink()
+
+
+def _resume_weights(lm: Any, ckpt_dir: str) -> None:
+    """Load the most recent ``checkpoint-<step>.safetensors`` snapshot into ``lm``.
+
+    No-op when ``ckpt_dir`` holds no numbered snapshots (a fresh run). Only the
+    trainable weights are restored; the optimizer state and step counter are not,
+    so training restarts its schedule from the loaded weights.
+    """
+    import mlx.core as mx
+    from mlx.utils import tree_unflatten
+
+    existing = sorted(
+        Path(ckpt_dir).glob("checkpoint-*.safetensors"),
+        key=lambda p: int(p.stem.split("-")[1]),
+    )
+    if not existing:
+        return
+    # mx.load of a .safetensors returns a {name: array} dict; the mlx stub types
+    # it as the broader array|tuple union, so narrow it for tree_unflatten.
+    weights: dict[str, Any] = mx.load(str(existing[-1]))  # type: ignore[assignment]
+    lm.update(tree_unflatten(list(weights.items())))
+    mx.eval(lm.parameters())
+
+
 def _loss_report_callback(
-    callback: Callback, lm: Any, optimizer: Any, iters: int, patience: int | None
+    callback: Callback,
+    lm: Any,
+    optimizer: Any,
+    iters: int,
+    patience: int | None,
+    *,
+    ckpt_dir: str,
+    save_every: int | None,
+    keep: int | None,
 ) -> Any:
     """Build an mlx-lm ``TrainingCallback`` that forwards train/val loss, the
     gradient norm and the current device memory to ``callback``.
@@ -393,8 +470,10 @@ def _loss_report_callback(
     The gradient norm stays ``None`` when clipping is disabled
     (``max_grad_norm`` unset), since nothing computes it then.
 
-    When ``patience`` is set it also tracks the best validation snapshot for early
-    stopping, exposed as ``.best`` for the caller to restore after training, and
+    When ``save_every`` is set, every that-many micro-steps a numbered checkpoint
+    is written under ``ckpt_dir`` and pruned to the ``keep`` most recent. Whenever
+    a validation set yields reports the best (lowest-loss) snapshot is tracked and
+    exposed as ``.best`` for the caller to restore; with ``patience`` set it also
     raises :class:`_StopTraining` once validation stops improving for ``patience``
     reports.
     """
@@ -413,20 +492,23 @@ def _loss_report_callback(
         def on_train_loss_report(self, train_info: dict[str, Any]) -> None:
             callback.on_memory(int(mx.get_active_memory()))
             norm = optimizer.state.get("last_grad_norm")
+            step = int(train_info["iteration"])
             callback.on_train_report(
-                step=int(train_info["iteration"]),
+                step=step,
                 total_steps=iters,
                 loss=float(train_info["train_loss"]),
                 epoch=None,
                 learning_rate=train_info.get("learning_rate"),
                 grad_norm=float(norm.item()) if norm is not None else None,
             )
+            if save_every is not None and step % save_every == 0:
+                snapshot = tree_flatten(lm.trainable_parameters())
+                mx.eval([v for _, v in snapshot])
+                _save_checkpoint(ckpt_dir, step, snapshot, keep)
 
         def on_val_loss_report(self, val_info: dict[str, Any]) -> None:
             loss = float(val_info["val_loss"])
             callback.on_eval_report(step=int(val_info["iteration"]), loss=loss, epoch=None)
-            if patience is None:
-                return
             if loss < self.best_loss - 1e-9:
                 self.best_loss = loss
                 # mlx arrays are immutable, so snapshotting the current leaves
@@ -435,7 +517,7 @@ def _loss_report_callback(
                 mx.eval([v for _, v in snapshot])
                 self.best = snapshot
                 self.no_improve = 0
-            else:
+            elif patience is not None:
                 self.no_improve += 1
                 if self.no_improve >= patience:
                     raise _StopTraining
