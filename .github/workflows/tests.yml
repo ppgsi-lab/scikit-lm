@@ -36,7 +36,7 @@ jobs:
     # pyright statically resolves the mlx and plotext imports, so it only passes
     # where both install: an Apple-Silicon runner with every extra present.
     name: typecheck (macOS arm64)
-    runs-on: macos-14
+    runs-on: macos-26
     steps:
       - uses: actions/checkout@v4
       - name: Install uv
