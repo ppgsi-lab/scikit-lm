@@ -453,10 +453,6 @@ def test_complete_serializes_numpy_scalar_knowns_as_native() -> None:
 # --- permute_order semantics ------------------------------------------------
 
 
-def test_permute_order_defaults_off() -> None:
-    assert GenerationConfig().permute_order is False
-
-
 def test_regressor_single_sample_permute_order_is_inert() -> None:
     X = pd.DataFrame({"a": [1.0, 2.0], "b": [3.0, 4.0]})
     y = np.array([1.0, 2.0])

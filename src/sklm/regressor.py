@@ -29,6 +29,7 @@ from .base import (
     to_frame,
     unique_name,
 )
+from .bridge import Model
 from .callbacks import predict_batches
 from .config import DiscretizationConfig, GenerationConfig
 from .params import AnnotatedDefault, RegressorArgs, _FlatParams
@@ -42,8 +43,10 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
 
     Parameters
     ----------
-    model : str, optional
-        Hugging Face model id. Default ``"distilgpt2"``.
+    model : Model, optional
+        A model id string (default ``"distilgpt2"``), an already-loaded HF/MLX
+        model, or a zero-argument factory returning one. A factory reloads on
+        each fit (refit-safe); a bare object is fine-tuned in place.
     backend : LanguageModelBackend or str, optional
         ``"huggingface"`` (default) builds a fresh :class:`~sklm.HFBackend` per
         fit, or pass an :class:`~sklm.LanguageModelBackend` instance.
@@ -68,11 +71,11 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
         Default ``3``.
     random_state : int or None, optional
         Seed forwarded to the backend and serializer.
-    callback : Callback, list of Callback or None, optional
+    callback : Callback, list of Callback, "auto" or None, optional
         Feedback hooks for fitting and inference. A list is wrapped in a
-        :class:`~sklm.CompositeCallback`. Default ``None`` auto-selects a
-        dashboard for the runtime environment (Jupyter, rich, or
-        logging).
+        :class:`~sklm.CompositeCallback`. ``"auto"`` (default) selects a
+        dashboard for the runtime environment (Jupyter, rich, or logging);
+        ``None`` disables feedback entirely.
     lora : LoRAConfig or None, optional
         Fine-tune with LoRA adapters when set; full-weight otherwise (default).
     quantization : {"2bit", "3bit", "4bit", "6bit", "8bit"}, QuantizationConfig or None, optional
@@ -107,7 +110,7 @@ class LanguageModelRegressor(_FlatParams, RegressorMixin, BaseEstimator):
     generation: GenerationConfig
     discretization: DiscretizationConfig
 
-    def __init__(self, model: str = "distilgpt2", **kwargs: Unpack[RegressorArgs]) -> None:
+    def __init__(self, model: Model = "distilgpt2", **kwargs: Unpack[RegressorArgs]) -> None:
         self.model = model
         defaults = AnnotatedDefault.create_with_defaults(
             RegressorArgs, valid_params=self._get_param_names(), **kwargs

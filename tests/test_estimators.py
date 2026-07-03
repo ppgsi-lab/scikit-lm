@@ -27,6 +27,7 @@ from sklm import (
     LanguageModelImputer,
     LanguageModelOverSampler,
     LanguageModelRegressor,
+    LanguageModelSynthesizer,
     LoggingCallback,
     Serializer,
     TrainingConfig,
@@ -152,7 +153,7 @@ def test_classifier_candidate_scoring_sum_uses_total_loglik(clf_data) -> None:
 
 
 def test_classifier_duplicate_columns_raise() -> None:
-    X = pd.DataFrame([[1, 2, 3], [4, 5, 6]], columns=["age", "age", "score"])
+    X = pd.DataFrame([[1, 2, 3], [4, 5, 6]], columns=pd.Index(["age", "age", "score"]))
     y = np.array(["yes", "no"])
     clf = LanguageModelClassifier(backend=FakeBackend())
     with pytest.raises(ValueError, match="duplicate column names"):
@@ -326,6 +327,44 @@ def test_imputer_accepts_builtin_non_json_serializers(serializer: Serializer, na
     assert out.isna().sum().sum() == 0
 
 
+def test_imputer_complete_rows_only_restricts_training_to_complete_rows() -> None:
+    """``complete_rows_only=True`` trains only on rows without missing cells while
+    keeping the ``loss_on_target_only`` masking: ``ctx`` (never missing) is masked
+    context and ``a`` (has a NaN) is the supervised target column."""
+    frame = pd.DataFrame(
+        {
+            "ctx": [1.0, 2.0, 3.0, 4.0],
+            "a": [1.0, 2.0, np.nan, 4.0],
+        }
+    )
+
+    fake_all = FakeBackend()
+    LanguageModelImputer(
+        backend=fake_all,
+        training=TrainingConfig(epochs=1, augmentation_factor=1, loss_on_target_only=True),
+    ).fit(frame)
+
+    fake_complete = FakeBackend()
+    LanguageModelImputer(
+        backend=fake_complete,
+        training=TrainingConfig(epochs=1, augmentation_factor=1, loss_on_target_only=True),
+        complete_rows_only=True,
+    ).fit(frame)
+
+    assert fake_all.last_examples is not None
+    assert fake_complete.last_examples is not None
+    assert len(fake_complete.last_examples) < len(fake_all.last_examples)
+    assert all("ctx" in ex.prompt for ex in fake_complete.last_examples)
+
+
+def test_imputer_complete_rows_only_raises_without_complete_rows() -> None:
+    """With no complete row, ``complete_rows_only=True`` fails loud rather than
+    training on an empty table."""
+    frame = pd.DataFrame({"a": [1.0, np.nan], "b": [np.nan, 2.0]})
+    with pytest.raises(ValueError, match="complete"):
+        LanguageModelImputer(backend=FakeBackend(), complete_rows_only=True).fit(frame)
+
+
 def test_pickle_drops_live_callback_and_keeps_imputing(nan_data) -> None:
     """Pickling a fitted estimator restores a no-op ``Callback`` on the inner
     model (a live callback may hold an open stream) while transform still works."""
@@ -387,3 +426,44 @@ def test_oversampler_warns_on_loss_on_target_only(imbalanced_data) -> None:
     )
     with pytest.warns(RuntimeWarning, match="oversampler"):
         over.fit_resample(X, y)
+
+
+# --- synthesizer ----------------------------------------------------------
+
+
+def test_synthesizer_fit_sets_sklearn_attrs(make: MakeEstimator, clf_data) -> None:
+    X, y = clf_data
+    frame = X.assign(label=y)
+    synth = make(LanguageModelSynthesizer)
+    assert synth.fit(frame) is synth
+    assert synth.n_features_in_ == frame.shape[1]
+    np.testing.assert_array_equal(synth.feature_names_in_, np.asarray(frame.columns))
+
+
+def test_synthesizer_sample_returns_table(make: MakeEstimator, clf_data) -> None:
+    X, y = clf_data
+    frame = X.assign(label=y)
+    synth = make(LanguageModelSynthesizer).fit(frame)
+    rows = synth.sample(5)
+    assert isinstance(rows, pd.DataFrame)
+    assert len(rows) == 5
+    assert list(rows.columns) == [str(c) for c in frame.columns]
+
+
+def test_synthesizer_samples_categorical_from_levels() -> None:
+    frame = pd.DataFrame({"num": [1.0, 2.0, 3.0, 4.0], "cat": ["a", "b", "a", "b"]})
+    synth = LanguageModelSynthesizer(backend=FakeBackend(value="0"), random_state=0).fit(frame)
+    rows = synth.sample(8)
+    assert set(rows["cat"]) <= {"a", "b"}  # scored from levels, never the generated "0"
+
+
+def test_synthesizer_conditional_holds_column_fixed() -> None:
+    frame = pd.DataFrame({"num": [1.0, 2.0, 3.0, 4.0], "cat": ["a", "b", "a", "b"]})
+    synth = LanguageModelSynthesizer(backend=FakeBackend(value="0"), random_state=0).fit(frame)
+    rows = synth.sample(4, condition={"cat": "a"})
+    assert (rows["cat"] == "a").all()
+
+
+def test_synthesizer_sample_before_fit_raises() -> None:
+    with pytest.raises(NotFittedError):
+        LanguageModelSynthesizer(backend=FakeBackend()).sample(1)

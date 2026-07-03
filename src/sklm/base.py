@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 
 from .backend import LanguageModelBackend
+from .bridge import Model, Tokenizer
 from .callbacks import Callback, resolve_callback
 from .config import (
     DiscretizationConfig,
@@ -47,17 +48,17 @@ __all__ = [
 
 
 class _HasBackendParams(Protocol):
-    model: str
+    model: Model
     backend: LanguageModelBackend | str
     training: TrainingConfig
     serializer: str | Serializer
     max_decimals: int | None
     random_state: int | None
-    callback: Callback | list[Callback] | None
+    callback: Callback | list[Callback] | Literal["auto"] | None
     lora: LoRAConfig | None
     quantization: Quantization | QuantizationConfig | None
     precision: Precision
-    tokenizer: str | None
+    tokenizer: Tokenizer | None
     trust_remote_code: bool
     device: str
     attn_implementation: str | None
@@ -381,10 +382,12 @@ def reduce_estimate(
     """Collapse a candidate probability distribution into one prediction.
 
     ``config.estimate == "mean"`` returns the probability-weighted expectation
-    over ``candidates``; ``"mode"`` returns the single most likely candidate.
-    ``config.sharpness`` re-tempers the distribution first (probabilities are
-    raised to that power and renormalized), pulling the expectation toward the
-    top candidates; the argmax is invariant to it.
+    over ``candidates``; ``"median"`` the probability-weighted median (the
+    smallest candidate whose cumulative probability reaches half); ``"mode"``
+    the single most likely candidate. ``config.sharpness`` re-tempers the
+    distribution first (probabilities are raised to that power and
+    renormalized), pulling ``"mean"`` and ``"median"`` toward the top
+    candidates; the argmax (``"mode"``) is invariant to it.
 
     Parameters
     ----------
@@ -402,13 +405,18 @@ def reduce_estimate(
         The reduced prediction.
     """
     c = np.asarray(candidates, dtype=float)
-    if config.estimate == "mean":
-        p = np.asarray(proba_row, dtype=float)
-        if config.sharpness != 1.0:
-            p = p**config.sharpness
-            p = p / p.sum()
-        return float(np.dot(p, c))
-    return float(c[int(np.argmax(proba_row))])
+    if config.estimate == "mode":
+        return float(c[int(np.argmax(proba_row))])
+    p = np.asarray(proba_row, dtype=float)
+    if config.sharpness != 1.0:
+        p = p**config.sharpness
+        p = p / p.sum()
+    if config.estimate == "median":
+        order = np.argsort(c)
+        cum = np.cumsum(p[order])
+        idx = int(np.searchsorted(cum, 0.5 * cum[-1]))
+        return float(c[order[min(idx, c.size - 1)]])
+    return float(np.dot(p, c))
 
 
 def resolve_discretization(

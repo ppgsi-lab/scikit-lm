@@ -36,7 +36,7 @@ def _format_duration(seconds: float) -> str:
 
 def _format_params(training: TrainingConfig) -> str:
     """Render the headline training hyperparameters as a ``·``-joined string."""
-    lr = training.learning_rate
+    lr = training.lr_scheduler.learning_rate
     parts = [
         f"{training.epochs} epochs",
         f"bs={training.batch_size}",

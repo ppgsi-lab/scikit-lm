@@ -197,7 +197,7 @@ def _hyperparameters(state: TrainingState, dash: DashboardState) -> KeyValues:
         rows.append(KeyValue("base model", state.model, mono=True))
     t = state.training
     if t is not None:
-        lr = t.learning_rate
+        lr = t.lr_scheduler.learning_rate
         rows.append(KeyValue("peak lr", lr if isinstance(lr, str) else _sci(lr), mono=True))
         rows.append(KeyValue("batch size", str(t.batch_size)))
         rows.append(KeyValue("epochs", str(t.epochs)))

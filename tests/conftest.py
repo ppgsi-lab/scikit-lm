@@ -138,7 +138,7 @@ def nan_data() -> pd.DataFrame:
 @pytest.fixture
 def imbalanced_data() -> tuple[pd.DataFrame, np.ndarray]:
     rng = np.random.default_rng(3)
-    X = pd.DataFrame(rng.normal(size=(20, 3)), columns=["a", "b", "c"])
+    X = pd.DataFrame(rng.normal(size=(20, 3)), columns=pd.Index(["a", "b", "c"]))
     y = np.array([0] * 16 + [1] * 4)
     return X, y
 
@@ -164,15 +164,12 @@ def _has_hf() -> bool:
 
 
 def _has_mlx() -> bool:
-    if not (importlib.util.find_spec("mlx") and importlib.util.find_spec("mlx_lm")):
-        return False
-    import mlx.core as mx
-
-    return bool(mx.metal.is_available())
+    # Any installed MLX build -- CPU, CUDA or Metal; the backend runs on all three.
+    return bool(importlib.util.find_spec("mlx") and importlib.util.find_spec("mlx_lm"))
 
 
 # distilgpt2's own repo is not mlx-loadable; this mirror is (same GPT-2 arch).
-_MLX_MODEL = "gabfssilva/distilgpt2"
+_MLX_MODEL = "mlx-community/distilgpt2"
 
 _BACKENDS = [
     pytest.param(
@@ -212,7 +209,7 @@ _BACKENDS = [
         id="mlx",
         marks=[
             pytest.mark.slow,
-            pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon"),
+            pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra"),
         ],
     ),
 ]

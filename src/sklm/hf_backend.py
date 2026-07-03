@@ -21,11 +21,17 @@ from dataclasses import replace
 from typing import Any, Literal
 
 from .backend import common_token_prefix, resolve_max_new_tokens, resolve_max_seq_length
+from .bridge import Model
 from .callbacks import Callback
 from .config import (
+    ConstantLR,
+    CosineLR,
     GenerationConfig,
+    LinearLR,
     LoRAConfig,
+    LRScheduler,
     ModelConfig,
+    PlateauLR,
     QuantizationConfig,
     TrainingConfig,
 )
@@ -83,10 +89,10 @@ class HFBackend:
             return "mps"
         return "cpu"
 
-    def _load(self, model_name: str, model_config: ModelConfig) -> None:
+    def _load(self, model: Model, model_config: ModelConfig) -> None:
         try:
             import torch
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            from transformers import AutoConfig, AutoModelForCausalLM, PreTrainedModel
         except ImportError as exc:  # pragma: no cover - exercised only without extra
             raise ImportError(
                 "HFBackend requires the 'hf' extra: pip install scikit-lm[hf]"
@@ -100,62 +106,112 @@ class HFBackend:
         }[model_config.precision]
         device = self._resolve_device(model_config.device)
 
-        tokenizer_src = model_config.tokenizer or model_name
-        tokenizer: Any = AutoTokenizer.from_pretrained(
-            tokenizer_src, trust_remote_code=model_config.trust_remote_code
-        )
+        # A factory defers loading to here; its product is a model id or a loaded model.
+        if callable(model) and not isinstance(model, (str, PreTrainedModel)):
+            model = model()
+
+        tokenizer = self._resolve_tokenizer(model_config, model)
         if tokenizer.pad_token is None:
             tokenizer.pad_token = tokenizer.eos_token
 
-        quantization = model_config.quantization
-        method: str | None = None
-        if quantization is not None:
-            method = _resolve_hf_method(quantization)
-            if method == "bitsandbytes" and device not in ("cuda", "mps"):
-                raise ValueError(
-                    f"bitsandbytes quantization needs CUDA or MPS (mps-bitsandbytes); "
-                    f"got device={device!r}"
-                )
-
-        load_kwargs: dict[str, Any] = {"trust_remote_code": model_config.trust_remote_code}
-        if model_config.attn_implementation is not None:
-            load_kwargs["attn_implementation"] = model_config.attn_implementation
-        if quantization is not None and method == "hqq":
-            # HQQ quantizes at load and dispatches via device_map; works on CUDA
-            # (kernels) and CPU (pure PyTorch), unlike bitsandbytes.
-            load_kwargs["quantization_config"] = _hqq_config(quantization)
-            load_kwargs["device_map"] = device
-            load_kwargs["dtype"] = dtype
-        elif quantization is not None and method == "bitsandbytes" and device == "cuda":
-            load_kwargs["quantization_config"] = _quant_config(quantization, dtype)
-            load_kwargs["device_map"] = "auto"
-        else:
-            load_kwargs["dtype"] = dtype
-
-        model: Any = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
         self._mps_quantized = False
-        if quantization is not None and method == "bitsandbytes" and device == "mps":
-            model = model.to(device)
-            model = _quantize_mps(model, quantization, dtype)
-            self._mps_quantized = True
-        elif quantization is None:
-            model = model.to(device)
-        model.generation_config.max_length = None
+        method: str | None = None
+        lm: Any
+        if isinstance(model, str):
+            quantization = model_config.quantization
+            if quantization is not None:
+                method = _resolve_hf_method(quantization)
+                if method == "bitsandbytes" and device not in ("cuda", "mps"):
+                    raise ValueError(
+                        f"bitsandbytes quantization needs CUDA or MPS (mps-bitsandbytes); "
+                        f"got device={device!r}"
+                    )
+
+            # The MLX backend's text models carry no dropout, so silence the HF base
+            # model's config dropout (GPT-2 ships resid/embd/attn_pdrop=0.1) to keep
+            # fine-tuning regularization matched across backends.
+            config: Any = AutoConfig.from_pretrained(
+                model, trust_remote_code=model_config.trust_remote_code
+            )
+            _zero_base_dropout(config)
+            load_kwargs: dict[str, Any] = {
+                "config": config,
+                "trust_remote_code": model_config.trust_remote_code,
+            }
+            if model_config.attn_implementation is not None:
+                load_kwargs["attn_implementation"] = model_config.attn_implementation
+            if quantization is not None and method == "hqq":
+                # HQQ quantizes at load and dispatches via device_map; works on CUDA
+                # (kernels) and CPU (pure PyTorch), unlike bitsandbytes.
+                load_kwargs["quantization_config"] = _hqq_config(quantization)
+                load_kwargs["device_map"] = device
+                load_kwargs["dtype"] = dtype
+            elif quantization is not None and method == "bitsandbytes" and device == "cuda":
+                load_kwargs["quantization_config"] = _quant_config(quantization, dtype)
+                load_kwargs["device_map"] = "auto"
+            else:
+                load_kwargs["dtype"] = dtype
+
+            lm = AutoModelForCausalLM.from_pretrained(model, **load_kwargs)
+            if quantization is not None and method == "bitsandbytes" and device == "mps":
+                lm = lm.to(device)
+                lm = _quantize_mps(lm, quantization, dtype)
+                self._mps_quantized = True
+            elif quantization is None:
+                lm = lm.to(device)
+        elif isinstance(model, PreTrainedModel):
+            if model_config.quantization is not None:
+                raise ValueError(
+                    "quantization applies to a model id the backend loads, not a "
+                    "pre-loaded model; quantize it before passing it, or pass an id"
+                )
+            lm = model
+            lm = lm.to(device)
+        else:
+            raise TypeError(
+                "HFBackend expected a model id, a PreTrainedModel, or a factory "
+                f"returning one; got {type(model).__name__}"
+            )
+
+        lm.generation_config.max_length = None
         # Make the embedding output require grad so gradients reach LoRA adapters
         # through frozen/quantized layers (also a prerequisite for checkpointing).
-        model.enable_input_require_grads()
+        lm.enable_input_require_grads()
 
         if model_config.lora is not None:
-            model = _apply_lora(
-                model,
+            lm = _apply_lora(
+                lm,
                 model_config.lora,
                 prepare_kbit=method == "bitsandbytes" and not self._mps_quantized,
             )
 
         self._tokenizer = tokenizer
-        self._model = model
+        self._model = lm
         self._device = device
         self._precision = model_config.precision
+
+    def _resolve_tokenizer(self, model_config: ModelConfig, model: Model) -> Any:
+        """Resolve the tokenizer spec to a loaded tokenizer.
+
+        A factory is invoked; an already-loaded tokenizer is used as-is; a string
+        id is loaded; ``None`` derives the tokenizer from a model-id string, and is
+        rejected when ``model`` is a pre-loaded object (no id to derive from).
+        """
+        from transformers import AutoTokenizer, PreTrainedTokenizerBase
+
+        spec = model_config.tokenizer
+        if callable(spec) and not isinstance(spec, (str, PreTrainedTokenizerBase)):
+            spec = spec()
+        if isinstance(spec, PreTrainedTokenizerBase):
+            return spec
+        if spec is None:
+            if not isinstance(model, str):
+                raise ValueError(
+                    "tokenizer must be set when model is a pre-loaded object "
+                    "(there is no model id to derive it from)"
+                )
+            spec = model
+        return AutoTokenizer.from_pretrained(spec, trust_remote_code=model_config.trust_remote_code)
 
     def fit(
         self,
@@ -175,7 +231,11 @@ class HFBackend:
         from transformers.trainer_callback import PrinterCallback, ProgressCallback
         from transformers.trainer_utils import get_last_checkpoint
 
-        training = replace(training, learning_rate=training.resolved_learning_rate(model_config))
+        sched = training.lr_scheduler
+        training = replace(
+            training,
+            lr_scheduler=replace(sched, learning_rate=sched.resolved_learning_rate(model_config)),
+        )
 
         import torch
 
@@ -379,7 +439,7 @@ class HFBackend:
         }[training.optimizer]
         opt = cls(
             self._model.parameters(),
-            lr=training.learning_rate,
+            lr=training.lr_scheduler.learning_rate,
             weight_decay=training.weight_decay,
         )
         return (opt, None)
@@ -396,6 +456,20 @@ class HFBackend:
         else:
             with torch.no_grad():
                 yield
+
+
+def _zero_base_dropout(config: Any) -> None:
+    """Zero every dropout rate on a model config, in place.
+
+    The MLX backend's text models implement no dropout, so the HF base model's
+    config dropout is silenced to keep fine-tuning regularization matched across
+    backends -- GPT-2, for instance, ships ``resid_pdrop = embd_pdrop =
+    attn_pdrop = 0.1``. Field names vary by architecture, so any float attribute
+    whose name mentions ``dropout`` or ``pdrop`` is caught.
+    """
+    for attr, value in list(vars(config).items()):
+        if isinstance(value, float) and ("dropout" in attr or "pdrop" in attr):
+            setattr(config, attr, 0.0)
 
 
 def _resolve_hf_method(quantization: QuantizationConfig) -> str:
@@ -577,10 +651,8 @@ def _training_kwargs(
         max_steps=max_steps,
         per_device_train_batch_size=training.batch_size,
         gradient_accumulation_steps=training.grad_accumulation_steps,
-        learning_rate=training.learning_rate,
+        learning_rate=training.lr_scheduler.learning_rate,
         weight_decay=training.weight_decay,
-        lr_scheduler_type=training.lr_scheduler,
-        warmup_ratio=training.warmup_ratio,
         max_grad_norm=training.max_grad_norm if training.max_grad_norm is not None else 0.0,
         optim=optim,
         label_smoothing_factor=training.label_smoothing,
@@ -602,8 +674,52 @@ def _training_kwargs(
         # fresh seed for None and pass the explicit int through untouched.
         seed=random_state if random_state is not None else int.from_bytes(os.urandom(4)),
     )
+    _apply_lr_scheduler_kwargs(kwargs, training.lr_scheduler)
     _apply_eval_kwargs(kwargs, training, has_eval)
     return kwargs
+
+
+def _apply_lr_scheduler_kwargs(kwargs: dict[str, Any], scheduler: LRScheduler) -> None:
+    """Map an :class:`~sklm.LRScheduler` onto the ``TrainingArguments`` schedule keys.
+
+    The step-based shapes set ``lr_scheduler_type`` and ``warmup_ratio``. A
+    ``floor`` on cosine/linear switches the type to ``cosine_with_min_lr`` /
+    ``polynomial`` (degree 1 = linear) so the decay ends at the floor instead of
+    zero. :class:`~sklm.PlateauLR` sets ``reduce_lr_on_plateau`` plus the
+    ``lr_scheduler_kwargs`` the ``Trainer`` forwards to
+    ``torch.optim.lr_scheduler.ReduceLROnPlateau`` (minimum mode; ``threshold_mode``
+    and ``eps`` left at their torch defaults to match the MLX backend).
+    """
+    match scheduler:
+        case ConstantLR():
+            kwargs["lr_scheduler_type"] = "constant"
+            kwargs["warmup_ratio"] = scheduler.warmup_ratio
+        case LinearLR():
+            if scheduler.floor > 0.0:
+                kwargs["lr_scheduler_type"] = "polynomial"
+                kwargs["lr_scheduler_kwargs"] = {"lr_end": scheduler.floor, "power": 1.0}
+            else:
+                kwargs["lr_scheduler_type"] = "linear"
+            kwargs["warmup_ratio"] = scheduler.warmup_ratio
+        case CosineLR():
+            if scheduler.floor > 0.0:
+                kwargs["lr_scheduler_type"] = "cosine_with_min_lr"
+                kwargs["lr_scheduler_kwargs"] = {"min_lr": scheduler.floor}
+            else:
+                kwargs["lr_scheduler_type"] = "cosine"
+            kwargs["warmup_ratio"] = scheduler.warmup_ratio
+        case PlateauLR():
+            kwargs["lr_scheduler_type"] = "reduce_lr_on_plateau"
+            kwargs["lr_scheduler_kwargs"] = {
+                "mode": "min",
+                "factor": scheduler.factor,
+                "patience": scheduler.patience,
+                "threshold": scheduler.threshold,
+                "min_lr": scheduler.floor,
+                "cooldown": scheduler.cooldown,
+            }
+        case _:
+            raise ValueError(f"unknown lr_scheduler {type(scheduler).__name__}")
 
 
 def _apply_eval_kwargs(kwargs: dict[str, Any], training: TrainingConfig, has_eval: bool) -> None:
@@ -650,17 +766,18 @@ def _apply_eval_kwargs(kwargs: dict[str, Any], training: TrainingConfig, has_eva
 
 def _causal_collator(tokenizer: Any) -> Callable[[list[dict[str, Any]]], dict[str, Any]]:
     def collate(features: list[dict[str, Any]]) -> dict[str, Any]:
-        # Pop per-example so a batch may mix masked rows (carrying prompt_len)
-        # with unmasked ones (context-only / flag off, default 0). Stripping the
-        # key here also keeps it out of tokenizer.pad, which only accepts lists.
-        prompt_lens = [int(f.pop("prompt_len", 0)) for f in features]
+        # ``labels`` rides as a first-class column (the dataset masks the prompt
+        # with -100), so it survives the Trainer's ``remove_unused_columns``. Pull
+        # it out before ``tokenizer.pad`` -- which only pads input_ids/
+        # attention_mask -- then right-pad it with -100 to the batch width (matches
+        # the right-padded input_ids; -100 positions are ignored by the loss).
+        labels = [f.pop("labels") for f in features]
         batch = tokenizer.pad(features, return_tensors="pt")
-        labels = batch["input_ids"].clone()
-        labels[batch["attention_mask"] == 0] = -100
-        for i, plen in enumerate(prompt_lens):  # mask the (right-padded) context span
-            if plen > 0:
-                labels[i, :plen] = -100
-        batch["labels"] = labels
+        ids = batch["input_ids"]
+        padded = ids.new_full((len(labels), ids.shape[1]), -100)
+        for i, lab in enumerate(labels):
+            padded[i, : len(lab)] = ids.new_tensor(lab)
+        batch["labels"] = padded
         return batch
 
     return collate
@@ -673,12 +790,14 @@ def _text_dataset(
 
     ``reshuffle`` refreshes the buffer from ``epoch_texts`` for the next epoch
     index so the column-order permutation is redrawn at each epoch boundary
-    (driven by a Trainer callback). Tokenization is lazy in ``__getitem__``; the
-    causal collator
-    pads dynamically and builds the labels. When an example carries a non-empty
-    ``prompt`` (loss-on-target-only), ``prompt_len`` records how many leading
-    tokens the collator must mask, found as the longest common token prefix
-    between the prompt and the full text (robust to BPE merging the boundary).
+    (driven by a Trainer callback). Tokenization is lazy in ``__getitem__``, which
+    also builds ``labels``: a copy of ``input_ids`` with the prompt span set to
+    -100. When an example carries a non-empty ``prompt`` (loss-on-target-only),
+    the masked span is the longest common token prefix between the prompt and the
+    full text (robust to BPE merging the boundary); the causal collator pads
+    dynamically, padding ``labels`` with -100. Emitting ``labels`` directly keeps
+    the mask a first-class column that survives the Trainer's
+    ``remove_unused_columns``.
     """
     from torch.utils.data import Dataset as TorchDataset
 
@@ -699,15 +818,17 @@ def _text_dataset(
         def __getitem__(self, idx: int) -> dict[str, Any]:
             ex = self._buffer[idx]
             enc = tokenizer(ex.text + eos, truncation=True, max_length=max_seq_length)
-            item: dict[str, Any] = {
-                "input_ids": enc["input_ids"],
-                "attention_mask": enc["attention_mask"],
-            }
+            labels = list(enc["input_ids"])
             if ex.prompt:
                 prompt_ids = tokenizer(ex.prompt)["input_ids"]
                 n = common_token_prefix(prompt_ids, enc["input_ids"])
                 # Always supervise at least one token to avoid an all-masked row.
-                item["prompt_len"] = min(n, len(enc["input_ids"]) - 1)
-            return item
+                plen = min(n, len(enc["input_ids"]) - 1)
+                labels[:plen] = [-100] * plen
+            return {
+                "input_ids": enc["input_ids"],
+                "attention_mask": enc["attention_mask"],
+                "labels": labels,
+            }
 
     return _TextDataset()

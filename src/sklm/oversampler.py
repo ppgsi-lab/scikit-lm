@@ -24,6 +24,7 @@ from imblearn.utils._tags import Tags
 from sklearn.utils.validation import check_consistent_length
 
 from .base import forget, make_tabular_lm, to_frame, unique_name
+from .bridge import Model
 from .config import GenerationConfig
 from .params import AnnotatedDefault, OversamplerArgs, _FlatParams
 
@@ -42,8 +43,10 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
     sampling_strategy : str, float, dict or callable, optional
         Forwarded to imbalanced-learn; controls how many samples each class
         gets. Default ``"auto"``.
-    model : str, optional
-        Hugging Face model id. Default ``"distilgpt2"``.
+    model : Model, optional
+        A model id string (default ``"distilgpt2"``), an already-loaded HF/MLX
+        model, or a zero-argument factory returning one. A factory reloads on
+        each fit (refit-safe); a bare object is fine-tuned in place.
     backend : LanguageModelBackend or str, optional
         ``"huggingface"`` (default) builds a fresh :class:`~sklm.HFBackend` per
         fit, or pass an :class:`~sklm.LanguageModelBackend` instance.
@@ -61,11 +64,11 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
         Default ``3``.
     random_state : int or None, optional
         Seed forwarded to the backend and serializer.
-    callback : Callback, list of Callback or None, optional
+    callback : Callback, list of Callback, "auto" or None, optional
         Feedback hooks for fitting and inference. A list is wrapped in a
-        :class:`~sklm.CompositeCallback`. Default ``None`` auto-selects a
-        dashboard for the runtime environment (Jupyter, rich, or
-        logging).
+        :class:`~sklm.CompositeCallback`. ``"auto"`` (default) selects a
+        dashboard for the runtime environment (Jupyter, rich, or logging);
+        ``None`` disables feedback entirely.
     lora : LoRAConfig or None, optional
         Fine-tune with LoRA adapters when set; full-weight otherwise (default).
     quantization : {"2bit", "3bit", "4bit", "6bit", "8bit"}, QuantizationConfig or None, optional
@@ -102,7 +105,7 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
         self,
         *,
         sampling_strategy: object = "auto",
-        model: str = "distilgpt2",
+        model: Model = "distilgpt2",
         **kwargs: Unpack[OversamplerArgs],
     ) -> None:
         # imbalanced-learn accepts str | float | dict | callable but types the
@@ -224,7 +227,7 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
                 )
         cb.on_predict_end()
 
-        synth_df = pd.DataFrame(synth_rows, columns=feature_cols)
+        synth_df = pd.DataFrame(synth_rows, columns=pd.Index(feature_cols))
         X_res = pd.concat([X_df, synth_df], ignore_index=True)
         y_res = np.concatenate([y_arr, np.asarray(synth_y, dtype=y_arr.dtype)])
         return X_res.to_numpy(), y_res

@@ -20,9 +20,10 @@ from __future__ import annotations
 import inspect
 from collections.abc import Iterable, Mapping
 from copy import deepcopy
-from typing import Annotated, ClassVar, TypedDict, get_args, get_type_hints
+from typing import Annotated, ClassVar, Literal, TypedDict, get_args, get_type_hints
 
 from .backend import LanguageModelBackend
+from .bridge import Tokenizer
 from .callbacks import Callback
 from .config import (
     DiscretizationConfig,
@@ -103,11 +104,13 @@ class EstimatorArgs(TypedDict, total=False):
     serializer: Annotated[str | Serializer, AnnotatedDefault("json")]
     max_decimals: Annotated[int | None, AnnotatedDefault(3)]
     random_state: Annotated[int | None, AnnotatedDefault(None)]
-    callback: Annotated[Callback | list[Callback] | None, AnnotatedDefault(None)]
+    callback: Annotated[
+        Callback | list[Callback] | Literal["auto"] | None, AnnotatedDefault("auto")
+    ]
     lora: Annotated[LoRAConfig | None, AnnotatedDefault(None)]
     quantization: Annotated[Quantization | QuantizationConfig | None, AnnotatedDefault(None)]
     precision: Annotated[Precision, AnnotatedDefault("fp32")]
-    tokenizer: Annotated[str | None, AnnotatedDefault(None)]
+    tokenizer: Annotated[Tokenizer | None, AnnotatedDefault(None)]
     trust_remote_code: Annotated[bool, AnnotatedDefault(False)]
     device: Annotated[str, AnnotatedDefault("auto")]
     attn_implementation: Annotated[str | None, AnnotatedDefault(None)]
@@ -122,6 +125,7 @@ class ImputerArgs(EstimatorArgs, total=False):
         DiscretizationConfig | Mapping[str, DiscretizationConfig],
         AnnotatedDefault(DiscretizationConfig()),
     ]
+    complete_rows_only: Annotated[bool, AnnotatedDefault(False)]
 
 
 class OversamplerArgs(EstimatorArgs, total=False):
@@ -143,11 +147,11 @@ class _FlatParams:
     serializer: str | Serializer
     max_decimals: int | None
     random_state: int | None
-    callback: Callback | list[Callback] | None
+    callback: Callback | list[Callback] | Literal["auto"] | None
     lora: LoRAConfig | None
     quantization: Quantization | QuantizationConfig | None
     precision: Precision
-    tokenizer: str | None
+    tokenizer: Tokenizer | None
     trust_remote_code: bool
     device: str
     attn_implementation: str | None

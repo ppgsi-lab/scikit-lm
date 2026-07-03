@@ -32,6 +32,7 @@ from .base import (
     select_candidates,
     to_frame,
 )
+from .bridge import Model
 from .callbacks import predict_batches
 from .config import DiscretizationConfig, GenerationConfig
 from .core import _ScoreSpec
@@ -51,8 +52,10 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
 
     Parameters
     ----------
-    model : str, optional
-        Hugging Face model id. Default ``"distilgpt2"``.
+    model : Model, optional
+        A model id string (default ``"distilgpt2"``), an already-loaded HF/MLX
+        model, or a zero-argument factory returning one. A factory reloads on
+        each fit (refit-safe); a bare object is fine-tuned in place.
     backend : LanguageModelBackend or str, optional
         ``"huggingface"`` (default) builds a fresh :class:`~sklm.HFBackend` per
         fit, or pass an :class:`~sklm.LanguageModelBackend` instance.
@@ -77,6 +80,11 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
         :class:`~sklm.DiscretizationConfig` with ``bins=0``). Each row is filled
         cell by cell -- scored cells are deterministic, generated cells draw and
         aggregate ``generation.n_samples`` per cell.
+    complete_rows_only : bool, optional
+        When ``True``, fine-tune only on rows with no missing cells; any row with a
+        missing value is excluded from training. ``target_cols`` and the
+        ``loss_on_target_only`` masking are still derived from the full table, so
+        only the training-row population changes. Default ``False``.
     serializer : str or Serializer, optional
         ``"json"``, ``"key-value"``, ``"bracket"``, or a custom
         :class:`~sklm.Serializer`. Default ``"json"``.
@@ -87,11 +95,11 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
         Default ``3``.
     random_state : int or None, optional
         Seed forwarded to the backend and serializer.
-    callback : Callback, list of Callback or None, optional
+    callback : Callback, list of Callback, "auto" or None, optional
         Feedback hooks for fitting and inference. A list is wrapped in a
-        :class:`~sklm.CompositeCallback`. Default ``None`` auto-selects a
-        dashboard for the runtime environment (Jupyter, rich, or
-        logging).
+        :class:`~sklm.CompositeCallback`. ``"auto"`` (default) selects a
+        dashboard for the runtime environment (Jupyter, rich, or logging);
+        ``None`` disables feedback entirely.
     lora : LoRAConfig or None, optional
         Fine-tune with LoRA adapters when set; full-weight otherwise (default).
     quantization : {"2bit", "3bit", "4bit", "6bit", "8bit"}, QuantizationConfig or None, optional
@@ -125,8 +133,9 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
 
     generation: GenerationConfig
     discretization: DiscretizationConfig | Mapping[str, DiscretizationConfig]
+    complete_rows_only: bool
 
-    def __init__(self, model: str = "distilgpt2", **kwargs: Unpack[ImputerArgs]) -> None:
+    def __init__(self, model: Model = "distilgpt2", **kwargs: Unpack[ImputerArgs]) -> None:
         self.model = model
         defaults = AnnotatedDefault.create_with_defaults(
             ImputerArgs, valid_params=self._get_param_names(), **kwargs
@@ -168,7 +177,15 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
         self._validate_discretization()
         self.column_values_ = {c: X_df[c].to_numpy() for c in numeric_cols}
         target_cols = frozenset(c for c in self.feature_cols_ if bool(X_df[c].isna().any()))
-        self.lm_ = make_tabular_lm(self).fit(X_df, target_cols=target_cols)
+        train_df = X_df
+        if self.complete_rows_only:
+            train_df = X_df.dropna()
+            if train_df.empty:
+                raise ValueError(
+                    "complete_rows_only=True but X has no complete rows; "
+                    "every row has at least one missing value."
+                )
+        self.lm_ = make_tabular_lm(self).fit(train_df, target_cols=target_cols)
         return self
 
     def _validate_discretization(self) -> None:

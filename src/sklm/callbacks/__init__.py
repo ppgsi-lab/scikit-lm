@@ -15,6 +15,7 @@ configures the root logger -- handlers and levels are the caller's choice.
 from __future__ import annotations
 
 import importlib.util
+from typing import Literal
 
 from .base import Callback, CompositeCallback, predict_batches
 from .events import (
@@ -108,15 +109,18 @@ def _auto_callback() -> Callback:
     return LoggingCallback()
 
 
-def resolve_callback(callback: Callback | list[Callback] | None) -> Callback:
+def resolve_callback(callback: Callback | list[Callback] | Literal["auto"] | None) -> Callback:
     """Resolve the estimator ``callback`` argument to a single :class:`Callback`.
 
-    ``None`` auto-selects a dashboard for the runtime environment
-    (:func:`_auto_callback`); a list is wrapped in a :class:`CompositeCallback`;
+    ``"auto"`` selects a dashboard for the runtime environment
+    (:func:`_auto_callback`); ``None`` means no feedback (the no-op base
+    :class:`Callback`); a list is wrapped in a :class:`CompositeCallback`;
     a single :class:`Callback` is returned unchanged.
     """
-    if callback is None:
+    if callback == "auto":
         return _auto_callback()
+    if callback is None:
+        return Callback()
     if isinstance(callback, Callback):
         return callback
     return CompositeCallback(callback)

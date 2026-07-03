@@ -22,8 +22,5 @@ src/sklm/_version.py
 # IDE
 .idea/
 
-# Local article export, not part of the package
-llm-tabular-estimator.html
-
 # Scratch space
-scratch/
+experiments/

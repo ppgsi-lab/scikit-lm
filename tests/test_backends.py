@@ -19,6 +19,7 @@ from sklm import (
     LanguageModelClassifier,
     LanguageModelImputer,
     LoRAConfig,
+    LRScheduler,
     MLXBackend,
     ModelConfig,
     TrainingConfig,
@@ -29,7 +30,7 @@ from sklm.base import resolve_backend
 
 from .conftest import FakeBackend, _has_hf, _has_mlx
 
-_MLX_MODEL = "gabfssilva/distilgpt2"
+_MLX_MODEL = "mlx-community/distilgpt2"
 
 
 def _has_mps_bnb() -> bool:
@@ -50,6 +51,66 @@ def _clf_xy() -> tuple[pd.DataFrame, np.ndarray]:
 # --- HuggingFace ----------------------------------------------------------
 
 
+def test_zero_base_dropout_silences_only_dropout_fields() -> None:
+    """``_zero_base_dropout`` zeroes float dropout rates and leaves the rest."""
+    from types import SimpleNamespace
+
+    from sklm.hf_backend import _zero_base_dropout
+
+    config = SimpleNamespace(
+        resid_pdrop=0.1,
+        embd_pdrop=0.1,
+        attn_pdrop=0.1,
+        attention_dropout=0.2,
+        n_layer=6,
+        scale_attn_weights=True,
+        model_type="gpt2",
+    )
+    _zero_base_dropout(config)
+    assert config.resid_pdrop == config.embd_pdrop == config.attn_pdrop == 0.0
+    assert config.attention_dropout == 0.0
+    assert config.n_layer == 6
+    assert config.scale_attn_weights is True
+    assert config.model_type == "gpt2"
+
+
+@pytest.mark.skipif(not _has_hf(), reason="requires the 'hf' extra (torch dataset)")
+def test_hf_dataset_masks_prompt_with_minus_100() -> None:
+    """The dataset emits ``labels`` with -100 over the prompt span (and supervises
+    everything when the prompt is empty). Building the mask as a first-class
+    ``labels`` column keeps it from being dropped by the Trainer's
+    ``remove_unused_columns``, which silently disabled ``loss_on_target_only``."""
+    from sklm.hf_backend import _text_dataset
+    from sklm.serialize import TrainingExample
+
+    class _CharTok:
+        eos_token = ""
+
+        def __call__(self, text: str, **_: object) -> dict[str, list[int]]:
+            ids = [ord(c) for c in text]
+            return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+    masked = _text_dataset(lambda _: [TrainingExample("ab", "cd")], _CharTok(), 100)[0]
+    assert masked["labels"] == [-100, -100, ord("c"), ord("d")]
+
+    unmasked = _text_dataset(lambda _: [TrainingExample("", "cd")], _CharTok(), 100)[0]
+    assert unmasked["labels"] == [ord("c"), ord("d")]
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _has_hf(), reason="requires the 'hf' extra")
+def test_hf_zeroes_base_dropout_on_real_config() -> None:
+    """A real GPT-2 config has every dropout zeroed (parity with the MLX backend)."""
+    from transformers import AutoConfig
+
+    from sklm.hf_backend import _zero_base_dropout
+
+    config = AutoConfig.from_pretrained(_MLX_MODEL)
+    assert config.resid_pdrop > 0  # the checkpoint ships nonzero dropout
+    _zero_base_dropout(config)
+    assert config.resid_pdrop == config.embd_pdrop == config.attn_pdrop == 0.0
+
+
 @pytest.mark.slow
 @pytest.mark.skipif(not _has_hf(), reason="requires the 'hf' extra")
 def test_hf_lora_and_training_knobs() -> None:
@@ -60,8 +121,7 @@ def test_hf_lora_and_training_knobs() -> None:
             epochs=2,
             batch_size=8,
             grad_accumulation_steps=2,
-            lr_scheduler="cosine",
-            warmup_ratio=0.1,
+            lr_scheduler=LRScheduler.cosine(warmup_ratio=0.1),
             weight_decay=0.01,
         ),
         lora=LoRAConfig(rank=4, alpha=8, target_modules=["c_attn"]),
@@ -177,7 +237,7 @@ def test_mlx_score_truncates_right() -> None:
 )
 def test_score_ranks_identically_across_backends() -> None:
     """Convention: ``HFBackend.score`` and ``MLXBackend.score`` are behaviorally
-    identical. On the unmodified base model (``gabfssilva/distilgpt2`` mirrors
+    identical. On the unmodified base model (``mlx-community/distilgpt2`` mirrors
     distilgpt2's GPT-2 weights in an mlx-loadable layout) both backends must rank
     a candidate set the same way -- including a prompt ending in a space, where
     BPE merges the space into the continuation's first token and the

@@ -180,6 +180,20 @@ def test_resolve_callback_wraps_list_in_composite() -> None:
     assert resolved.callbacks == [a, b]
 
 
+def test_resolve_callback_auto_selects_a_dashboard() -> None:
+    resolved = resolve_callback("auto")
+    assert isinstance(resolved, Callback)
+    assert type(resolved) is not Callback  # a real dashboard, not the no-op base
+
+
+def test_resolve_callback_none_is_noop() -> None:
+    assert type(resolve_callback(None)) is Callback
+
+
+def test_callback_defaults_to_auto() -> None:
+    assert LanguageModelImputer(backend=FakeBackend()).callback == "auto"
+
+
 def test_clone_preserves_callback() -> None:
     imp = LanguageModelImputer(backend=FakeBackend(), callback=LoggingCallback())
     cloned = clone(imp)

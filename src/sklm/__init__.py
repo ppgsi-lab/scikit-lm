@@ -75,6 +75,7 @@ from .serialize import (
     SpacedDigits,
     TrainingExample,
 )
+from .synthesizer import LanguageModelSynthesizer
 
 __all__ = [
     "AnnotatedDefault",
@@ -105,6 +106,7 @@ __all__ = [
     "LanguageModelImputer",
     "LanguageModelOverSampler",
     "LanguageModelRegressor",
+    "LanguageModelSynthesizer",
     "LoRAConfig",
     "LoggingCallback",
     "MLXBackend",

@@ -1,33 +1,42 @@
-"""Language-model classifier.
+"""Language-model tabular synthesizer.
 
-Conditions on all features and ranks the (fixed) candidate labels by their
-likelihood under the model, so ``predict_proba`` is well defined and predicted
-labels are always valid members of ``classes_``.
+The four supervised estimators each fix which columns of the shared fine-tune go
+in the prompt. Drop that constraint and the same :class:`~sklm.TabularLanguageModel`
+becomes a generator of whole rows: fit on a table with no fixed target, then draw
+new rows from the learned joint distribution, optionally conditioning on columns
+held fixed. This estimator is a thin facade over the core -- it only exposes the
+flat constructor knobs the other estimators share and forwards ``fit`` / ``sample``.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from typing import Self, Unpack, override
 
 import numpy as np
 import pandas as pd
-from sklearn.base import BaseEstimator, ClassifierMixin
+from sklearn.base import BaseEstimator
 from sklearn.utils import Tags
-from sklearn.utils.multiclass import check_classification_targets
-from sklearn.utils.validation import check_consistent_length, check_is_fitted, column_or_1d
+from sklearn.utils.validation import check_is_fitted
 
-from .base import align_features, forget, make_tabular_lm, records, to_frame, unique_name
+from .base import forget, make_tabular_lm, to_frame
 from .bridge import Model
-from .callbacks import predict_batches
 from .config import GenerationConfig
 from .params import AnnotatedDefault, EstimatorArgs, _FlatParams
-from .serialize import is_missing
 
-__all__ = ["LanguageModelClassifier"]
+__all__ = ["LanguageModelSynthesizer"]
 
 
-class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
-    """Classify tabular rows by scoring candidate labels with a language model.
+class LanguageModelSynthesizer(_FlatParams, BaseEstimator):
+    """Synthesize tabular rows by sampling a language model's learned joint.
+
+    Fit on a whole table (features and any target alike are just columns); column
+    order is permuted throughout training, so the model learns
+    ``p(any column | any subset of the others)``. :meth:`sample` then draws rows
+    one column at a time -- each cell conditioning on ``condition`` plus the cells
+    already produced -- the autoregressive factorization the fine-tune was trained
+    for. Categorical columns are drawn from their scored level distribution;
+    numeric columns are generated.
 
     Parameters
     ----------
@@ -41,12 +50,9 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
     training : TrainingConfig, optional
         Fine-tuning hyperparameters.
     generation : GenerationConfig, optional
-        Drives candidate ranking. ``permute_order`` / ``n_samples`` /
-        ``score_pool`` marginalize each candidate's likelihood over feature
-        order, and ``inference_batch_size`` sets the scoring batch. Candidate
-        scoring is deterministic, so the stochastic sampling fields
-        (``temperature``, ``top_p``, ``top_k``, ``repetition_penalty``,
-        ``max_new_tokens``) are inert.
+        Sampling hyperparameters (temperature, token budget). ``temperature > 0``
+        is what gives the rows their diversity -- greedy decoding collapses every
+        row to the same mode.
     serializer : str or Serializer, optional
         ``"json"``, ``"key-value"``, ``"bracket"``, or a custom
         :class:`~sklm.Serializer`. Default ``"json"``.
@@ -85,15 +91,17 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
 
     Attributes
     ----------
-    classes_ : numpy.ndarray
-        Sorted unique labels; the column order of ``predict_proba``.
+    lm_ : TabularLanguageModel
+        The fitted core model rows are drawn from.
     n_features_in_ : int
-        Number of features seen during :meth:`fit`.
+        Number of columns seen during :meth:`fit`.
     feature_names_in_ : numpy.ndarray
-        Feature names, set only when ``X`` is a DataFrame.
+        Column names, set only when ``X`` is a DataFrame.
     """
 
     _args = EstimatorArgs
+
+    generation: GenerationConfig
 
     def __init__(self, model: Model = "distilgpt2", **kwargs: Unpack[EstimatorArgs]) -> None:
         self.model = model
@@ -103,15 +111,17 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
         for key, value in defaults.items():
             setattr(self, key, value)
 
-    def fit(self, X: object, y: object) -> Self:
-        """Fine-tune the backend on ``X`` with ``y`` appended as a column.
+    def fit(self, X: object, y: object = None) -> Self:
+        """Fine-tune the backend on the whole table's joint distribution.
 
         Parameters
         ----------
         X : array-like or pandas.DataFrame of shape (n_samples, n_features)
-            Feature table.
-        y : array-like of shape (n_samples,)
-            Class labels.
+            Training table. Every column is modeled jointly; a supervised target,
+            if any, is just another column of ``X``.
+        y : ignored
+            Present for the scikit-learn API. The model is joint, so there is no
+            separate target.
 
         Returns
         -------
@@ -121,89 +131,57 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
         Raises
         ------
         ValueError
-            If ``X`` is not 2-dimensional, or if ``backend``/``serializer`` is
-            an unknown string selector.
+            If ``X`` is not 2-dimensional, or if ``backend``/``serializer`` is an
+            unknown string selector.
         """
         X_df = to_frame(X)
-        y_arr = column_or_1d(y, warn=True)
-        check_consistent_length(X_df, y_arr)
-        check_classification_targets(y_arr)
-        self.classes_ = np.unique(y_arr)
         self.n_features_in_ = X_df.shape[1]
         if isinstance(X, pd.DataFrame):
             self.feature_names_in_ = np.asarray(X.columns, dtype=object)
         else:
             forget(self, "feature_names_in_")
         X_df = X_df.set_axis([str(c) for c in X_df.columns], axis=1)
-        self.feature_cols_ = [str(c) for c in X_df.columns]
-        self.target_col_ = unique_name("target", self.feature_cols_)
-        frame = X_df.copy()
-        frame[self.target_col_] = y_arr
-        self.lm_ = make_tabular_lm(self).fit(frame, target_cols=frozenset({self.target_col_}))
+        self.lm_ = make_tabular_lm(self).fit(X_df)
         return self
 
-    def _known_rows(self, X: object) -> list[dict[str, object]]:
-        return records(align_features(self, X))
-
-    def predict_proba(self, X: object, *, generation: GenerationConfig | None = None) -> np.ndarray:
-        """Return class probabilities, with columns ordered as ``classes_``.
+    def sample(
+        self,
+        n_samples: int = 1,
+        *,
+        condition: Mapping[str, object] | Sequence[Mapping[str, object]] | None = None,
+        generation: GenerationConfig | None = None,
+    ) -> pd.DataFrame:
+        """Draw rows from the learned joint distribution.
 
         Parameters
         ----------
-        X : array-like or pandas.DataFrame of shape (n_samples, n_features)
-            Feature table.
+        n_samples : int, optional
+            Number of rows to draw. Default ``1``.
+        condition : mapping, sequence of mappings, or None, optional
+            Columns to hold fixed. A single mapping is broadcast to all
+            ``n_samples`` rows; a sequence gives one mapping per row and overrides
+            ``n_samples``. ``None`` (default) samples unconditionally.
         generation : GenerationConfig, optional
-            Per-call override of the estimator's ``generation``. ``None``
-            (default) uses the fitted estimator's attribute; passing a config
-            (e.g. to change order marginalization or the scoring batch) applies
-            to this call only, without mutating the estimator.
+            Per-call override of the estimator's ``generation``; ``None`` (default)
+            uses the fitted attribute, without mutating the estimator.
 
         Returns
         -------
-        numpy.ndarray of shape (n_samples, n_classes)
-            Per-row distribution over ``classes_`` (each row sums to 1).
+        pandas.DataFrame
+            One row per draw, columns in the training order; numeric columns are
+            cast to float.
 
         Raises
         ------
         ValueError
-            If ``X``'s feature count does not match what was seen at fit.
+            If ``condition`` references a column not seen at fit.
+        RuntimeError
+            If any row stays malformed after the core's retries -- never a silent
+            partial table.
         """
         check_is_fitted(self)
         generation = self.generation if generation is None else generation
-        rows = self._known_rows(X)
-        candidates = list(self.classes_)
-        cb = self.lm_.callback
-        knowns = [{c: v for c, v in row.items() if not is_missing(v)} for row in rows]
-        batch_size = generation.inference_batch_size or self.training.batch_size
-        proba = np.empty((len(rows), len(candidates)))
-        for start, stop in predict_batches(cb, len(rows), batch_size):
-            proba[start:stop] = self.lm_.predict_proba_many(
-                knowns[start:stop],
-                self.target_col_,
-                candidates,
-                generation,
-                row_ids=range(start, stop),
-            )
-        return proba
-
-    def predict(self, X: object, *, generation: GenerationConfig | None = None) -> np.ndarray:
-        """Return the most likely label per row.
-
-        Parameters
-        ----------
-        X : array-like or pandas.DataFrame of shape (n_samples, n_features)
-            Feature table.
-        generation : GenerationConfig, optional
-            Per-call override of the estimator's ``generation``, forwarded to
-            :meth:`predict_proba`; ``None`` (default) uses the fitted attribute.
-
-        Returns
-        -------
-        numpy.ndarray of shape (n_samples,)
-            Predicted labels drawn from ``classes_``.
-        """
-        proba = self.predict_proba(X, generation=generation)
-        return self.classes_[np.argmax(proba, axis=1)]
+        return self.lm_.sample(n_samples, condition=condition, generation=generation)
 
     @override
     def __sklearn_tags__(self) -> Tags:

@@ -6,7 +6,7 @@
 
 **scikit-learn estimators backed by a fine-tuned autoregressive language model.**
 
-scikit-lm gives you a classifier, a regressor, a missing-value imputer, and an  imbalanced-learn oversampler that all work directly on tabular data — mixed numeric and categorical columns, no one-hot encoding, no scaling required — by  fine-tuning a small language model on your table and then performing inference on the learned representation. Every estimator follows the familiar scikit-learn API (`fit` / `predict` / `transform` / `fit_resample`), drops into a `Pipeline`, and is tunable with `GridSearchCV` or Optuna.
+scikit-lm gives you a classifier, a regressor, a missing-value imputer, an  imbalanced-learn oversampler, and a tabular synthesizer that all work directly on tabular data — mixed numeric and categorical columns, no one-hot encoding, no scaling required — by  fine-tuning a small language model on your table and then performing inference on the learned representation. Every estimator follows the familiar scikit-learn API (`fit` / `predict` / `transform` / `fit_resample` / `sample`), drops into a `Pipeline`, and is tunable with `GridSearchCV` or Optuna.
 
 ```python
 from sklearn.datasets import load_iris
@@ -30,11 +30,12 @@ clf.predict_proba(X_test)  # -> per-row distribution over clf.classes_
 
 - [How it works](#how-it-works)
 - [Installation](#installation)
-- [The four estimators](#the-four-estimators)
+- [The five estimators](#the-five-estimators)
   - [Classifier](#classifier)
   - [Regressor](#regressor)
   - [Imputer](#imputer)
   - [Oversampler](#oversampler)
+  - [Synthesizer](#synthesizer)
 - [The shared core: `TabularLanguageModel`](#the-shared-core-tabularlanguagemodel)
   - [Tabular synthesis](#tabular-synthesis)
 - [Configuration](#configuration)
@@ -74,7 +75,7 @@ $$
 p(\text{any column} \mid \text{any subset of the other columns})
 $$
 
-That single conditional distribution is all four estimators need. Each one is just a choice of *which columns go into the prompt* and *which column the model produces*:
+That single conditional distribution is all five estimators need. Each one is just a choice of *which columns go into the prompt* and *which column the model produces*:
 
 | Estimator    | Conditions on (prompt)      | Produces (target)        | How it reads the answer            |
 |--------------|-----------------------------|--------------------------|------------------------------------|
@@ -82,6 +83,7 @@ That single conditional distribution is all four estimators need. Each one is ju
 | Regressor    | all features                | the numeric target       | **generates** the value `n` times, averages |
 | Imputer      | a row's observed cells      | that row's missing cells | **generates** each missing value   |
 | Oversampler  | a minority class label      | the features             | **generates** synthetic rows       |
+| Synthesizer  | nothing (or columns held fixed) | every other column   | **samples** whole rows from the joint |
 
 Two primitives implement those two reading strategies:
 
@@ -90,7 +92,7 @@ Two primitives implement those two reading strategies:
 
 Missing cells (`None`, `NaN`, `inf`) are never serialized — training drops them, and at inference the model conditions only on the cells that are present. That is why the imputer needs no separate "missingness" handling: a row with holes is simply a shorter prompt.
 
-Drop the prompt entirely — put *no* columns in the context — and the same conditional generates every column from scratch, so each row is a draw from the learned joint $p(\text{features}, \text{label})$. That turns the fitted model into a [tabular synthesizer](#tabular-synthesis) on top of the four estimators.
+Drop the prompt entirely — put *no* columns in the context — and the same conditional generates every column from scratch, so each row is a draw from the learned joint $p(\text{features}, \text{label})$. That is what [`LanguageModelSynthesizer`](#synthesizer) does; the same draw is also available directly on the fitted core ([tabular synthesis](#tabular-synthesis)).
 
 Because it is a real fine-tune of a real LM, the quality scales with the base model and the training budget. The defaults (`distilgpt2`, the smallest GPT-2) are chosen so examples run anywhere; if needed, swap in a larger model for better accuracy.
 
@@ -134,9 +136,9 @@ Requires **Python ≥ 3.12**.
 
 ---
 
-## The four estimators
+## The five estimators
 
-All four share the same constructor knobs (model, backend, serializer, training, generation, LoRA, quantization, …) — documented under [Configuration](#configuration) — and differ only in their task-specific method. The examples below work on both Hugging Face and MLX versions.
+All five share the same constructor knobs (model, backend, serializer, training, generation, LoRA, quantization, …) — documented under [Configuration](#configuration) — and differ only in their task-specific method. The examples below work on both Hugging Face and MLX versions.
 
 ### Classifier
 
@@ -205,6 +207,24 @@ X_res, y_res = LanguageModelOverSampler(
 
 The `sampling_strategy` parameter is forwarded to imbalanced-learn (string, float, dict, or callable). Integer-typed feature columns are rounded so the restored dtype isn't truncated. If a class can't be filled within its attempt budget, `fit_resample` raises `RuntimeError`.
 
+### Synthesizer
+
+`LanguageModelSynthesizer` fits on the whole table with no fixed target and **draws new rows from the learned joint distribution**. It is the thinnest adapter — just the shared flat constructor knobs over the core's `fit` + `sample` — so reach for it (instead of the raw [`TabularLanguageModel`](#tabular-synthesis)) when you want a synthesizer with the same ergonomic API as the other estimators.
+
+```python
+from sklm import LanguageModelSynthesizer, GenerationConfig
+
+synth = LanguageModelSynthesizer(random_state=0).fit(frame)   # frame = features + label
+
+# Unconditional — whole rows from p(features, label):
+rows = synth.sample(150, generation=GenerationConfig(temperature=0.7))
+
+# Conditional — pin a column and synthesize the rest (e.g. class-balanced rows):
+rows = synth.sample(condition=[{"species": s} for s in species for _ in range(50)])
+```
+
+A target, if any, is just another column of `frame`. `sample` returns a DataFrame in the training column order and raises `RuntimeError` if any row stays malformed after retries — never a silent partial table. See [Tabular synthesis](#tabular-synthesis) for the conditioning rules (shared with the core's `sample`).
+
 ---
 
 ## The shared core: `TabularLanguageModel`
@@ -254,7 +274,7 @@ The completion methods return `None` for a row whose targets stay malformed afte
 
 ### Tabular synthesis
 
-The four estimators each fix *which* columns go in the prompt. Fix *none* of them and the same fitted model becomes a **tabular synthesizer**: generate every column from an empty context, so each row is a draw from the learned joint $p(\text{features}, \text{label})$ — the first column sampled from its marginal, every later one conditioning on the cells already produced. No new estimator class is involved; `sample` is a method of the fitted model, the conditional counterpart to `KernelDensity.sample`.
+The classifier, regressor, imputer, and oversampler each fix *which* columns go in the prompt. Fix *none* of them and the same fitted model generates every column from an empty context, so each row is a draw from the learned joint $p(\text{features}, \text{label})$ — the first column sampled from its marginal, every later one conditioning on the cells already produced. `sample` is a method of the fitted model, the conditional counterpart to `KernelDensity.sample`; [`LanguageModelSynthesizer`](#synthesizer) is the same call wrapped behind the estimators' flat constructor knobs.
 
 ```python
 from sklm import TabularLanguageModel, GenerationConfig
@@ -315,24 +335,25 @@ A custom serializer just needs to implement the `Serializer` protocol (`serializ
 Fine-tuning hyperparameters. Held by the estimator as a nested, tunable object.
 
 ```python
-from sklm import TrainingConfig
+from sklm import LRScheduler, TrainingConfig
 
 TrainingConfig(
     epochs=50,                 # passes over the rows
     batch_size=16,
-    learning_rate="auto",      # 2e-5 full-weight, 2e-4 with LoRA; or pass a float
-    lr_scheduler="cosine",     # "constant" | "linear" | "cosine"
+    lr_scheduler=LRScheduler.cosine(),  # .constant() | .linear() | .cosine() | .plateau()
     augmentation_factor=1,     # distinct column orders emitted per row each epoch
     loss_on_target_only=False, # supervise only the target column(s), not the context
 )
 ```
+
+The learning rate and warmup live on the schedule object — `LRScheduler.cosine(learning_rate="auto", warmup_ratio=0.0)`, where `"auto"` picks 2e-5 full-weight and 2e-4 with LoRA — and `LRScheduler.plateau(...)` lowers the rate when validation loss stalls (requires `validation_split > 0`).
 
 Two knobs are specific to this library's mechanism:
 
 - **`augmentation_factor`** — how many distinct column permutations to emit per row each epoch (a row with `m` present columns has at most `m!`). Raising it is a cheap form of data augmentation.
 - **`loss_on_target_only`** — when `True`, the context tokens are masked out of the loss and the model is supervised only on the column(s) it must actually predict (the label for the classifier/regressor, the missing cells for the imputer). Inert for the oversampler.
 
-Other fields cover the usual levers: `weight_decay`, `grad_accumulation_steps`, `warmup_ratio`, `max_grad_norm`, `optimizer`, `label_smoothing`, `neftune_noise_alpha`, `gradient_checkpointing`, `max_seq_length`, and `max_steps`. See the docstring for the full list and defaults.
+Other fields cover the usual levers: `weight_decay`, `grad_accumulation_steps`, `max_grad_norm`, `optimizer`, `label_smoothing`, `neftune_noise_alpha`, `gradient_checkpointing`, `max_seq_length`, and `max_steps`. See the docstring for the full list and defaults.
 
 ### Generation (`GenerationConfig`)
 
@@ -426,9 +447,9 @@ A **backend** is the execution engine that actually fine-tunes, generates, and s
 
 A few cross-backend gotchas worth knowing:
 
-- **Quantization** uses bitsandbytes on CUDA / mps-bitsandbytes on Apple MPS for the HF backend (CPU is unsupported); the MLX backend converts to its native 4-/8-bit format at load time, cached under `~/.cache/sklm/mlx`.
+- **Quantization** uses bitsandbytes on CUDA / mps-bitsandbytes on Apple MPS for the HF backend (CPU is unsupported); the MLX backend converts to its native 4-/8-bit format at load time, cached in the Hugging Face hub cache as a local-only `sklm/…` repo (so `hf cache scan`/`delete` manage it).
 - **`LoRAConfig.target_modules`** matching differs (HF matches a name suffix like `"c_attn"`; MLX matches the in-block path like `"attn.c_attn"`). Use `"all-linear"` / `None` to stay portable.
-- **MLX model loading** — some HF repos aren't mlx-loadable. distilgpt2's own repo isn't; use an mlx-loadable mirror such as `gabfssilva/distilgpt2` or `openai-community/gpt2`.
+- **MLX model loading** — some HF repos aren't mlx-loadable. distilgpt2's own repo isn't; use an mlx-loadable mirror such as `mlx-community/distilgpt2` or `openai-community/gpt2`.
 
 ---
 
@@ -463,7 +484,7 @@ Input handling follows scikit-learn conventions: DataFrame columns are matched b
 
 ## Callbacks
 
-Pass a `callback=` object to watch fitting and inference. `Callback` is a concrete base class that folds the granular event stream into a running `TrainingState` and dispatches a single `on_event(state, event)` — subclass it and override `on_event`. Four dashboards ship: `LoggingCallback`, `TqdmCallback` (`[tqdm]` extra), `RichCallback` (`[rich]` extra) and `JupyterCallback` (`[jupyter]` extra). Leave `callback` unset (the default) and one is auto-selected for the runtime environment — `JupyterCallback` in a Jupyter kernel, `RichCallback` when the `[rich]` extra is installed, otherwise `LoggingCallback`. Pass a list to drive several at once (wrapped in a `CompositeCallback`).
+Pass a `callback=` object to watch fitting and inference. `Callback` is a concrete base class that folds the granular event stream into a running `TrainingState` and dispatches a single `on_event(state, event)` — subclass it and override `on_event`. Four dashboards ship: `LoggingCallback`, `TqdmCallback` (`[tqdm]` extra), `RichCallback` (`[rich]` extra) and `JupyterCallback` (`[jupyter]` extra). Leave `callback` at its `"auto"` default and one is selected for the runtime environment — `JupyterCallback` in a Jupyter kernel, `RichCallback` when the `[rich]` extra is installed, otherwise `LoggingCallback`. Pass a list to drive several at once (wrapped in a `CompositeCallback`), or `None` for no feedback at all.
 
 ```python
 from sklm import LanguageModelClassifier, LoggingCallback, RichCallback, TqdmCallback
@@ -543,7 +564,7 @@ If you use scikit-lm in your research, please cite it. GitHub's "Cite this repos
   title   = {scikit-lm: scikit-learn estimators backed by language models},
   year    = {2026},
   url     = {https://github.com/ppgsi-lab/scikit-lm},
-  abstract = {scikit-lm provides scikit-learn-compatible estimators backed by a fine-tuned autoregressive language model for tabular data. A single mechanism underlies all of them: each row is serialized to text and the model is fine-tuned while the column order is permuted throughout training, so it learns the conditional distribution of any column given any subset of the others. From this one fitted model the library exposes four estimators (a classifier, a regressor, a missing-value imputer, and a minority-class oversampler), as well as conditional and unconditional tabular synthesis. It runs on Hugging Face Transformers or Apple MLX backends, while the core estimators depend only on the lightweight NumPy, pandas, and scikit-learn stack.}
+  abstract = {scikit-lm provides scikit-learn-compatible estimators backed by a fine-tuned autoregressive language model for tabular data. A single mechanism underlies all of them: each row is serialized to text and the model is fine-tuned while the column order is permuted throughout training, so it learns the conditional distribution of any column given any subset of the others. From this one fitted model the library exposes five estimators — a classifier, a regressor, a missing-value imputer, a minority-class oversampler, and a tabular synthesizer for conditional and unconditional row generation. It runs on Hugging Face Transformers or Apple MLX backends, while the core estimators depend only on the lightweight NumPy, pandas, and scikit-learn stack.}
 }
 ```
 

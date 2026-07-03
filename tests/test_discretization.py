@@ -129,6 +129,46 @@ def test_reduce_estimate_mode_is_invariant_to_sharpness() -> None:
     assert reduce_estimate(proba, [10.0, 20.0], cfg) == 20.0
 
 
+def test_reduce_estimate_median_is_probability_weighted_median() -> None:
+    # mass: 0.4 at 10, then crosses half at 20; argmax (mode) would pick 10 instead
+    proba = np.array([0.4, 0.35, 0.25])
+    cfg = DiscretizationConfig(estimate="median")
+    assert reduce_estimate(proba, [10.0, 20.0, 30.0], cfg) == 20.0
+    assert reduce_estimate(proba, [10.0, 20.0, 30.0], DiscretizationConfig(estimate="mode")) == 10.0
+
+
+def test_reduce_estimate_median_is_lower_median_on_even_split() -> None:
+    # cumulative mass reaches exactly half at the first candidate -> the smaller value
+    proba = np.array([0.5, 0.5])
+    cfg = DiscretizationConfig(estimate="median")
+    assert reduce_estimate(proba, [10.0, 20.0], cfg) == 10.0
+
+
+def test_reduce_estimate_median_sorts_unsorted_candidates() -> None:
+    # candidates need not arrive sorted; the median orders by value internally
+    proba = np.array([0.3, 0.2, 0.5])
+    cfg = DiscretizationConfig(estimate="median")
+    assert reduce_estimate(proba, [30.0, 10.0, 20.0], cfg) == 20.0
+
+
+def test_reduce_estimate_median_ignores_distant_outlier() -> None:
+    # three near-equal candidates hold most of the mass; a lone distant candidate
+    # drags the mean far off but cannot move the median off the cluster
+    candidates = [0.3, 7.392, 7.4, 7.403, 8.0]
+    proba = np.array([0.2, 0.3, 0.3, 0.3, 0.3]) / 1.4
+    median = reduce_estimate(proba, candidates, DiscretizationConfig(estimate="median"))
+    mean = reduce_estimate(proba, candidates, DiscretizationConfig(estimate="mean"))
+    assert median == 7.4
+    assert mean == pytest.approx(6.513, abs=1e-3)
+
+
+def test_reduce_estimate_median_high_sharpness_converges_to_mode() -> None:
+    proba = np.array([0.3, 0.4, 0.3])
+    cfg = DiscretizationConfig(estimate="median", sharpness=200.0)
+    # mass collapses onto the argmax candidate -> the median crosses there too
+    assert reduce_estimate(proba, [10.0, 20.0, 30.0], cfg) == pytest.approx(20.0)
+
+
 def test_discretization_rejects_non_positive_sharpness() -> None:
     with pytest.raises(ValueError, match="sharpness"):
         DiscretizationConfig(sharpness=0.0)

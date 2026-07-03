@@ -21,21 +21,33 @@ from __future__ import annotations
 import contextlib
 import gc
 import io
+import math
 import os
 import shutil
 import sys
 import tempfile
 import warnings
 from collections.abc import Callable, Iterator, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
 import numpy as np
 
 from .backend import common_token_prefix, resolve_max_new_tokens, resolve_max_seq_length
+from .bridge import Model
 from .callbacks import Callback
-from .config import GenerationConfig, LoRAConfig, ModelConfig, QuantizationConfig, TrainingConfig
+from .config import (
+    ConstantLR,
+    CosineLR,
+    GenerationConfig,
+    LinearLR,
+    LoRAConfig,
+    ModelConfig,
+    PlateauLR,
+    QuantizationConfig,
+    TrainingConfig,
+)
 from .serialize import TrainingExample
 
 __all__ = ["MLXBackend"]
@@ -68,9 +80,10 @@ class MLXBackend:
         self._tokenizer: Any = None
         self._max_seq_length: int = 256
 
-    def _load(self, model_name: str, model_config: ModelConfig) -> None:
+    def _load(self, model: Model, model_config: ModelConfig) -> None:
         try:
             import mlx.core as mx
+            from mlx.nn import Module
             from mlx_lm import load
         except ImportError as exc:  # pragma: no cover - exercised only without extra
             raise ImportError(
@@ -86,45 +99,89 @@ class MLXBackend:
         if device == "cpu":
             mx.set_default_device(mx.Device(mx.cpu))
 
-        quantization = model_config.quantization
-        if quantization is not None:
-            _resolve_mlx_method(quantization)
-        src = (
-            _convert_quantized(
-                model_name, quantization.bits, model_config.precision, quantization.group_size
+        # A factory defers loading to here; its product is a model id or a loaded model.
+        if callable(model) and not isinstance(model, (str, Module)):
+            model = model()
+
+        lm: Any
+        tokenizer: Any
+        if isinstance(model, str):
+            quantization = model_config.quantization
+            if quantization is not None:
+                _resolve_mlx_method(quantization)
+            src = (
+                _convert_quantized(
+                    model, quantization.bits, model_config.precision, quantization.group_size
+                )
+                if quantization is not None
+                else model
             )
-            if quantization is not None
-            else model_name
-        )
 
-        load_kwargs: dict[str, Any] = {"lazy": True}
-        if model_config.trust_remote_code:
-            load_kwargs["tokenizer_config"] = {"trust_remote_code": True}
-            load_kwargs["model_config"] = {"trust_remote_code": True}
+            load_kwargs: dict[str, Any] = {"lazy": True}
+            if model_config.trust_remote_code:
+                load_kwargs["tokenizer_config"] = {"trust_remote_code": True}
+                load_kwargs["model_config"] = {"trust_remote_code": True}
 
-        try:
-            loaded = load(src, **load_kwargs)
-        except (ValueError, KeyError) as exc:
-            raise ValueError(
-                f"mlx-lm could not load {src!r}. The MLX backend needs an mlx-loadable "
-                "model -- a pre-converted 'mlx-community/*' repo or an HF repo whose "
-                "weights match mlx-lm's layout. Some HF checkpoints are not directly "
-                "loadable; use an mlx-compatible equivalent."
-            ) from exc
-        # load() returns (model, tokenizer); the 3-tuple form is return_config-only.
-        model, tokenizer = loaded[0], loaded[1]
-        if model_config.tokenizer is not None:
-            tokenizer = _load_tokenizer(model_config.tokenizer, model_config.trust_remote_code)
+            try:
+                loaded = load(src, **load_kwargs)
+            except (ValueError, KeyError) as exc:
+                raise ValueError(
+                    f"mlx-lm could not load {src!r}. The MLX backend needs an mlx-loadable "
+                    "model -- a pre-converted 'mlx-community/*' repo or an HF repo whose "
+                    "weights match mlx-lm's layout. Some HF checkpoints are not directly "
+                    "loadable; use an mlx-compatible equivalent."
+                ) from exc
+            # load() returns (model, tokenizer); the 3-tuple form is return_config-only.
+            lm, tokenizer = loaded[0], loaded[1]
+            resolved = self._resolve_tokenizer(model_config)
+            if resolved is not None:
+                tokenizer = resolved
+        elif isinstance(model, Module):
+            if model_config.quantization is not None:
+                raise ValueError(
+                    "quantization applies to a model id the backend loads, not a "
+                    "pre-loaded model; convert it before passing it, or pass an id"
+                )
+            lm = model
+            tokenizer = self._resolve_tokenizer(model_config)
+            if tokenizer is None:
+                raise ValueError(
+                    "tokenizer must be set when model is a pre-loaded object "
+                    "(there is no model id to derive it from)"
+                )
+        else:
+            raise TypeError(
+                "MLXBackend expected a model id, an mlx model, or a factory "
+                f"returning one; got {type(model).__name__}"
+            )
 
         dtypes = {"fp32": mx.float32, "bf16": mx.bfloat16, "fp16": mx.float16}
-        model.set_dtype(dtypes[model_config.precision])
-        mx.eval(model.parameters())
+        lm.set_dtype(dtypes[model_config.precision])
+        mx.eval(lm.parameters())
 
         if model_config.lora is not None:
-            _apply_lora(model, model_config.lora)
+            _apply_lora(lm, model_config.lora)
 
-        self._model = model
+        self._model = lm
         self._tokenizer = tokenizer
+
+    def _resolve_tokenizer(self, model_config: ModelConfig) -> Any:
+        """Resolve the tokenizer spec to a loaded tokenizer, or ``None`` if unset.
+
+        A factory is invoked; an already-loaded ``TokenizerWrapper`` is used as-is;
+        a string id is loaded. ``None`` returns ``None`` so the caller decides (the
+        string branch keeps the tokenizer that ``load`` already returned).
+        """
+        from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+        spec = model_config.tokenizer
+        if callable(spec) and not isinstance(spec, (str, TokenizerWrapper)):
+            spec = spec()
+        if isinstance(spec, TokenizerWrapper):
+            return spec
+        if isinstance(spec, str):
+            return _load_tokenizer(spec, model_config.trust_remote_code)
+        return None
 
     def fit(
         self,
@@ -190,23 +247,46 @@ class MLXBackend:
 
         # The LR schedule advances once per optimizer.update (every
         # grad_accumulation_steps micro-steps), so it is sized in optimizer steps.
+        sched = training.lr_scheduler
         optimizer = _build_optimizer(
             training,
             max(1, iters // training.grad_accumulation_steps),
-            training.resolved_learning_rate(model_config),
+            sched.resolved_learning_rate(model_config),
         )
         iterate_fn = _make_iterate_batches(random_state)
         loss_fn = _make_loss(training.label_smoothing) if training.label_smoothing > 0 else None
         patience = training.early_stopping_patience
+        plateau = _PlateauReducer(sched) if isinstance(sched, PlateauLR) else None
 
         ckpt = training.checkpoint
+        resumable = ckpt is not None and ckpt.dir is not None
         with tempfile.TemporaryDirectory(prefix="sklm_mlx_") as tmpdir:
             ckpt_dir = (ckpt.dir if ckpt is not None else None) or tmpdir
             Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
-            # Resume: when ``dir`` already holds snapshots, load the most recent
-            # weights before training instead of starting from the base model.
-            if ckpt is not None and ckpt.dir is not None:
-                _resume_weights(lm, ckpt_dir)
+            # Resume: when ``dir`` already holds snapshots, restore the most recent
+            # one -- weights, optimizer state (Adam moments + step + LR schedule
+            # position), the dropout/sampling RNG and the plateau/early-stop/best
+            # trackers -- then continue only the steps left to the original budget,
+            # 1:1 with the HF ``Trainer``'s ``resume_from_checkpoint``.
+            resume = _resume_state(lm, ckpt_dir) if resumable else None
+            step_offset = 0
+            if resume is not None:
+                step_offset = resume.resumed_it
+                if resume.opt_state is not None:
+                    optimizer.init(lm.trainable_parameters())
+                    optimizer.state = tree_unflatten(resume.opt_state)
+                    # State assigned wholesale; mark initialized so the first
+                    # ``update`` does not re-init and zero the restored moments.
+                    optimizer._initialized = True
+                    mx.eval(optimizer.state)
+                if resume.rng_state is not None:
+                    # mlx-lm ships no stub for the ``mx.random.state`` global, so
+                    # pyright cannot see the attribute; restoring it continues the
+                    # dropout/sampling RNG 1:1 across the resume.
+                    mx.random.state = resume.rng_state  # type: ignore[attr-defined]
+                    mx.eval(*resume.rng_state)
+                if plateau is not None and resume.plateau is not None:
+                    plateau.load(*resume.plateau)
             # Cadence in micro-steps (mlx-lm counts micro-steps): an optimizer
             # step is ``grad_accumulation_steps`` micro-steps, an epoch is
             # ``micro_per_epoch``. ``None`` disables trajectory saving (no config).
@@ -225,45 +305,51 @@ class MLXBackend:
                 ckpt_dir=ckpt_dir,
                 save_every=save_every,
                 keep=ckpt.keep if ckpt is not None else None,
+                plateau=plateau,
+                step_offset=step_offset,
+                resumable=resumable,
+                init_best=resume.best if resume is not None else None,
+                init_best_loss=resume.best_loss if resume is not None else math.inf,
+                init_no_improve=resume.no_improve if resume is not None else 0,
             )
-            args = TrainingArgs(
-                batch_size=training.batch_size,
-                iters=iters,
-                grad_accumulation_steps=training.grad_accumulation_steps,
-                grad_checkpoint=training.gradient_checkpointing,
-                max_seq_length=seq_len,
-                adapter_file=str(Path(ckpt_dir) / "adapters.safetensors"),
-                steps_per_report=1,
-                steps_per_eval=micro_per_epoch if val_dataset is not None else iters + 1,
-                # mlx-lm's own saving is disabled; the report callback writes
-                # numbered checkpoint-<step>.safetensors snapshots instead.
-                steps_per_save=iters + 1,
-                val_batches=-1,
-            )
-            train_kwargs: dict[str, Any] = {
-                "model": lm,
-                "optimizer": optimizer,
-                "train_dataset": dataset,
-                "val_dataset": val_dataset,
-                "args": args,
-                "iterate_batches": iterate_fn,
-                "training_callback": report,
-            }
-            if loss_fn is not None:
-                train_kwargs["loss"] = loss_fn
+            remaining = iters - step_offset
+            if remaining > 0:
+                args = TrainingArgs(
+                    batch_size=training.batch_size,
+                    iters=remaining,
+                    grad_accumulation_steps=training.grad_accumulation_steps,
+                    grad_checkpoint=training.gradient_checkpointing,
+                    max_seq_length=seq_len,
+                    adapter_file=str(Path(ckpt_dir) / "adapters.safetensors"),
+                    steps_per_report=1,
+                    steps_per_eval=micro_per_epoch if val_dataset is not None else remaining + 1,
+                    # mlx-lm's own saving is disabled; the report callback writes
+                    # numbered checkpoint-<step>.safetensors snapshots instead.
+                    steps_per_save=remaining + 1,
+                    val_batches=-1,
+                )
+                train_kwargs: dict[str, Any] = {
+                    "model": lm,
+                    "optimizer": optimizer,
+                    "train_dataset": dataset,
+                    "val_dataset": val_dataset,
+                    "args": args,
+                    "iterate_batches": iterate_fn,
+                    "training_callback": report,
+                }
+                if loss_fn is not None:
+                    train_kwargs["loss"] = loss_fn
 
-            with (
-                _neftune(lm, training.neftune_noise_alpha),
-                _silenced(),
-                contextlib.suppress(_StopTraining),
-            ):
-                mlx_train(**train_kwargs)
+                with (
+                    _neftune(lm, training.neftune_noise_alpha),
+                    _silenced(),
+                    contextlib.suppress(_StopTraining),
+                ):
+                    mlx_train(**train_kwargs)
 
             if report.best is not None:
                 lm.update(tree_unflatten(report.best))
                 mx.eval(lm.parameters())
-                if ckpt is not None and ckpt.dir is not None:
-                    mx.save_safetensors(str(Path(ckpt_dir) / "best.safetensors"), dict(report.best))
         lm.eval()
 
     def generate(self, prompts: Sequence[str], generation: GenerationConfig) -> list[str]:
@@ -411,46 +497,184 @@ class _MLXTextDataset:
         return result
 
 
-def _save_checkpoint(ckpt_dir: str, step: int, params: Any, keep: int | None) -> None:
-    """Write a ``checkpoint-<step>.safetensors`` snapshot and prune to ``keep``.
+def _save_checkpoint(
+    ckpt_dir: str, step: int, weights: Any, sidecar: dict[str, Any] | None, keep: int | None
+) -> None:
+    """Write a ``checkpoint-<step>`` snapshot (and its resume sidecar) and prune.
 
-    ``params`` is a ``tree_flatten`` list of ``(path, array)``. Only the numbered
-    snapshots are pruned (oldest first); ``best.safetensors`` is named apart, so
-    it survives. ``keep`` of ``None`` retains every snapshot.
+    ``weights`` is a ``tree_flatten`` list of ``(path, array)`` written to
+    ``checkpoint-<step>.safetensors``. ``sidecar`` (when resuming is possible)
+    holds the optimizer state, RNG and trackers needed to continue training; it
+    is written to ``state-<step>.safetensors``. Both numbered files are pruned in
+    lockstep (oldest first), keeping the ``keep`` most recent; ``best.safetensors``
+    is named apart, so it survives. ``keep`` of ``None`` retains every snapshot.
     """
     import mlx.core as mx
 
-    mx.save_safetensors(str(Path(ckpt_dir) / f"checkpoint-{step}.safetensors"), dict(params))
+    d = Path(ckpt_dir)
+    mx.save_safetensors(str(d / f"checkpoint-{step}.safetensors"), dict(weights))
+    if sidecar is not None:
+        mx.save_safetensors(str(d / f"state-{step}.safetensors"), sidecar)
     if keep is not None:
-        existing = sorted(
-            Path(ckpt_dir).glob("checkpoint-*.safetensors"),
-            key=lambda p: int(p.stem.split("-")[1]),
-        )
-        for old in existing[:-keep]:
-            old.unlink()
+        steps = sorted(int(p.stem.split("-")[1]) for p in d.glob("checkpoint-*.safetensors"))
+        for old in steps[:-keep]:
+            (d / f"checkpoint-{old}.safetensors").unlink(missing_ok=True)
+            (d / f"state-{old}.safetensors").unlink(missing_ok=True)
 
 
-def _resume_weights(lm: Any, ckpt_dir: str) -> None:
-    """Load the most recent ``checkpoint-<step>.safetensors`` snapshot into ``lm``.
+def _save_best(ckpt_dir: str, snapshot: Any, loss: float) -> None:
+    """Persist the best (lowest-val-loss) weights to ``best.safetensors``.
 
-    No-op when ``ckpt_dir`` holds no numbered snapshots (a fresh run). Only the
-    trainable weights are restored; the optimizer state and step counter are not,
-    so training restarts its schedule from the loaded weights.
+    Written the moment the best improves (not only at the end) so an interrupted
+    run can still restore it. ``snapshot`` is a ``tree_flatten`` list; the loss is
+    embedded under ``meta.best_loss`` so resume recovers the bar to beat.
+    """
+    import mlx.core as mx
+
+    payload: dict[str, Any] = {f"best.{k}": v for k, v in snapshot}
+    payload["meta.best_loss"] = mx.array(loss)
+    mx.save_safetensors(str(Path(ckpt_dir) / "best.safetensors"), payload)
+
+
+@dataclass
+class _Resume:
+    """State restored from a checkpoint directory to continue training 1:1.
+
+    ``opt_state``/``rng_state``/``plateau`` are ``None`` when the directory holds
+    only legacy weight snapshots (no ``state-*`` sidecar): training then warm-starts
+    from the weights and reruns the full budget, the pre-resume behaviour.
+    """
+
+    resumed_it: int
+    opt_state: list[tuple[str, Any]] | None
+    rng_state: list[Any] | None
+    no_improve: int
+    plateau: tuple[float, int, int] | None
+    best: list[tuple[str, Any]] | None
+    best_loss: float
+
+
+def _resume_state(lm: Any, ckpt_dir: str) -> _Resume | None:
+    """Restore the most recent checkpoint into ``lm`` and return the resume state.
+
+    Loads the latest ``checkpoint-<step>`` weights into ``lm`` and reads the
+    matching ``state-<step>`` sidecar (optimizer state, RNG, plateau/early-stop
+    trackers) plus ``best.safetensors``. Returns ``None`` when ``ckpt_dir`` holds
+    no snapshot at all (a fresh run). When a weight snapshot exists without its
+    sidecar (a directory written before resume tracked optimizer state), the
+    optimizer fields come back ``None`` and the caller warm-starts from the
+    weights.
     """
     import mlx.core as mx
     from mlx.utils import tree_unflatten
 
-    existing = sorted(
-        Path(ckpt_dir).glob("checkpoint-*.safetensors"),
-        key=lambda p: int(p.stem.split("-")[1]),
-    )
-    if not existing:
-        return
+    d = Path(ckpt_dir)
     # mx.load of a .safetensors returns a {name: array} dict; the mlx stub types
-    # it as the broader array|tuple union, so narrow it for tree_unflatten.
-    weights: dict[str, Any] = mx.load(str(existing[-1]))  # type: ignore[assignment]
+    # it as the broader array|tuple union, so narrow it where it feeds tree ops.
+    best: list[tuple[str, Any]] | None = None
+    best_loss = math.inf
+    best_file = d / "best.safetensors"
+    if best_file.exists():
+        bd: dict[str, Any] = mx.load(str(best_file))  # type: ignore[assignment]
+        best = [(k.removeprefix("best."), v) for k, v in bd.items() if k.startswith("best.")]
+        if "meta.best_loss" in bd:
+            best_loss = float(bd["meta.best_loss"].item())
+
+    ckpts = sorted(d.glob("checkpoint-*.safetensors"), key=lambda p: int(p.stem.split("-")[1]))
+    if not ckpts:
+        return _Resume(0, None, None, 0, None, best, best_loss) if best is not None else None
+
+    weights: dict[str, Any] = mx.load(str(ckpts[-1]))  # type: ignore[assignment]
     lm.update(tree_unflatten(list(weights.items())))
     mx.eval(lm.parameters())
+    it = int(ckpts[-1].stem.split("-")[1])
+
+    sidecar_file = d / f"state-{it}.safetensors"
+    if not sidecar_file.exists():
+        return _Resume(0, None, None, 0, None, best, best_loss)
+
+    s: dict[str, Any] = mx.load(str(sidecar_file))  # type: ignore[assignment]
+    opt_state = [(k.removeprefix("opt."), v) for k, v in s.items() if k.startswith("opt.")]
+    rng_state = [s[f"rng.{i}"] for i in range(sum(1 for k in s if k.startswith("rng.")))]
+    no_improve = int(s["meta.no_improve"].item())
+    plateau = (
+        (
+            float(s["meta.plateau_best"].item()),
+            int(s["meta.plateau_num_bad"].item()),
+            int(s["meta.plateau_cooldown"].item()),
+        )
+        if "meta.plateau_best" in s
+        else None
+    )
+    return _Resume(it, opt_state, rng_state, no_improve, plateau, best, best_loss)
+
+
+class _PlateauReducer:
+    """Reduce-on-plateau controller for the MLX backend.
+
+    Reimplements ``torch.optim.lr_scheduler.ReduceLROnPlateau`` (minimum mode,
+    relative threshold, ``eps=1e-8``) so the MLX backend matches the HF backend,
+    which uses torch's scheduler directly. Fed the validation loss at each
+    evaluation; returns the learning rate to use next.
+
+    Parameters
+    ----------
+    config : PlateauLR
+        Schedule parameters: factor, patience, threshold, floor, cooldown.
+
+    Notes
+    -----
+    A reduction fires once the loss has failed to improve for ``patience + 1``
+    consecutive evaluations (the count uses strict ``>``), matching torch.
+    """
+
+    def __init__(self, config: PlateauLR) -> None:
+        self._cfg = config
+        self._best = math.inf
+        self._num_bad = 0
+        self._cooldown = 0
+
+    def step(self, metric: float, lr: float) -> float:
+        """Return the learning rate for the next step given ``metric``.
+
+        Parameters
+        ----------
+        metric : float
+            Latest validation loss.
+        lr : float
+            Current learning rate.
+
+        Returns
+        -------
+        float
+            The (possibly reduced) learning rate; equal to ``lr`` unless a
+            plateau just triggered a reduction.
+        """
+        cfg = self._cfg
+        if metric < self._best * (1 - cfg.threshold):
+            self._best = metric
+            self._num_bad = 0
+        else:
+            self._num_bad += 1
+        if self._cooldown > 0:
+            self._cooldown -= 1
+            self._num_bad = 0
+        new_lr = lr
+        if self._num_bad > cfg.patience:
+            reduced = max(lr * cfg.factor, cfg.floor)
+            if lr - reduced > 1e-8:
+                new_lr = reduced
+            self._cooldown = cfg.cooldown
+            self._num_bad = 0
+        return new_lr
+
+    def export(self) -> tuple[float, int, int]:
+        """Snapshot the controller state for checkpointing: ``(best, num_bad, cooldown)``."""
+        return self._best, self._num_bad, self._cooldown
+
+    def load(self, best: float, num_bad: int, cooldown: int) -> None:
+        """Restore the controller state from an :meth:`export` snapshot."""
+        self._best, self._num_bad, self._cooldown = best, num_bad, cooldown
 
 
 def _loss_report_callback(
@@ -463,6 +687,12 @@ def _loss_report_callback(
     ckpt_dir: str,
     save_every: int | None,
     keep: int | None,
+    plateau: _PlateauReducer | None = None,
+    step_offset: int = 0,
+    resumable: bool = False,
+    init_best: Any = None,
+    init_best_loss: float = math.inf,
+    init_no_improve: int = 0,
 ) -> Any:
     """Build an mlx-lm ``TrainingCallback`` that forwards train/val loss, the
     gradient norm and the current device memory to ``callback``.
@@ -470,10 +700,18 @@ def _loss_report_callback(
     The gradient norm stays ``None`` when clipping is disabled
     (``max_grad_norm`` unset), since nothing computes it then.
 
+    ``step_offset`` is added to every mlx-lm iteration so a resumed run reports
+    and names checkpoints on the original absolute step axis. The best/loss/
+    no-improve trackers are seeded from ``init_*`` so early stopping and best
+    restoration survive a resume.
+
     When ``save_every`` is set, every that-many micro-steps a numbered checkpoint
-    is written under ``ckpt_dir`` and pruned to the ``keep`` most recent. Whenever
-    a validation set yields reports the best (lowest-loss) snapshot is tracked and
-    exposed as ``.best`` for the caller to restore; with ``patience`` set it also
+    is written under ``ckpt_dir`` and pruned to the ``keep`` most recent; when
+    ``resumable`` it carries a ``state-<step>`` sidecar (optimizer state, RNG,
+    trackers) so the next ``fit`` continues 1:1. Whenever a validation set yields
+    reports the best (lowest-loss) snapshot is tracked and exposed as ``.best``
+    for the caller to restore (and, when ``resumable``, persisted to
+    ``best.safetensors`` the moment it improves); with ``patience`` set it also
     raises :class:`_StopTraining` once validation stops improving for ``patience``
     reports.
     """
@@ -485,14 +723,14 @@ def _loss_report_callback(
         def __init__(self) -> None:
             # tree_flatten's result (a list of (path, array)); typed Any
             # because mlx-lm ships no stubs for it.
-            self.best: Any = None
-            self.best_loss = float("inf")
-            self.no_improve = 0
+            self.best: Any = init_best
+            self.best_loss = init_best_loss
+            self.no_improve = init_no_improve
 
         def on_train_loss_report(self, train_info: dict[str, Any]) -> None:
             callback.on_memory(int(mx.get_active_memory()))
             norm = optimizer.state.get("last_grad_norm")
-            step = int(train_info["iteration"])
+            step = int(train_info["iteration"]) + step_offset
             callback.on_train_report(
                 step=step,
                 total_steps=iters,
@@ -502,13 +740,32 @@ def _loss_report_callback(
                 grad_norm=float(norm.item()) if norm is not None else None,
             )
             if save_every is not None and step % save_every == 0:
-                snapshot = tree_flatten(lm.trainable_parameters())
-                mx.eval([v for _, v in snapshot])
-                _save_checkpoint(ckpt_dir, step, snapshot, keep)
+                weights = tree_flatten(lm.trainable_parameters())
+                sidecar = self._sidecar(step) if resumable else None
+                mx.eval([v for _, v in weights])
+                _save_checkpoint(ckpt_dir, step, weights, sidecar, keep)
+
+        def _sidecar(self, step: int) -> dict[str, Any]:
+            """Optimizer state + RNG + trackers, keyed for one safetensors file."""
+            opt_state = tree_flatten(optimizer.state)
+            mx.eval([v for _, v in opt_state])
+            sidecar: dict[str, Any] = {f"opt.{k}": v for k, v in opt_state}
+            # No stub for the ``mx.random.state`` global; type it for enumerate.
+            rng: list[Any] = mx.random.state  # type: ignore[attr-defined]
+            sidecar |= {f"rng.{i}": a for i, a in enumerate(rng)}
+            sidecar["meta.no_improve"] = mx.array(self.no_improve)
+            if plateau is not None:
+                best, num_bad, cooldown = plateau.export()
+                sidecar["meta.plateau_best"] = mx.array(best)
+                sidecar["meta.plateau_num_bad"] = mx.array(num_bad)
+                sidecar["meta.plateau_cooldown"] = mx.array(cooldown)
+            return sidecar
 
         def on_val_loss_report(self, val_info: dict[str, Any]) -> None:
             loss = float(val_info["val_loss"])
-            callback.on_eval_report(step=int(val_info["iteration"]), loss=loss, epoch=None)
+            callback.on_eval_report(
+                step=int(val_info["iteration"]) + step_offset, loss=loss, epoch=None
+            )
             if loss < self.best_loss - 1e-9:
                 self.best_loss = loss
                 # mlx arrays are immutable, so snapshotting the current leaves
@@ -517,10 +774,14 @@ def _loss_report_callback(
                 mx.eval([v for _, v in snapshot])
                 self.best = snapshot
                 self.no_improve = 0
+                if resumable:
+                    _save_best(ckpt_dir, snapshot, loss)
             elif patience is not None:
                 self.no_improve += 1
                 if self.no_improve >= patience:
                     raise _StopTraining
+            if plateau is not None:
+                optimizer.learning_rate = plateau.step(loss, float(optimizer.learning_rate.item()))
 
     return _LossReport()
 
@@ -582,26 +843,38 @@ def _build_optimizer(training: TrainingConfig, steps: int, lr: float) -> Any:
     import mlx.core as mx
     import mlx.optimizers as opt
 
-    def main_schedule(n: int) -> Any:
-        match training.lr_scheduler:
-            case "constant":
-                return opt.linear_schedule(lr, lr, max(1, n))
-            case "linear":
-                return opt.linear_schedule(lr, 0.0, max(1, n))
-            case "cosine":
-                return opt.cosine_decay(lr, max(1, n))
-            case _:
-                raise ValueError(f"unknown lr_scheduler {training.lr_scheduler!r}")
+    sched = training.lr_scheduler
 
-    warmup_n = min(round(steps * training.warmup_ratio), steps) if training.warmup_ratio > 0 else 0
-    if warmup_n > 0:
-        schedule: Any = opt.join_schedules(
-            [opt.linear_schedule(0.0, lr, warmup_n), main_schedule(steps - warmup_n)], [warmup_n]
-        )
-    elif training.lr_scheduler == "constant":
-        schedule = lr
-    else:
-        schedule = main_schedule(steps)
+    def main_schedule(n: int) -> Any:
+        match sched:
+            case ConstantLR():
+                return opt.linear_schedule(lr, lr, max(1, n))
+            case LinearLR():
+                return opt.linear_schedule(lr, sched.floor, max(1, n))
+            case CosineLR():
+                return opt.cosine_decay(lr, max(1, n), end=sched.floor)
+            case _:
+                raise ValueError(f"unknown lr_scheduler {type(sched).__name__}")
+
+    match sched:
+        case PlateauLR():
+            # Scalar LR (no schedule); _PlateauReducer mutates optimizer.learning_rate on plateau.
+            schedule: Any = lr
+        case ConstantLR() | LinearLR() | CosineLR():
+            warmup_n = (
+                min(round(steps * sched.warmup_ratio), steps) if sched.warmup_ratio > 0 else 0
+            )
+            if warmup_n > 0:
+                schedule = opt.join_schedules(
+                    [opt.linear_schedule(0.0, lr, warmup_n), main_schedule(steps - warmup_n)],
+                    [warmup_n],
+                )
+            elif isinstance(sched, ConstantLR):
+                schedule = lr
+            else:
+                schedule = main_schedule(steps)
+        case _:
+            raise ValueError(f"unknown lr_scheduler {type(sched).__name__}")
 
     match training.optimizer:
         case "adamw" | "adamw_8bit" | "paged_adamw_8bit":
@@ -682,29 +955,37 @@ def _resolve_mlx_method(quantization: QuantizationConfig) -> str:
     return method
 
 
+_LOCAL_REVISION = "0" * 40
+
+
 def _convert_quantized(
     model_name: str, q_bits: int, precision: str, group_size: int | None = None
 ) -> str:
-    """Convert ``model_name`` to MLX's native ``q_bits``-bit format, cached under
-    ``~/.cache/sklm/mlx``. Requires an mlx-convertible HF repo (safetensors) or a
-    pre-converted ``mlx-community`` model.
+    """Convert ``model_name`` to MLX's native ``q_bits``-bit format, cached in the
+    Hugging Face hub cache as the local-only repo ``sklm/<slug>-<bits>bit-<precision>``
+    (visible to ``hf cache scan`` / ``hf cache delete``; the repo id resolves nowhere
+    online, which is fine because the snapshot *path* is returned and loaded directly).
+    Requires an mlx-convertible HF repo (safetensors) or a pre-converted
+    ``mlx-community`` model.
 
     The conversion writes into a temporary sibling directory and is renamed into
-    the cache path only once complete, so an interrupted convert never leaves a
+    the snapshot path only once complete, so an interrupted convert never leaves a
     half-written cache behind (``mlx_lm`` writes ``config.json`` before the
     tokenizer files, so the files' mere presence proves nothing)."""
+    from huggingface_hub.constants import HF_HUB_CACHE
     from mlx_lm import convert
 
     slug = model_name.replace("/", "--")
     group = f"-g{group_size}" if group_size is not None else ""
-    cache = Path.home() / ".cache" / "sklm" / "mlx" / f"{slug}-{q_bits}bit{group}-{precision}"
-    if (cache / "config.json").exists():
-        return str(cache)
-    cache.parent.mkdir(parents=True, exist_ok=True)
-    if cache.exists():
+    repo_dir = Path(HF_HUB_CACHE) / f"models--sklm--{slug}-{q_bits}bit{group}-{precision}"
+    snapshot = repo_dir / "snapshots" / _LOCAL_REVISION
+    if (snapshot / "config.json").exists():
+        return str(snapshot)
+    snapshot.parent.mkdir(parents=True, exist_ok=True)
+    if snapshot.exists():
         # A partial directory from a convert interrupted before this rename
         # scheme existed; rebuild it.
-        shutil.rmtree(cache)
+        shutil.rmtree(snapshot)
     convert_kwargs: dict[str, Any] = {
         "hf_path": model_name,
         "quantize": True,
@@ -713,15 +994,18 @@ def _convert_quantized(
     }
     if group_size is not None:
         convert_kwargs["q_group_size"] = group_size
-    staging = Path(tempfile.mkdtemp(dir=cache.parent, prefix=f"{cache.name}.tmp"))
+    staging = Path(tempfile.mkdtemp(dir=repo_dir, prefix="convert.tmp"))
     try:
         # convert refuses to write into an existing directory, hence the child.
         out = staging / "model"
         convert(mlx_path=str(out), **convert_kwargs)
-        os.replace(out, cache)
+        os.replace(out, snapshot)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
-    return str(cache)
+    refs = repo_dir / "refs"
+    refs.mkdir(exist_ok=True)
+    (refs / "main").write_text(_LOCAL_REVISION)
+    return str(snapshot)
 
 
 def _load_tokenizer(tokenizer_id: str, trust_remote_code: bool) -> Any:
@@ -731,7 +1015,20 @@ def _load_tokenizer(tokenizer_id: str, trust_remote_code: bool) -> Any:
     if not path.is_dir():
         from huggingface_hub import snapshot_download
 
-        path = Path(snapshot_download(tokenizer_id))
+        path = Path(
+            snapshot_download(
+                tokenizer_id,
+                allow_patterns=[
+                    "*.json",
+                    "*.py",
+                    "tokenizer.model",
+                    "*.tiktoken",
+                    "tiktoken.model",
+                    "*.txt",
+                    "*.jinja",
+                ],
+            )
+        )
     extra = {"trust_remote_code": True} if trust_remote_code else None
     return load_tokenizer(path, tokenizer_config_extra=extra)
 

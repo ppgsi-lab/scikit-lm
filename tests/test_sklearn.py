@@ -52,7 +52,7 @@ from sklm import (
 
 from .conftest import _has_mlx
 
-_MLX_MODEL = "gabfssilva/distilgpt2"
+_MLX_MODEL = "mlx-community/distilgpt2"
 requires_mlx = pytest.mark.skipif(
     not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon"
 )

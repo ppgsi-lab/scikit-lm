@@ -69,7 +69,7 @@ def to_frame(X: object, columns: Sequence[str] | None = None) -> pd.DataFrame:
     check_array(X, dtype=None, ensure_all_finite=False)  # pyright: ignore[reportArgumentType]
     arr = np.asarray(X)
     names = list(columns) if columns is not None else [f"x{i}" for i in range(arr.shape[1])]
-    return pd.DataFrame(arr, columns=names)
+    return pd.DataFrame(arr, columns=pd.Index(names))
 
 
 def _distinct_orders(columns: list[str], k: int, rng: np.random.Generator) -> list[list[str]]:
@@ -380,7 +380,9 @@ class TabularLanguageModel(BaseEstimator):
             eval_rng = np.random.default_rng(self.random_state)
             eval_examples = [ex for row in eval_rows for ex in row_examples(row, eval_rng, 1)]
 
-        self.callback.on_fit_info(self.model.model, self.training)
+        configured = self.model.model
+        label = configured if isinstance(configured, str) else type(configured).__name__
+        self.callback.on_fit_info(label, self.training)
         self.callback.on_fit_start(len(train_rows), self.training.epochs)
         self.backend.fit(
             epoch_texts,
@@ -639,7 +641,7 @@ class TabularLanguageModel(BaseEstimator):
                 f"{len(rows) - len(completed)} of {len(rows)} sampled rows stayed "
                 f"malformed after {self.max_retries} attempts"
             )
-        out = pd.DataFrame(completed, columns=self.columns_)
+        out = pd.DataFrame(completed, columns=pd.Index(self.columns_))
         numeric = [c for c in self.columns_ if c in self.numeric_cols_]
         out[numeric] = out[numeric].astype(float)
         return out

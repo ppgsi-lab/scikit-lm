@@ -13,12 +13,15 @@ model-loading fields. The first three subclass
 from __future__ import annotations
 
 import math
+from abc import ABC
 from collections import Counter
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal
 
 from sklearn.base import BaseEstimator
+
+from .bridge import Model, Tokenizer
 
 __all__ = [
     "CheckpointConfig",
@@ -41,7 +44,6 @@ type Quantization = Literal["2bit", "3bit", "4bit", "6bit", "8bit"]
 type QuantMethod = Literal["auto", "bitsandbytes", "hqq", "mlx"]
 type Precision = Literal["fp32", "bf16", "fp16"]
 type Optimizer = Literal["adamw", "adamw_8bit", "paged_adamw_8bit", "adafactor", "lion"]
-type LRScheduler = Literal["constant", "linear", "cosine"]
 type Device = Literal["auto", "cuda", "mps", "cpu"] | str
 
 
@@ -115,8 +117,12 @@ class ModelConfig:
 
     Parameters
     ----------
-    model : str
-        Model id/path handed to the backend at fit time. Default ``"gpt2"``.
+    model : Model
+        What the backend fine-tunes: a model id/path string (loaded at fit time
+        with the fields below), an already-loaded HF/MLX model, or a
+        zero-argument factory returning one of those. A factory is re-invoked on
+        every ``fit`` (so refits start clean); a bare loaded object is used in
+        place. Default ``"gpt2"``.
     lora : LoRAConfig or None
         Fine-tune with LoRA adapters when set; full-weight fine-tuning when
         ``None`` (default).
@@ -127,8 +133,11 @@ class ModelConfig:
     precision : {"fp32", "bf16", "fp16"}
         Compute dtype for the (unquantized) weights and the train/generate
         autocast. Default ``"fp32"``.
-    tokenizer : str or None
-        Tokenizer id/path; ``None`` (default) derives it from the model.
+    tokenizer : Tokenizer or None
+        Tokenizer id/path, an already-loaded tokenizer, or a factory returning
+        one. ``None`` (default) derives it from the model id, and is required to
+        be set when ``model`` is a pre-loaded object (there is no id to derive
+        from).
     trust_remote_code : bool
         Allow custom model/tokenizer code from the hub. Default ``False``.
     device : str
@@ -138,11 +147,11 @@ class ModelConfig:
         ``"flash_attention_2"``). ``None`` (default) keeps the model default.
     """
 
-    model: str = "gpt2"
+    model: Model = "gpt2"
     lora: LoRAConfig | None = None
     quantization: QuantizationConfig | None = None
     precision: Precision = "fp32"
-    tokenizer: str | None = None
+    tokenizer: Tokenizer | None = None
     trust_remote_code: bool = False
     device: Device = "auto"
     attn_implementation: str | None = None
@@ -190,6 +199,277 @@ class CheckpointConfig(BaseEstimator):
 
 
 @dataclass
+class LRScheduler(BaseEstimator, ABC):
+    """Learning-rate schedule for fine-tuning.
+
+    Build a schedule through one of the named constructors rather than
+    instantiating this base directly:
+
+    - :meth:`constant` -- flat learning rate.
+    - :meth:`linear` -- linear decay to zero.
+    - :meth:`cosine` -- half-cosine decay to zero.
+    - :meth:`plateau` -- lower the rate when validation loss stops improving.
+
+    Every schedule carries a peak ``learning_rate`` (the initial rate it
+    operates on; ``"auto"`` picks a LoRA-aware default -- see
+    :meth:`resolved_learning_rate`). The step-based schedules (``constant``,
+    ``linear``, ``cosine``) also take a ``warmup_ratio``; ``plateau`` reacts to
+    the validation metric instead and requires
+    ``TrainingConfig.validation_split > 0``.
+
+    Examples
+    --------
+    >>> TrainingConfig(lr_scheduler=LRScheduler.cosine(learning_rate=2e-5, warmup_ratio=0.1))
+    >>> TrainingConfig(
+    ...     lr_scheduler=LRScheduler.plateau(patience=5, factor=0.5),
+    ...     validation_split=0.2,
+    ... )
+    """
+
+    learning_rate: float | Literal["auto"] = "auto"
+
+    @staticmethod
+    def constant(
+        *, learning_rate: float | Literal["auto"] = "auto", warmup_ratio: float = 0.0
+    ) -> LRScheduler:
+        """Build a constant (flat) learning-rate schedule.
+
+        Parameters
+        ----------
+        learning_rate : float or "auto", optional
+            Peak learning rate. ``"auto"`` (default) selects ``2e-4`` with LoRA
+            and ``2e-5`` for full-weight fine-tuning; a float overrides.
+        warmup_ratio : float, optional
+            Fraction of total optimizer steps spent linearly warming up from
+            zero before the rate goes flat. Must be in ``[0.0, 1.0)``.
+            Default ``0.0``.
+
+        Returns
+        -------
+        LRScheduler
+            The configured constant schedule.
+        """
+        return ConstantLR(learning_rate=learning_rate, warmup_ratio=warmup_ratio)
+
+    @staticmethod
+    def linear(
+        *,
+        learning_rate: float | Literal["auto"] = "auto",
+        warmup_ratio: float = 0.0,
+        floor: float = 0.0,
+    ) -> LRScheduler:
+        """Build a linear-decay schedule.
+
+        The learning rate decays linearly from ``learning_rate`` to ``floor``
+        over the planned training steps, after an optional linear warmup.
+
+        Parameters
+        ----------
+        learning_rate : float or "auto", optional
+            Peak learning rate. ``"auto"`` (default) selects ``2e-4`` with LoRA
+            and ``2e-5`` for full-weight fine-tuning; a float overrides.
+        warmup_ratio : float, optional
+            Fraction of total optimizer steps spent linearly warming up from
+            zero before the decay. Must be in ``[0.0, 1.0)``. Default ``0.0``.
+        floor : float, optional
+            Lower bound the decay ends at, instead of zero. Must be ``>= 0`` and
+            below ``learning_rate``. Default ``0.0`` (decay to zero).
+
+        Returns
+        -------
+        LRScheduler
+            The configured linear schedule.
+        """
+        return LinearLR(learning_rate=learning_rate, warmup_ratio=warmup_ratio, floor=floor)
+
+    @staticmethod
+    def cosine(
+        *,
+        learning_rate: float | Literal["auto"] = "auto",
+        warmup_ratio: float = 0.0,
+        floor: float = 0.0,
+    ) -> LRScheduler:
+        """Build a half-cosine decay schedule.
+
+        The learning rate decays from ``learning_rate`` to ``floor`` following a
+        half cosine over the planned training steps, after an optional linear
+        warmup.
+
+        Parameters
+        ----------
+        learning_rate : float or "auto", optional
+            Peak learning rate. ``"auto"`` (default) selects ``2e-4`` with LoRA
+            and ``2e-5`` for full-weight fine-tuning; a float overrides.
+        warmup_ratio : float, optional
+            Fraction of total optimizer steps spent linearly warming up from
+            zero before the decay. Must be in ``[0.0, 1.0)``. Default ``0.0``.
+        floor : float, optional
+            Lower bound the decay ends at, instead of zero. Must be ``>= 0`` and
+            below ``learning_rate``. Default ``0.0`` (decay to zero).
+
+        Returns
+        -------
+        LRScheduler
+            The configured cosine schedule.
+        """
+        return CosineLR(learning_rate=learning_rate, warmup_ratio=warmup_ratio, floor=floor)
+
+    @staticmethod
+    def plateau(
+        *,
+        learning_rate: float | Literal["auto"] = "auto",
+        factor: float = 0.1,
+        patience: int = 10,
+        threshold: float = 1e-4,
+        floor: float = 0.0,
+        cooldown: int = 0,
+    ) -> LRScheduler:
+        """Build a schedule that lowers the rate on a validation-loss plateau.
+
+        The learning rate starts at ``learning_rate`` and is multiplied by
+        ``factor`` whenever the validation loss fails to improve for
+        ``patience`` consecutive evaluations, down to a floor of ``floor``.
+        Mirrors ``torch.optim.lr_scheduler.ReduceLROnPlateau`` (minimum mode,
+        relative threshold) on both backends. Requires
+        ``TrainingConfig.validation_split > 0``.
+
+        Parameters
+        ----------
+        learning_rate : float or "auto", optional
+            Peak (starting) learning rate the reductions apply to. ``"auto"``
+            (default) selects ``2e-4`` with LoRA and ``2e-5`` for full-weight
+            fine-tuning; a float overrides.
+        factor : float, optional
+            Multiplier applied on each reduction, in ``(0.0, 1.0)``.
+            Default ``0.1``.
+        patience : int, optional
+            Consecutive evaluations with no improvement tolerated before the
+            rate is reduced. Default ``10``.
+        threshold : float, optional
+            Minimum relative improvement that counts as progress
+            (``new < best * (1 - threshold)``). Default ``1e-4``.
+        floor : float, optional
+            Lower bound the reductions stop at. Default ``0.0``.
+        cooldown : int, optional
+            Evaluations to wait after a reduction before resuming the
+            no-improvement count. Default ``0``.
+
+        Returns
+        -------
+        LRScheduler
+            The configured plateau schedule.
+
+        Notes
+        -----
+        ``patience`` is counted in evaluations, whose cadence differs slightly
+        between backends (per epoch on MLX; per save cadence on HF) -- the same
+        convention as ``TrainingConfig.early_stopping_patience``.
+        """
+        return PlateauLR(
+            learning_rate=learning_rate,
+            factor=factor,
+            patience=patience,
+            threshold=threshold,
+            floor=floor,
+            cooldown=cooldown,
+        )
+
+    def resolved_learning_rate(self, model_config: ModelConfig) -> float:
+        """Concrete learning rate, resolving the ``"auto"`` sentinel.
+
+        ``"auto"`` selects ``2e-4`` when ``model_config`` enables LoRA and
+        ``2e-5`` for full-weight fine-tuning; an explicit float passes through.
+
+        Parameters
+        ----------
+        model_config : ModelConfig
+            Model configuration; its ``lora`` field selects the auto rate.
+
+        Returns
+        -------
+        float
+            The resolved learning rate.
+        """
+        if self.learning_rate != "auto":
+            return self.learning_rate
+        return 2e-4 if model_config.lora is not None else 2e-5
+
+
+@dataclass
+class _StepLR(LRScheduler):
+    """Base for step-based schedules; carries the linear-warmup fraction.
+
+    Parameters
+    ----------
+    warmup_ratio : float
+        Fraction of total optimizer steps spent linearly warming up from zero.
+        Must be in ``[0.0, 1.0)``.
+    """
+
+    warmup_ratio: float = 0.0
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.warmup_ratio < 1.0:
+            raise ValueError(f"warmup_ratio must be in [0.0, 1.0), got {self.warmup_ratio}")
+
+
+@dataclass
+class _DecayLR(_StepLR):
+    """Base for decaying step-based schedules; adds the learning-rate floor.
+
+    Parameters
+    ----------
+    floor : float
+        Lower bound the decay ends at, instead of zero. Must be ``>= 0``.
+    """
+
+    floor: float = 0.0
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if self.floor < 0.0:
+            raise ValueError(f"floor must be non-negative, got {self.floor}")
+
+
+@dataclass
+class ConstantLR(_StepLR):
+    """Constant (flat) schedule. Build via :meth:`LRScheduler.constant`."""
+
+
+@dataclass
+class LinearLR(_DecayLR):
+    """Linear-decay schedule. Build via :meth:`LRScheduler.linear`."""
+
+
+@dataclass
+class CosineLR(_DecayLR):
+    """Half-cosine decay schedule. Build via :meth:`LRScheduler.cosine`."""
+
+
+@dataclass
+class PlateauLR(LRScheduler):
+    """Reduce-on-plateau schedule. Build via :meth:`LRScheduler.plateau`."""
+
+    factor: float = 0.1
+    patience: int = 10
+    threshold: float = 1e-4
+    floor: float = 0.0
+    cooldown: int = 0
+
+    def __post_init__(self) -> None:
+        if not 0.0 < self.factor < 1.0:
+            raise ValueError(f"factor must be in (0.0, 1.0), got {self.factor}")
+        if self.patience <= 0:
+            raise ValueError(f"patience must be a positive integer, got {self.patience}")
+        if self.threshold < 0.0:
+            raise ValueError(f"threshold must be non-negative, got {self.threshold}")
+        if self.floor < 0.0:
+            raise ValueError(f"floor must be non-negative, got {self.floor}")
+        if self.cooldown < 0:
+            raise ValueError(f"cooldown must be non-negative, got {self.cooldown}")
+
+
+@dataclass
 class TrainingConfig(BaseEstimator):
     """Fine-tuning hyperparameters.
 
@@ -199,10 +479,6 @@ class TrainingConfig(BaseEstimator):
         Number of passes over the training rows. Default ``50``.
     batch_size : int
         Per-device batch size. Default ``16``.
-    learning_rate : float or "auto"
-        Optimizer learning rate. ``"auto"`` (default) picks ``2e-5`` for
-        full-weight fine-tuning and ``2e-4`` when LoRA is enabled (see
-        ``ModelConfig.lora``); pass a float to override.
     max_steps : int or None
         Optimizer-step ceiling. When set, training runs for
         ``min(epochs * steps_per_epoch, max_steps)``. ``None`` (default) ties
@@ -211,11 +487,12 @@ class TrainingConfig(BaseEstimator):
         L2 regularization. Default ``0.0``.
     grad_accumulation_steps : int
         Micro-batches accumulated before each optimizer step. Default ``1``.
-    lr_scheduler : {"constant", "linear", "cosine"}
-        Learning-rate schedule. Default ``"cosine"``.
-    warmup_ratio : float
-        Fraction of total steps spent linearly warming the LR up from 0.
-        Default ``0.0``.
+    lr_scheduler : LRScheduler
+        Learning-rate schedule object, built via the :class:`LRScheduler`
+        factories (:meth:`~LRScheduler.constant`, :meth:`~LRScheduler.linear`,
+        :meth:`~LRScheduler.cosine`, :meth:`~LRScheduler.plateau`). Carries the
+        peak ``learning_rate`` and, for the step-based shapes, ``warmup_ratio``.
+        Default :meth:`LRScheduler.cosine`.
     max_grad_norm : float or None
         Global gradient-norm clip threshold; ``None`` disables clipping.
         Default ``1.0``.
@@ -288,12 +565,10 @@ class TrainingConfig(BaseEstimator):
 
     epochs: int = 50
     batch_size: int = 16
-    learning_rate: float | Literal["auto"] = "auto"
     max_steps: int | None = None
     weight_decay: float = 0.0
     grad_accumulation_steps: int = 1
-    lr_scheduler: LRScheduler = "cosine"
-    warmup_ratio: float = 0.0
+    lr_scheduler: LRScheduler = field(default_factory=CosineLR)
     max_grad_norm: float | None = 1.0
     optimizer: Optimizer = "adamw"
     label_smoothing: float = 0.0
@@ -332,21 +607,11 @@ class TrainingConfig(BaseEstimator):
                     "early_stopping_patience requires validation_split > 0 "
                     "(no validation metric to monitor otherwise)"
                 )
-
-    def resolved_learning_rate(self, model_config: ModelConfig) -> float:
-        """Concrete learning rate, resolving the ``"auto"`` sentinel.
-
-        ``"auto"`` selects ``2e-4`` when ``model_config`` enables LoRA and
-        ``2e-5`` for full-weight fine-tuning; an explicit float passes through.
-
-        Returns
-        -------
-        float
-            The resolved learning rate.
-        """
-        if self.learning_rate != "auto":
-            return self.learning_rate
-        return 2e-4 if model_config.lora is not None else 2e-5
+        if isinstance(self.lr_scheduler, PlateauLR) and self.validation_split <= 0.0:
+            raise ValueError(
+                "PlateauLR requires validation_split > 0 "
+                "(no validation metric to monitor otherwise)"
+            )
 
 
 def aggregate_default(draws: list[object], numeric: bool) -> object:
@@ -411,7 +676,7 @@ class GenerationConfig(BaseEstimator):
         draws marginalize over feature order rather than fixing one arbitrary
         order. For the classifier this scores each candidate under ``n_samples``
         distinct column orders and pools the results via :attr:`score_pool`.
-        ``False`` (default) reuses the same order. Has no effect when
+        ``True`` (default) always permutes the order. Has no effect when
         ``n_samples == 1`` or a row conditions on fewer than two columns.
     aggregate : callable
         Generative estimators only: ``(draws, numeric) -> value`` collapsing the
@@ -442,7 +707,7 @@ class GenerationConfig(BaseEstimator):
     repetition_penalty: float | None = None
     inference_batch_size: int | None = None
     n_samples: int = 1
-    permute_order: bool = False
+    permute_order: bool = True
     aggregate: Callable[[list[object], bool], object] = aggregate_default
     score_pool: Callable[[list[Sequence[float]]], Sequence[float]] | None = None
     candidate_scoring: Literal["mean", "sum"] = "mean"
@@ -475,23 +740,29 @@ class DiscretizationConfig(BaseEstimator):
         The candidate value taken from each partition. ``"median"`` (default, the
         lower median) and ``"mode"`` are real observed values; ``"mean"`` is
         synthetic and may serialize to tokens the model never emitted.
-    estimate : {"mean", "mode"}, optional
+    estimate : {"mean", "mode", "median"}, optional
         How the scored distribution collapses to a prediction. ``"mean"``
         (default) is the probability-weighted expectation over the candidates;
-        ``"mode"`` is the single most likely candidate (argmax).
+        ``"median"`` is the probability-weighted median (the smallest candidate
+        whose cumulative probability reaches half) -- a robust central estimate
+        that pools nearby mass and, unlike ``"mean"``, is not dragged off by a
+        distant low-probability candidate; ``"mode"`` is the single most likely
+        candidate (argmax). ``"median"`` and ``"mode"`` return a real observed
+        candidate; ``"mean"`` interpolates.
     sharpness : float, optional
         Temperature applied to the scored distribution before ``estimate``:
         probabilities are raised to this power and renormalized. ``1.0``
         (default) keeps the distribution as scored; larger values concentrate
-        mass on the top candidates, so ``"mean"`` interpolates continuously
-        toward ``"mode"`` as sharpness grows. ``"mode"`` (argmax) is invariant
-        to it. Useful when the scored distribution is underconfident.
+        mass on the top candidates, so ``"mean"`` and ``"median"`` interpolate
+        continuously toward ``"mode"`` as sharpness grows. ``"mode"`` (argmax)
+        is invariant to it. Useful when the scored distribution is
+        underconfident.
     """
 
     bins: int | float = 0
     strategy: Literal["quantile", "uniform"] = "quantile"
     representative: Literal["median", "mode", "mean"] = "median"
-    estimate: Literal["mean", "mode"] = "mean"
+    estimate: Literal["mean", "mode", "median"] = "mean"
     sharpness: float = 1.0
 
     def __post_init__(self) -> None:

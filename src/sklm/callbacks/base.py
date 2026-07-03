@@ -26,7 +26,6 @@ if TYPE_CHECKING:
     from ..config import TrainingConfig
     from ..serialize import TrainingExample
 
-
 # --------------------------------------------------------------------------- callback
 
 
