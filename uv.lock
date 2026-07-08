@@ -19,10 +19,6 @@ resolution-markers = [
     "python_full_version < '3.13' and sys_platform != 'darwin' and sys_platform != 'emscripten' and sys_platform != 'linux' and sys_platform != 'win32'",
 ]
 
-[options]
-exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for backwards compatibility when using relative exclude-newer values.
-exclude-newer-span = "P7D"
-
 [[package]]
 name = "accelerate"
 version = "1.13.0"
@@ -3482,7 +3478,7 @@ wheels = [
 
 [[package]]
 name = "sdv"
-version = "1.37.1"
+version = "1.37.3"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "boto3" },
@@ -3500,9 +3496,9 @@ dependencies = [
     { name = "sdmetrics" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/0a/d0/169836f775dfca8a58a29dd89a789ce36e8a4e9cf584ee44c01e16e5690e/sdv-1.37.1.tar.gz", hash = "sha256:d22e276b19a03be1010beb43168ae4f98a56dbeb810efb7523e7abbcaf1b88ab", size = 180420, upload-time = "2026-06-11T20:35:21.013Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/09/09/141d7d201b30e8b896a2b80e8b86add1737df939c82cc1921fc3e084aae6/sdv-1.37.3.tar.gz", hash = "sha256:2900501a4d7eb663c9a05e2ac5e7fb175e29231aa2e7bc9a42260e4c0054b615", size = 180700, upload-time = "2026-07-02T15:02:57.25Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/be/82/13c41ab19854f73986ec24dc21cbd202f96c780c26c7c821a4a95c064c39/sdv-1.37.1-py3-none-any.whl", hash = "sha256:1db961302c3715636ce77a8a32608668b1638aa3b0091770dbd388a9a2f0ad54", size = 207538, upload-time = "2026-06-11T20:35:19.089Z" },
+    { url = "https://files.pythonhosted.org/packages/e5/bd/53da052fa67a4f65e784f6027dc24a51cef4017f5cd791bfa1dc24e6c788/sdv-1.37.3-py3-none-any.whl", hash = "sha256:6a9d2e1862a1db61a6a486445d494a2095048d018366b84c9ed4abecc43f9c2c", size = 207897, upload-time = "2026-07-02T15:02:55.305Z" },
 ]
 
 [[package]]
