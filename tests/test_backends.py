@@ -298,9 +298,7 @@ def test_resolve_auto_darwin_prefers_mlx(monkeypatch: pytest.MonkeyPatch) -> Non
     assert isinstance(resolved, _SentinelMLXBackend)
 
 
-def test_resolve_auto_darwin_without_mlx_falls_back_to_hf(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_resolve_auto_darwin_without_mlx_falls_back_to_hf(monkeypatch: pytest.MonkeyPatch) -> None:
     resolved = _resolve_auto_with(monkeypatch, system="Darwin", hf=True)
     assert isinstance(resolved, HFBackend)
 
@@ -327,8 +325,6 @@ def test_resolve_auto_linux_mlx_cpu_last(monkeypatch: pytest.MonkeyPatch) -> Non
     assert isinstance(resolved, _SentinelMLXBackend)
 
 
-def test_resolve_auto_nothing_installed_falls_back_to_hf(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_resolve_auto_nothing_installed_falls_back_to_hf(monkeypatch: pytest.MonkeyPatch) -> None:
     resolved = _resolve_auto_with(monkeypatch, system="Linux")
     assert isinstance(resolved, HFBackend)

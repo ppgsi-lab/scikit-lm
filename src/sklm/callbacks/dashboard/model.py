@@ -126,24 +126,25 @@ class DashboardState:
                 if self.pending and bucket != self.cur_bucket:
                     self.flush_log()
                 self.cur_bucket = bucket
-                self.pending.append(
-                    {
-                        "step": step,
-                        "epoch": state.epoch,
-                        "loss": state.loss,
-                        "lr": state.learning_rate,
-                        "grad_norm": grad_norm,
-                        "t": monotonic(),
-                    }
-                )
+                self.pending.append({
+                    "step": step,
+                    "epoch": state.epoch,
+                    "loss": state.loss,
+                    "lr": state.learning_rate,
+                    "grad_norm": grad_norm,
+                    "t": monotonic(),
+                })
             case EvalReport(step=step, loss=loss):
                 self.eval_by_step[step] = loss
             case RowEnd(index=index, total=total):
                 self.done, self.total = index + 1, total
             case Generation(prompt=prompt, target=target, value=value):
-                self.generations.append(
-                    {"kind": "gen", "prompt": prompt, "target": target, "value": value}
-                )
+                self.generations.append({
+                    "kind": "gen",
+                    "prompt": prompt,
+                    "target": target,
+                    "value": value,
+                })
             case Score(prompts=prompts, candidates=candidates, probs=probs):
                 ranking = _ranking_pairs(candidates, probs)
                 _, top_p = ranking[0]
@@ -190,17 +191,15 @@ class DashboardState:
         losses = [r["loss"] for r in self.pending if r["loss"] is not None]
         grads = [r["grad_norm"] for r in self.pending if r["grad_norm"] is not None]
         last = self.pending[-1]
-        self.log.append(
-            {
-                "step": last["step"],
-                "epoch": last["epoch"],
-                "loss": statistics.fmean(losses) if losses else None,
-                "std": statistics.pstdev(losses) if len(losses) > 1 else None,
-                "lr": last["lr"],
-                "grad_norm": statistics.fmean(grads) if grads else None,
-                "t": last["t"],
-            }
-        )
+        self.log.append({
+            "step": last["step"],
+            "epoch": last["epoch"],
+            "loss": statistics.fmean(losses) if losses else None,
+            "std": statistics.pstdev(losses) if len(losses) > 1 else None,
+            "lr": last["lr"],
+            "grad_norm": statistics.fmean(grads) if grads else None,
+            "t": last["t"],
+        })
         self.pending = []
 
     def eta(self) -> float | None:

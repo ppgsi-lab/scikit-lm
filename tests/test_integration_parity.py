@@ -109,18 +109,12 @@ class _LossRecorder(Callback):
 
 
 def _train_and_score(
-    spec: _Backend,
-    train: tuple[pd.DataFrame, np.ndarray],
-    test: tuple[pd.DataFrame, np.ndarray],
+    spec: _Backend, train: tuple[pd.DataFrame, np.ndarray], test: tuple[pd.DataFrame, np.ndarray]
 ) -> tuple[float, float]:
     """Fine-tune one backend on ``train`` and return ``(final_loss, test_accuracy)``."""
     rec = _LossRecorder()
     clf = LanguageModelClassifier(
-        model=spec.model,
-        backend=spec.backend,
-        training=_params(),
-        callback=rec,
-        random_state=0,
+        model=spec.model, backend=spec.backend, training=_params(), callback=rec, random_state=0
     )
     clf.fit(*train)
     acc = float(accuracy_score(test[1], clf.predict(test[0])))

@@ -72,10 +72,7 @@ def resolve_max_new_tokens(generation: GenerationConfig, max_seq_length: int) ->
 
 
 def resolve_max_seq_length(
-    examples: Sequence[TrainingExample],
-    token_len: Callable[[str], int],
-    *,
-    multiple: int = 8,
+    examples: Sequence[TrainingExample], token_len: Callable[[str], int], *, multiple: int = 8
 ) -> int:
     """Smallest ``multiple`` of tokens holding the longest serialized row.
 

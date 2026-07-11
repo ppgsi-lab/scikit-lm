@@ -71,11 +71,7 @@ def test_decode_value_non_string_literal_returns_raw_token() -> None:
 
 @pytest.mark.parametrize(
     "context",
-    [
-        [Field("age", 39, True), Field("city", "São Paulo", False)],
-        [Field("age", 39, True)],
-        [],
-    ],
+    [[Field("age", 39, True), Field("city", "São Paulo", False)], [Field("age", 39, True)], []],
 )
 def test_split_concatenates_to_full_serialization(context: list[Field]) -> None:
     s = JSONSerializer()
@@ -232,12 +228,7 @@ def _serializers() -> list[Serializer]:
 
 @pytest.mark.parametrize("s", _serializers())
 @pytest.mark.parametrize(
-    "context",
-    [
-        [Field("age", 39, True), Field("city", "SP", False)],
-        [Field("age", 39, True)],
-        [],
-    ],
+    "context", [[Field("age", 39, True), Field("city", "SP", False)], [Field("age", 39, True)], []]
 )
 def test_split_concatenates_to_full_serialization_all_formats(
     s: Serializer, context: list[Field]
@@ -280,3 +271,19 @@ def test_resolve_serializer_passes_instances_through() -> None:
 def test_resolve_serializer_rejects_unknown() -> None:
     with pytest.raises(ValueError, match="unknown serializer"):
         resolve_serializer("toml")
+
+
+def test_resolve_serializer_number_format() -> None:
+    plain = resolve_serializer("json", 2)
+    spaced = resolve_serializer("json", 2, "spaced")
+    assert isinstance(plain, JSONSerializer)
+    assert isinstance(plain.number, PlainNumber)
+    assert isinstance(spaced, JSONSerializer)
+    assert isinstance(spaced.number, SpacedDigits)
+    assert spaced.number.max_decimals == 2
+
+
+def test_resolve_serializer_rejects_unknown_number_format() -> None:
+    with pytest.raises(ValueError, match="unknown number_format"):
+        # "roman" is not in the Literal -- the rejection under test
+        resolve_serializer("json", None, "roman")  # pyright: ignore[reportArgumentType]

@@ -7,12 +7,7 @@ from time import monotonic
 from typing import TYPE_CHECKING, Any, override
 
 from .base import Callback
-from .dashboard import (
-    DashboardState,
-    RenderConfig,
-    build_fit_dashboard,
-    build_predict_dashboard,
-)
+from .dashboard import DashboardState, RenderConfig, build_fit_dashboard, build_predict_dashboard
 from .dashboard.rich_renderer import RichRenderer
 from .events import (
     Event,
@@ -127,9 +122,7 @@ class RichCallback(Callback):
         self._n_train_examples = n_train_examples
         self._rps = refresh_per_second
         self._dash_state = DashboardState(
-            n_generations=n_generations,
-            uncertain_threshold=0.6,
-            log_every="epoch",
+            n_generations=n_generations, uncertain_threshold=0.6, log_every="epoch"
         )
         # n_log_rows=0 / uid="" disable the HTML-only widgets (the training-log
         # table and the CSS-tab examples panel) the Rich renderer never draws.
@@ -142,10 +135,7 @@ class RichCallback(Callback):
             loss_window=loss_window,
         )
         self._renderer = RichRenderer(
-            marker=marker,
-            train_color=train_color,
-            eval_color=eval_color,
-            plot_height=plot_height,
+            marker=marker, train_color=train_color, eval_color=eval_color, plot_height=plot_height
         )
         self._console: Console | None = None
         self._live: Live | None = None

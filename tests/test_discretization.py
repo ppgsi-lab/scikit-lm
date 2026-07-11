@@ -251,12 +251,7 @@ def test_regressor_set_params_addresses_nested_discretization() -> None:
 
 def _mixed_frame() -> pd.DataFrame:
     """Numeric + categorical columns, last row missing both."""
-    return pd.DataFrame(
-        {
-            "n": [10.0, 20.0, 10.0, 20.0, np.nan],
-            "c": ["x", "y", "x", "y", np.nan],
-        }
-    )
+    return pd.DataFrame({"n": [10.0, 20.0, 10.0, 20.0, np.nan], "c": ["x", "y", "x", "y", np.nan]})
 
 
 def test_imputer_scores_numeric_and_categorical() -> None:
@@ -285,12 +280,7 @@ def test_imputer_routes_numeric_and_categorical() -> None:
 
 
 def test_imputer_discretized_single_config_scores_all_numeric() -> None:
-    X = pd.DataFrame(
-        {
-            "a": [1.0, 2.0, 1.0, 2.0, np.nan],
-            "b": [10.0, 20.0, 10.0, 20.0, np.nan],
-        }
-    )
+    X = pd.DataFrame({"a": [1.0, 2.0, 1.0, 2.0, np.nan], "b": [10.0, 20.0, 10.0, 20.0, np.nan]})
     fake = FakeBackend(scores={"1.0": 0.0, "2.0": 0.0, "10.0": 0.0, "20.0": 0.0})
     out = LanguageModelImputer(
         backend=fake, discretization=DiscretizationConfig(bins=1.0, estimate="mean")
@@ -302,12 +292,7 @@ def test_imputer_discretized_single_config_scores_all_numeric() -> None:
 
 
 def test_imputer_discretized_map_scores_only_listed_column() -> None:
-    X = pd.DataFrame(
-        {
-            "a": [1.0, 2.0, 1.0, 2.0, np.nan],
-            "b": [10.0, 20.0, 10.0, 20.0, np.nan],
-        }
-    )
+    X = pd.DataFrame({"a": [1.0, 2.0, 1.0, 2.0, np.nan], "b": [10.0, 20.0, 10.0, 20.0, np.nan]})
     fake = FakeBackend(value="0", scores={"1.0": 0.0, "2.0": 0.0})
     LanguageModelImputer(
         backend=fake, discretization={"a": DiscretizationConfig(bins=1.0)}
@@ -339,12 +324,10 @@ def test_imputer_discretization_map_disables_categorical_scoring() -> None:
 
 
 def test_imputer_discretized_is_batch_size_invariant() -> None:
-    X = pd.DataFrame(
-        {
-            "n": [10.0, 20.0, 30.0, 40.0, np.nan, np.nan, np.nan, np.nan],
-            "c": ["x", "y", "x", "y", np.nan, np.nan, np.nan, np.nan],
-        }
-    )
+    X = pd.DataFrame({
+        "n": [10.0, 20.0, 30.0, 40.0, np.nan, np.nan, np.nan, np.nan],
+        "c": ["x", "y", "x", "y", np.nan, np.nan, np.nan, np.nan],
+    })
     fake = FakeBackend()  # stable-hash scores: both `n` and categorical `c` are deterministic
     imp = LanguageModelImputer(backend=fake, discretization=DiscretizationConfig(bins=4)).fit(X)
     imp.generation = GenerationConfig(inference_batch_size=1)
@@ -356,12 +339,10 @@ def test_imputer_discretized_is_batch_size_invariant() -> None:
 
 
 def test_imputer_discretized_scores_within_batch_cap() -> None:
-    X = pd.DataFrame(
-        {
-            "n": [10.0, 20.0, 30.0, 40.0, np.nan, np.nan, np.nan, np.nan],
-            "c": ["x", "y", "x", "y", "x", "y", "x", "y"],  # fully observed -> only "n" imputed
-        }
-    )
+    X = pd.DataFrame({
+        "n": [10.0, 20.0, 30.0, 40.0, np.nan, np.nan, np.nan, np.nan],
+        "c": ["x", "y", "x", "y", "x", "y", "x", "y"],  # fully observed -> only "n" imputed
+    })
     fake = FakeBackend(scores={"10.0": 0.0, "20.0": 0.0, "30.0": 0.0, "40.0": 0.0})
     LanguageModelImputer(
         backend=fake,

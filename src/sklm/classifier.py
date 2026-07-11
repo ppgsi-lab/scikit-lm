@@ -55,6 +55,11 @@ class LanguageModelClassifier(_FlatParams, ClassifierMixin, BaseEstimator):
         serializing. Applies only to the string ``serializer`` selectors; a
         :class:`~sklm.Serializer` instance keeps its own number format.
         Default ``3``.
+    number_format : {"plain", "spaced"}, optional
+        Number rendering for the string ``serializer`` selectors: ``"plain"``
+        (default) builds :class:`~sklm.PlainNumber`, ``"spaced"`` builds
+        :class:`~sklm.SpacedDigits` (one token per character). Ignored when
+        ``serializer`` is an instance.
     random_state : int or None, optional
         Seed forwarded to the backend and serializer.
     callback : Callback, list of Callback, "auto" or None, optional

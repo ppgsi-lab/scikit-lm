@@ -148,14 +148,12 @@ def _header(state: TrainingState, dash: DashboardState) -> Header:
 
 def _fit_cards(state: TrainingState, dash: DashboardState) -> StatCards:
     lr = _sci(state.learning_rate) if state.learning_rate is not None else "—"
-    return StatCards(
-        [
-            Stat("train loss", _metric(state.loss)),
-            Stat("val loss", _metric(state.eval_loss)),
-            Stat("learning rate", lr, mono=True),
-            _step_stat("step", dash),
-        ]
-    )
+    return StatCards([
+        Stat("train loss", _metric(state.loss)),
+        Stat("val loss", _metric(state.eval_loss)),
+        Stat("learning rate", lr, mono=True),
+        _step_stat("step", dash),
+    ])
 
 
 def _loss_curve(state: TrainingState) -> LossCurve:
@@ -218,11 +216,7 @@ def _examples_panel(state: TrainingState, cfg: RenderConfig) -> ExamplesPanel:
     texts = [ex.text for ex in state.examples[: cfg.n_train_examples]]
     parsed = _json_rows(texts)
     return ExamplesPanel(
-        epoch=state.example_epoch,
-        texts=texts,
-        parsed=parsed,
-        view=cfg.examples_view,
-        uid=cfg.uid,
+        epoch=state.example_epoch, texts=texts, parsed=parsed, view=cfg.examples_view, uid=cfg.uid
     )
 
 
@@ -367,13 +361,11 @@ def build_predict_dashboard(
     predictions = _predictions(dash)
     if dash.score_count:
         mean_conf = dash.conf_sum / dash.score_count if dash.score_count else 0.0
-        cards = StatCards(
-            [
-                _step_stat("predictions", dash),
-                Stat("mean top-1 conf", f"{mean_conf:.2f}", mono=True),
-                Stat("uncertain rows", f"{dash.uncertain} / {dash.score_count}"),
-            ]
-        )
+        cards = StatCards([
+            _step_stat("predictions", dash),
+            Stat("mean top-1 conf", f"{mean_conf:.2f}", mono=True),
+            Stat("uncertain rows", f"{dash.uncertain} / {dash.score_count}"),
+        ])
     else:
         cards = StatCards([_step_stat("rows", dash)])
     children: list[Widget] = [_header(state, dash), cards, predictions]

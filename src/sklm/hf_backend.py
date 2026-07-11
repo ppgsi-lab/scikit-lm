@@ -223,11 +223,7 @@ class HFBackend:
         callback: Callback,
         eval_examples: list[TrainingExample] | None = None,
     ) -> None:
-        from transformers import (
-            EarlyStoppingCallback,
-            Trainer,
-            TrainingArguments,
-        )
+        from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
         from transformers.trainer_callback import PrinterCallback, ProgressCallback
         from transformers.trainer_utils import get_last_checkpoint
 

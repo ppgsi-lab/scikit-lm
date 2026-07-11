@@ -16,9 +16,10 @@ loop so it can do two things ``optuna.integration.OptunaSearchCV`` cannot:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import sys
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
-from typing import Protocol, Self, cast
+from typing import Protocol, Self, cast, runtime_checkable
 
 try:
     import optuna
@@ -47,10 +48,24 @@ from sklearn.model_selection import BaseCrossValidator, KFold, StratifiedKFold
 from sklearn.utils.metaestimators import available_if
 from sklearn.utils.validation import check_is_fitted
 
-__all__ = ["LiveLeaderboard", "PruningSearchCV", "best_trial", "reconstruction_scorer"]
+__all__ = ["FoldCallback", "LogCallback", "PruningSearchCV", "best_trial", "reconstruction_scorer"]
 
 type ParamValue = bool | int | float | str | None
 type StudyCallback = Callable[[Study, FrozenTrial], None]
+
+
+@runtime_checkable
+class FoldCallback(Protocol):
+    """A :data:`StudyCallback` that also observes each finished CV fold.
+
+    :meth:`PruningSearchCV.fit` calls :meth:`on_fold` after every fold's ``trial.report`` -- the
+    seam a live view uses to show a trial's partial score before the trial completes. Plain study
+    callbacks lack the method and are only invoked once per finished trial.
+    """
+
+    def on_fold(
+        self, study: Study, trial: Trial, step: int, n_folds: int, scores: Sequence[float]
+    ) -> None: ...
 
 
 class _Estimator(Protocol):
@@ -337,7 +352,8 @@ class PruningSearchCV(MetaEstimatorMixin, BaseEstimator):
         ``None`` is passed to :func:`sklearn.metrics.check_scoring` (``None`` uses
         ``estimator.score``).
     n_trials : int, optional
-        Number of trials. Default is ``20``.
+        Number of trials to run -- always ``n_trials`` *new* trials, on top of whatever a
+        passed ``study`` already holds. Default is ``20``.
     std_penalty : float, optional
         Weight ``lambda`` in ``adj = mean - lambda * std`` used for selection. Default ``0.0``.
     sampler : optuna.samplers.BaseSampler or None, optional
@@ -345,7 +361,7 @@ class PruningSearchCV(MetaEstimatorMixin, BaseEstimator):
     pruner : optuna.pruners.BasePruner or None, optional
         Pruner. Default is ``MedianPruner()``.
     callbacks : list[StudyCallback] or None, optional
-        Optuna study callbacks invoked after each finished trial (e.g. :class:`LiveLeaderboard`).
+        Optuna study callbacks invoked after each finished trial (e.g. :class:`LogCallback`).
     refit : bool, optional
         If ``True`` (default), refit the selected config on the full data into ``best_estimator_``.
     catch : tuple[type[Exception], ...], optional
@@ -353,6 +369,12 @@ class PruningSearchCV(MetaEstimatorMixin, BaseEstimator):
         (forwarded to ``study.optimize``). The failed trial records the message under
         ``user_attrs["error"]``, carries ``NaN`` scores in ``cv_results_``, and is never
         selected. Default is ``()`` -- any error propagates.
+    study : optuna.study.Study or None, optional
+        An existing (``maximize``) study to continue: ``fit`` adds ``n_trials`` more trials to
+        it instead of creating a fresh one, and the study's own sampler and pruner apply --
+        ``sampler`` and ``pruner`` are ignored. The seam for checkpoint/resume: a study
+        round-trips through pickle with its sampler state intact, so a resumed search
+        continues the exact trial sequence of an uninterrupted one. Default is ``None``.
     random_state : int or None, optional
         Seed for the default sampler and the shuffled splitter.
 
@@ -402,6 +424,7 @@ class PruningSearchCV(MetaEstimatorMixin, BaseEstimator):
         callbacks: list[StudyCallback] | None = None,
         refit: bool = True,
         catch: tuple[type[Exception], ...] = (),
+        study: Study | None = None,
         random_state: int | None = None,
     ) -> None:
         self.estimator = estimator
@@ -415,6 +438,7 @@ class PruningSearchCV(MetaEstimatorMixin, BaseEstimator):
         self.callbacks = callbacks
         self.refit = refit
         self.catch = catch
+        self.study = study
         self.random_state = random_state
 
     def _make_splitter(self) -> BaseCrossValidator:
@@ -454,9 +478,14 @@ class PruningSearchCV(MetaEstimatorMixin, BaseEstimator):
         else:
             scorer = self.scoring
         splitter = self._make_splitter()
-        sampler = self.sampler if self.sampler is not None else TPESampler(seed=self.random_state)
-        pruner = self.pruner if self.pruner is not None else MedianPruner()
-        study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
+        if self.study is not None:
+            study = self.study
+        else:
+            sampler = (
+                self.sampler if self.sampler is not None else TPESampler(seed=self.random_state)
+            )
+            pruner = self.pruner if self.pruner is not None else MedianPruner()
+            study = optuna.create_study(direction="maximize", sampler=sampler, pruner=pruner)
 
         def objective(trial: Trial) -> float:
             params = {
@@ -464,11 +493,15 @@ class PruningSearchCV(MetaEstimatorMixin, BaseEstimator):
             }
             estimator = _configured(self.estimator, _resolved(params, self.param_distributions))
             scores: list[float] = []
+            splits = list(splitter.split(X, y))
             try:
-                for step, (train_idx, test_idx) in enumerate(splitter.split(X, y)):
+                for step, (train_idx, test_idx) in enumerate(splits):
                     estimator.fit(_rows(X, train_idx), _rows(y, train_idx), **fit_params)
                     scores.append(float(scorer(estimator, _rows(X, test_idx), _rows(y, test_idx))))
                     trial.report(float(np.mean(scores)), step)
+                    for callback in self.callbacks or ():
+                        if isinstance(callback, FoldCallback):
+                            callback.on_fold(study, trial, step, len(splits), scores)
                     if trial.should_prune():
                         raise optuna.TrialPruned()
             except optuna.TrialPruned:
@@ -624,100 +657,82 @@ def _fmt(value: object) -> str:
     return f"{value:.4g}" if isinstance(value, float) else str(value)
 
 
-def _params_cell(trial: FrozenTrial, keys: list[str]) -> str:
-    """A trial's params as one cell: space-joined ``leaf=value`` pairs that wrap across lines."""
-    return "  ".join(f"{_leaf(k)}={_fmt(trial.params.get(k))}" for k in keys)
+def _params_cell(params: Mapping[str, ParamValue], keys: list[str]) -> str:
+    """Params as one cell: space-joined ``leaf=value`` pairs that wrap across lines."""
+    return "  ".join(f"{_leaf(k)}={_fmt(params.get(k))}" for k in keys)
 
 
-def _maybe_clear() -> None:
-    """Clear the cell's previous output when running under an IPython kernel, else do nothing."""
-    try:
-        from IPython.core.getipython import get_ipython
-    except ImportError:
-        return
-    if get_ipython() is None:
-        return
-    from IPython.display import clear_output
+class LogCallback:
+    """Optuna study callback that appends one plain-stdout line per fold and per finished trial.
 
-    clear_output(wait=True)
+    No screen control and no extra dependency: every event is a new line, so the output reads
+    the same in a terminal, a notebook, a CI log, or a redirected file. A completed trial shows
+    ``mean ±std``, the risk-adjusted score ``adj = mean - std_penalty * std``, its wall-clock,
+    and either ``★ new best`` or a pointer to the current best; a pruned trial shows the running
+    mean and the fold it stopped at; a failed trial (a search with ``catch``) shows its error.
+    When stdout is a terminal, lines are colored with plain ANSI codes (green best, dim pruned,
+    red failed).
 
-
-class LiveLeaderboard:
-    """Optuna study callback that redraws one leaderboard table in place after each trial.
-
-    Completed trials are ranked by ``adj = mean - std_penalty * std`` (then by wall-clock) with the
-    top row highlighted; pruned trials are listed dim, showing the running mean and the fold they
-    stopped at; failed trials (a search with ``catch``) are listed dim red with their error.
-    Under an IPython kernel the table is redrawn in place (``clear_output``); elsewhere
-    each call simply prints. Requires the ``rich`` extra.
+    Also a :class:`FoldCallback`: :meth:`on_fold` prints a line after every CV fold, so a long
+    trial's progress shows before the trial completes.
 
     Parameters
     ----------
     std_penalty : float, optional
-        Weight ``lambda`` used for the ``adj`` column and the ranking. Default is ``0.0``.
+        Weight ``lambda`` in ``adj = mean - lambda * std`` used to rank completed trials.
+        Default is ``0.0``.
     """
 
     def __init__(self, *, std_penalty: float = 0.0) -> None:
-        try:
-            from rich.console import Console
-        except ImportError as exc:
-            raise ImportError(
-                "LiveLeaderboard requires the 'rich' extra: pip install scikit-lm[rich]"
-            ) from exc
         self.std_penalty = std_penalty
-        self._console = Console()
+
+    @staticmethod
+    def _print(line: str, *, color: str | None = None) -> None:
+        if color is not None and sys.stdout.isatty():
+            line = f"\x1b[{color}m{line}\x1b[0m"
+        print(line, flush=True)
+
+    def on_fold(
+        self, study: Study, trial: Trial, step: int, n_folds: int, scores: Sequence[float]
+    ) -> None:
+        """Print the fold just finished: its score and the trial's running mean."""
+        self._print(
+            f"trial {trial.number:>3} · fold {step + 1}/{n_folds}"
+            f"  score={scores[-1]:.4f}  mean={float(np.mean(scores)):.4f}"
+        )
 
     def __call__(self, study: Study, trial: FrozenTrial) -> None:
-        from rich.table import Table
-
-        trials = study.get_trials(deepcopy=False)
-        done = [t for t in trials if t.state == TrialState.COMPLETE and t.value is not None]
-        pruned = [t for t in trials if t.state == TrialState.PRUNED]
-        failed = [t for t in trials if t.state == TrialState.FAIL]
-        if not done and not pruned and not failed:
-            return
-        done.sort(key=lambda t: (-_adj(t, self.std_penalty), _duration(t)))
-        keys = list((done or pruned or failed)[0].params)
-
-        table = Table(title=f"Trials - adj = mean - {self.std_penalty:g}*std (then speed)")
-        for column in ("rank", "trial", "score+/-std", "adj", "time"):
-            table.add_column(column, justify="right")
-        table.add_column("params", overflow="fold", max_width=48)
-
-        for rank, t in enumerate(done, 1):
-            attrs = t.user_attrs
-            table.add_row(
-                str(rank),
-                str(t.number),
-                f"{attrs['mean_test_score']:.4f}+/-{attrs['std_test_score']:.3f}",
-                f"{_adj(t, self.std_penalty):.4f}",
-                f"{_duration(t):.0f}s",
-                _params_cell(t, keys),
-                style="green" if rank == 1 else None,
-            )
-        for t in sorted(pruned, key=lambda t: t.number):
-            step = max(t.intermediate_values, default=-1)
-            last = t.intermediate_values.get(step, float("nan"))
-            table.add_row(
-                "-",
-                str(t.number),
-                f"{last:.4f}",
-                f"pruned@f{step}",
-                f"{_duration(t):.0f}s",
-                _params_cell(t, keys),
-                style="dim",
-            )
-        for t in sorted(failed, key=lambda t: t.number):
-            error = str(t.user_attrs.get("error", "-"))
-            table.add_row(
-                "-",
-                str(t.number),
-                error if len(error) <= 48 else error[:47] + "…",
-                "failed",
-                f"{_duration(t):.0f}s",
-                _params_cell(t, keys),
-                style="red dim",
-            )
-
-        _maybe_clear()
-        self._console.print(table)
+        params = _params_cell(trial.params, list(trial.params))
+        prefix = f"trial {trial.number:>3}"
+        match trial.state:
+            case TrialState.COMPLETE if trial.value is not None:
+                attrs = trial.user_attrs
+                best = best_trial(study, std_penalty=self.std_penalty)
+                marker = (
+                    "★ new best"
+                    if best.number == trial.number
+                    else f"(best: trial {best.number}, adj={_adj(best, self.std_penalty):.4f})"
+                )
+                self._print(
+                    f"{prefix} ✓ mean={attrs['mean_test_score']:.4f} ±{attrs['std_test_score']:.3f}"
+                    f"  adj={_adj(trial, self.std_penalty):.4f}  {_duration(trial):.0f}s"
+                    f"  {marker}  {params}",
+                    color="32" if best.number == trial.number else None,
+                )
+            case TrialState.PRUNED:
+                step = max(trial.intermediate_values, default=-1)
+                last = trial.intermediate_values.get(step, float("nan"))
+                self._print(
+                    f"{prefix} ✗ pruned@fold {step + 1}  mean={last:.4f}"
+                    f"  {_duration(trial):.0f}s  {params}",
+                    color="2",
+                )
+            case TrialState.FAIL:
+                error = str(trial.user_attrs.get("error", "-"))
+                if len(error) > 48:
+                    error = error[:47] + "…"
+                self._print(
+                    f"{prefix} ! failed  {error}  {_duration(trial):.0f}s  {params}", color="31"
+                )
+            case _:  # RUNNING/WAITING: nothing to log yet
+                pass

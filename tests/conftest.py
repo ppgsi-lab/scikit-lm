@@ -73,11 +73,7 @@ class FakeBackend:
         return [self.value for _ in prompts]
 
     def score(
-        self,
-        prompts: Sequence[str],
-        continuations: Sequence[str],
-        *,
-        reduce: str = "mean",
+        self, prompts: Sequence[str], continuations: Sequence[str], *, reduce: str = "mean"
     ) -> list[float]:
         self.score_batches.append(len(prompts))
         if self.scores is not None:
@@ -99,13 +95,11 @@ class FakeBackend:
 @pytest.fixture
 def clf_data() -> tuple[pd.DataFrame, np.ndarray]:
     rng = np.random.default_rng(0)
-    X = pd.DataFrame(
-        {
-            "age": rng.integers(18, 80, size=20),
-            "city": rng.choice(["SP", "RJ", "BH"], size=20),
-            "score": rng.normal(size=20),
-        }
-    )
+    X = pd.DataFrame({
+        "age": rng.integers(18, 80, size=20),
+        "city": rng.choice(["SP", "RJ", "BH"], size=20),
+        "score": rng.normal(size=20),
+    })
     y = rng.choice(["yes", "no"], size=20)
     return X, y
 
@@ -123,12 +117,10 @@ def reg_data() -> tuple[pd.DataFrame, np.ndarray]:
 @pytest.fixture
 def nan_data() -> pd.DataFrame:
     rng = np.random.default_rng(2)
-    X = pd.DataFrame(
-        {
-            "age": rng.integers(18, 80, size=15).astype(float),
-            "city": rng.choice(["SP", "RJ"], size=15).astype(object),
-        }
-    )
+    X = pd.DataFrame({
+        "age": rng.integers(18, 80, size=15).astype(float),
+        "city": rng.choice(["SP", "RJ"], size=15).astype(object),
+    })
     X.loc[0, "age"] = np.nan
     X.loc[1, "city"] = np.nan
     X.loc[2, "age"] = np.nan

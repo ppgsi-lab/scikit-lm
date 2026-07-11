@@ -15,12 +15,7 @@ import pandas as pd
 import pytest
 from sklearn.base import clone
 
-from sklm import (
-    CheckpointConfig,
-    LanguageModelClassifier,
-    LanguageModelRegressor,
-    TrainingConfig,
-)
+from sklm import CheckpointConfig, LanguageModelClassifier, LanguageModelRegressor, TrainingConfig
 from sklm.core import _split_indices, _strata
 
 from .conftest import FakeBackend

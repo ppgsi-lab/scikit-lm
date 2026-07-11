@@ -31,6 +31,7 @@ from .serialize import (
     KeyValueSerializer,
     PlainNumber,
     Serializer,
+    SpacedDigits,
 )
 
 __all__ = [
@@ -53,6 +54,7 @@ class _HasBackendParams(Protocol):
     training: TrainingConfig
     serializer: str | Serializer
     max_decimals: int | None
+    number_format: Literal["plain", "spaced"]
     random_state: int | None
     callback: Callback | list[Callback] | Literal["auto"] | None
     lora: LoRAConfig | None
@@ -69,20 +71,28 @@ class _Fitted(Protocol):
     feature_cols_: list[str]
 
 
-def resolve_serializer(serializer: str | Serializer, max_decimals: int | None = None) -> Serializer:
+def resolve_serializer(
+    serializer: str | Serializer,
+    max_decimals: int | None = None,
+    number_format: Literal["plain", "spaced"] = "plain",
+) -> Serializer:
     """Resolve a serializer selector or instance to a ``Serializer``.
 
     Parameters
     ----------
     serializer : str or Serializer
-        One of ``"json"``, ``"key-value"``, ``"bracket"`` (all with plain
-        numbers) or a ``Serializer`` instance. For spaced digits or custom
-        delimiters, pass an instance.
+        One of ``"json"``, ``"key-value"``, ``"bracket"``, ``"if-then"`` or a
+        ``Serializer`` instance. For custom delimiters, pass an instance.
     max_decimals : int or None, optional
         Decimal places to round numeric cells to when building from a string
         selector. Ignored when ``serializer`` is already an instance -- that
         carries its own :class:`~sklm.NumberFormat`. Default ``None`` (no
         rounding).
+    number_format : {"plain", "spaced"}, optional
+        Number rendering when building from a string selector: ``"plain"``
+        (default) builds :class:`~sklm.PlainNumber`, ``"spaced"`` builds
+        :class:`~sklm.SpacedDigits` (one token per character). Ignored when
+        ``serializer`` is already an instance.
 
     Returns
     -------
@@ -92,7 +102,7 @@ def resolve_serializer(serializer: str | Serializer, max_decimals: int | None = 
     Raises
     ------
     ValueError
-        If ``serializer`` is an unknown string selector.
+        If ``serializer`` or ``number_format`` is an unknown string selector.
     """
     if isinstance(serializer, str):
         builders = {
@@ -107,7 +117,13 @@ def resolve_serializer(serializer: str | Serializer, max_decimals: int | None = 
                 f"unknown serializer {serializer!r}; pass one of {sorted(builders)} "
                 "or a Serializer instance"
             )
-        return builder(number=PlainNumber(max_decimals=max_decimals))
+        numbers = {"plain": PlainNumber, "spaced": SpacedDigits}
+        number = numbers.get(number_format)
+        if number is None:
+            raise ValueError(
+                f"unknown number_format {number_format!r}; pass one of {sorted(numbers)}"
+            )
+        return builder(number=number(max_decimals=max_decimals))
     return serializer
 
 
@@ -253,7 +269,9 @@ def make_tabular_lm(estimator: _HasBackendParams) -> TabularLanguageModel:
     """
     return TabularLanguageModel(
         backend=resolve_backend(estimator.backend),
-        serializer=resolve_serializer(estimator.serializer, estimator.max_decimals),
+        serializer=resolve_serializer(
+            estimator.serializer, estimator.max_decimals, estimator.number_format
+        ),
         training=estimator.training,
         model=ModelConfig(
             model=estimator.model,

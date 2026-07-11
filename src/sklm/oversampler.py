@@ -62,6 +62,11 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
         serializing. Applies only to the string ``serializer`` selectors; a
         :class:`~sklm.Serializer` instance keeps its own number format.
         Default ``3``.
+    number_format : {"plain", "spaced"}, optional
+        Number rendering for the string ``serializer`` selectors: ``"plain"``
+        (default) builds :class:`~sklm.PlainNumber`, ``"spaced"`` builds
+        :class:`~sklm.SpacedDigits` (one token per character). Ignored when
+        ``serializer`` is an instance.
     random_state : int or None, optional
         Seed forwarded to the backend and serializer.
     callback : Callback, list of Callback, "auto" or None, optional
@@ -134,7 +139,7 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
 
     # imbalanced-learn's stub types the abstract _fit_resample as returning None.
     @override
-    def _fit_resample(self, X: object, y: object) -> tuple[np.ndarray, np.ndarray]:  # type: ignore[reportIncompatibleMethodOverride]
+    def _fit_resample(self, X: object, y: object) -> tuple[np.ndarray, np.ndarray]:  # pyright: ignore[reportIncompatibleMethodOverride]
         """Append synthetic minority rows so each class meets its target count.
 
         Parameters
@@ -208,12 +213,10 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
                     # original int dtype afterwards, which would otherwise truncate.
                     # complete_many types each cell as object; numeric columns decode
                     # to a number, so the cast to float for round() is safe.
-                    synth_rows.append(
-                        [
-                            round(cast(float, out[c])) if c in int_cols else out[c]
-                            for c in feature_cols
-                        ]
-                    )
+                    synth_rows.append([
+                        round(cast(float, out[c])) if c in int_cols else out[c]
+                        for c in feature_cols
+                    ])
                     synth_y.append(label)
                     made += 1
                     cb.on_row_end(done, total)

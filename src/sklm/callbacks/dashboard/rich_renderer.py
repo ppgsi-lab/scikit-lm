@@ -44,13 +44,7 @@ class _LossPlot:
     """
 
     def __init__(
-        self,
-        curve: LossCurve,
-        *,
-        marker: str,
-        train_color: str,
-        eval_color: str,
-        plot_height: int,
+        self, curve: LossCurve, *, marker: str, train_color: str, eval_color: str, plot_height: int
     ) -> None:
         self._curve = curve
         self._marker = marker
@@ -167,11 +161,7 @@ class RichRenderer:
         body.add_column(ratio=3)
         body.add_column(ratio=1, justify="left", vertical="middle")
         body.add_row(plot, self._metrics_grid(metrics, task, speed))
-        blocks: list[RenderableType] = [
-            self._header(header),
-            Text(""),
-            body,
-        ]
+        blocks: list[RenderableType] = [self._header(header), Text(""), body]
         examples = _find(dashboard, ExamplesPanel)
         if examples is not None and examples.texts:
             blocks += [Text(""), self._examples(examples)]

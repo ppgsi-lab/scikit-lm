@@ -331,12 +331,7 @@ def test_imputer_complete_rows_only_restricts_training_to_complete_rows() -> Non
     """``complete_rows_only=True`` trains only on rows without missing cells while
     keeping the ``loss_on_target_only`` masking: ``ctx`` (never missing) is masked
     context and ``a`` (has a NaN) is the supervised target column."""
-    frame = pd.DataFrame(
-        {
-            "ctx": [1.0, 2.0, 3.0, 4.0],
-            "a": [1.0, 2.0, np.nan, 4.0],
-        }
-    )
+    frame = pd.DataFrame({"ctx": [1.0, 2.0, 3.0, 4.0], "a": [1.0, 2.0, np.nan, 4.0]})
 
     fake_all = FakeBackend()
     LanguageModelImputer(

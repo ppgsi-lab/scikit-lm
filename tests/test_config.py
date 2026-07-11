@@ -160,11 +160,7 @@ def test_training_kwargs_cosine_without_floor_stays_cosine() -> None:
 
 
 @pytest.mark.parametrize(
-    "make",
-    [
-        lambda: LRScheduler.cosine(floor=-1e-6),
-        lambda: LRScheduler.linear(floor=-0.5),
-    ],
+    "make", [lambda: LRScheduler.cosine(floor=-1e-6), lambda: LRScheduler.linear(floor=-0.5)]
 )
 def test_decay_scheduler_invalid_floor_raises(make: Callable[[], object]) -> None:
     with pytest.raises(ValueError, match="floor"):
@@ -248,8 +244,7 @@ def test_resolve_quantization_none_stays_none() -> None:
 
 
 @pytest.mark.parametrize(
-    ("bits", "method"),
-    [(4, "bitsandbytes"), (8, "bitsandbytes"), (2, "hqq"), (3, "hqq")],
+    ("bits", "method"), [(4, "bitsandbytes"), (8, "bitsandbytes"), (2, "hqq"), (3, "hqq")]
 )
 def test_hf_method_auto_routes_by_bits(bits: int, method: str) -> None:
     assert _resolve_hf_method(QuantizationConfig(bits=bits)) == method

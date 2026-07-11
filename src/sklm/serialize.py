@@ -216,7 +216,7 @@ class SpacedDigits:
         If set, truncate to this many decimal places before spacing.
     """
 
-    max_decimals: int = 3
+    max_decimals: int | None = 3
 
     def encode(self, value: object) -> str:
         return " ".join(_digits(value, self.max_decimals))

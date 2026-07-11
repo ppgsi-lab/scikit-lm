@@ -341,11 +341,7 @@ class HtmlRenderer:
     def _cards_html(self, cards: StatCards, extra: str = "") -> str:
         body = (
             "".join(
-                self._card_html(
-                    s.label,
-                    f"{s.value}{self._suffix(s.suffix)}",
-                    mono=s.mono,
-                )
+                self._card_html(s.label, f"{s.value}{self._suffix(s.suffix)}", mono=s.mono)
                 for s in cards.cards
             )
             + extra

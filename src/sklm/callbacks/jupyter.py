@@ -12,17 +12,8 @@ from .dashboard import (
     build_predict_dashboard,
 )
 from .dashboard.html_renderer import _JUP_INFO, _JUP_TK_KEY
-from .events import (
-    Event,
-    FitEnd,
-    FitStart,
-    PredictEnd,
-    PredictStart,
-    TrainExamples,
-)
-from .events import (
-    TrainingState as _TrainingState,
-)
+from .events import Event, FitEnd, FitStart, PredictEnd, PredictStart, TrainExamples
+from .events import TrainingState as _TrainingState
 
 __all__ = ["JupyterCallback", "_JUP_TK_KEY"]
 

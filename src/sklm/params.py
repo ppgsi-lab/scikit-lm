@@ -36,13 +36,7 @@ from .config import (
 )
 from .serialize import Serializer
 
-__all__ = [
-    "AnnotatedDefault",
-    "EstimatorArgs",
-    "ImputerArgs",
-    "OversamplerArgs",
-    "RegressorArgs",
-]
+__all__ = ["AnnotatedDefault", "EstimatorArgs", "ImputerArgs", "OversamplerArgs", "RegressorArgs"]
 
 
 class AnnotatedDefault:
@@ -103,6 +97,7 @@ class EstimatorArgs(TypedDict, total=False):
     generation: Annotated[GenerationConfig, AnnotatedDefault(GenerationConfig())]
     serializer: Annotated[str | Serializer, AnnotatedDefault("json")]
     max_decimals: Annotated[int | None, AnnotatedDefault(3)]
+    number_format: Annotated[Literal["plain", "spaced"], AnnotatedDefault("plain")]
     random_state: Annotated[int | None, AnnotatedDefault(None)]
     callback: Annotated[
         Callback | list[Callback] | Literal["auto"] | None, AnnotatedDefault("auto")
@@ -146,6 +141,7 @@ class _FlatParams:
     generation: GenerationConfig
     serializer: str | Serializer
     max_decimals: int | None
+    number_format: Literal["plain", "spaced"]
     random_state: int | None
     callback: Callback | list[Callback] | Literal["auto"] | None
     lora: LoRAConfig | None

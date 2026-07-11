@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import datetime
+import pickle
 from typing import cast
 
 import numpy as np
 import optuna
 import pandas as pd
 import pytest
-from optuna.distributions import BaseDistribution, CategoricalChoiceType, CategoricalDistribution
+from optuna.distributions import (
+    BaseDistribution,
+    CategoricalChoiceType,
+    CategoricalDistribution,
+    FloatDistribution,
+)
 from optuna.pruners import BasePruner, NopPruner
-from optuna.samplers import GridSampler
+from optuna.samplers import GridSampler, TPESampler
 from optuna.study import Study
 from optuna.trial import FrozenTrial, TrialState, create_trial
 from sklearn.base import BaseEstimator, ClassifierMixin, TransformerMixin
@@ -19,7 +25,7 @@ from sklearn.linear_model import LogisticRegression
 
 from sklm.config import CosineLR, LRScheduler
 from sklm.tuning import (
-    LiveLeaderboard,
+    LogCallback,
     PruningSearchCV,
     _reconstruction_error,
     best_trial,
@@ -187,9 +193,10 @@ def test_object_choices_stored_by_repr_and_resolved_fresh() -> None:
         },
         cv=4,
         n_trials=4,
-        sampler=GridSampler(
-            {"sched": [repr(cosine), repr(constant)], "sched__learning_rate": [0.1, 0.2]}
-        ),
+        sampler=GridSampler({
+            "sched": [repr(cosine), repr(constant)],
+            "sched__learning_rate": [0.1, 0.2],
+        }),
         pruner=NopPruner(),
     )
     search.fit(X, y)
@@ -327,6 +334,37 @@ def test_errors_propagate_without_catch() -> None:
     )
     with pytest.raises(RuntimeError, match="generation failed"):
         search.fit(X, y)
+
+
+def test_study_resumes_pickled_search_identically() -> None:
+    X, y = _binary_frame()
+
+    def search(n_trials: int, study: Study | None = None) -> PruningSearchCV:
+        return PruningSearchCV(
+            LogisticRegression(max_iter=200),
+            {"C": FloatDistribution(0.01, 10.0, log=True)},
+            cv=4,
+            scoring="accuracy",
+            n_trials=n_trials,
+            sampler=TPESampler(seed=7),
+            pruner=NopPruner(),
+            refit=False,
+            study=study,
+            random_state=0,
+        )
+
+    uninterrupted = search(6).fit(X, y)
+
+    first = search(4).fit(X, y)
+    resumed_study = pickle.loads(pickle.dumps(first.study_))
+    resumed = search(2, study=resumed_study).fit(X, y)
+
+    assert len(resumed.study_.trials) == 6
+    assert [t.params["C"] for t in resumed.study_.trials] == [
+        t.params["C"] for t in uninterrupted.study_.trials
+    ]
+    # ties in adjusted score break by wall-clock, so compare scores, not params
+    assert resumed.best_score_ == uninterrupted.best_score_
 
 
 def test_refit_false_has_no_best_estimator() -> None:
@@ -568,7 +606,7 @@ def test_cv_results_marks_pruned_trials_nan_and_ranks_them_last() -> None:
     assert ranks[search.best_index_] == 1
 
 
-def test_live_leaderboard_renders_complete_and_pruned(capsys: pytest.CaptureFixture[str]) -> None:
+def test_log_callback_logs_complete_pruned_and_failed(capsys: pytest.CaptureFixture[str]) -> None:
     study = optuna.create_study(direction="maximize")
     dist: dict[str, BaseDistribution] = {"q": CategoricalDistribution([0, 1])}
     study.add_trial(
@@ -582,13 +620,21 @@ def test_live_leaderboard_renders_complete_and_pruned(capsys: pytest.CaptureFixt
     )
     study.add_trial(
         create_trial(
+            state=TrialState.COMPLETE,
+            value=0.5,
+            params={"q": 1},
+            distributions=dist,
+            user_attrs={"mean_test_score": 0.5, "std_test_score": 0.02},
+        )
+    )
+    study.add_trial(
+        create_trial(
             state=TrialState.PRUNED,
             params={"q": 1},
             distributions=dist,
             intermediate_values={0: 0.3},
         )
     )
-
     study.add_trial(
         create_trial(
             state=TrialState.FAIL,
@@ -598,13 +644,29 @@ def test_live_leaderboard_renders_complete_and_pruned(capsys: pytest.CaptureFixt
         )
     )
 
-    LiveLeaderboard(std_penalty=0.5)(study, study.trials[-1])
+    callback = LogCallback(std_penalty=0.5)
+    for trial in study.trials:
+        callback(study, trial)
 
     out = capsys.readouterr().out
-    assert "0.9" in out
-    assert "pruned" in out.lower()
-    assert "failed" in out.lower()
-    assert "generation" in out  # the failed trial's error surfaces in the table
-    assert "params" in out  # one params column, not one column per key
+    assert "mean=0.9000" in out
+    assert "new best" in out  # trial 0 is the best completed trial
+    assert "(best: trial 0" in out  # trial 1 points at it instead
+    assert "pruned@fold 1" in out  # 0-based step 0 renders as fold 1
+    assert "failed" in out
+    assert "generation" in out  # the failed trial's error surfaces in the line
     assert "q=0" in out  # params rendered as leaf=value (completed trial)
     assert "q=1" in out  # and the pruned trial's params too
+
+
+def test_log_callback_on_fold_prints_running_mean(capsys: pytest.CaptureFixture[str]) -> None:
+    study = optuna.create_study(direction="maximize")
+    trial = study.ask()
+    trial.suggest_categorical("q", [0, 1])
+
+    LogCallback().on_fold(study, trial, step=1, n_folds=5, scores=[0.4, 0.6])
+
+    out = capsys.readouterr().out
+    assert "fold 2/5" in out  # 0-based step 1 renders as fold 2 of 5
+    assert "mean=0.5000" in out  # running mean of the folds seen so far
+    assert "score=0.6000" in out  # the fold just finished

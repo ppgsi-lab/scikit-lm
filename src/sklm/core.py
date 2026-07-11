@@ -423,9 +423,7 @@ class TabularLanguageModel(BaseEstimator):
         return generation.inference_batch_size or self.training.batch_size
 
     def _generate_values(
-        self,
-        requests: Sequence[tuple[str, str]],
-        generation: GenerationConfig,
+        self, requests: Sequence[tuple[str, str]], generation: GenerationConfig
     ) -> list[object | None]:
         """Decode one value per ``(prompt, target)`` request, batched with retries.
 
@@ -549,10 +547,7 @@ class TabularLanguageModel(BaseEstimator):
         return [filled[i] if alive[i] else None for i in range(len(knowns))]
 
     def complete(
-        self,
-        known: Mapping[str, object],
-        targets: Sequence[str],
-        generation: GenerationConfig,
+        self, known: Mapping[str, object], targets: Sequence[str], generation: GenerationConfig
     ) -> dict[str, object] | None:
         """Generate each target column in turn, conditioning on prior outputs.
 
@@ -883,14 +878,12 @@ class TabularLanguageModel(BaseEstimator):
                 if multi and len(cols) > 1
                 else [cols]
             )
-            row_prompts.append(
-                [
-                    self.serializer.prefix(
-                        [Field(c, _native(k[c]), c in self.numeric_cols_) for c in order], target
-                    )
-                    for order in orders
-                ]
-            )
+            row_prompts.append([
+                self.serializer.prefix(
+                    [Field(c, _native(k[c]), c in self.numeric_cols_) for c in order], target
+                )
+                for order in orders
+            ])
         pairs_prompt = [p for prompts in row_prompts for p in prompts for _ in encoded]
         pairs_cont = [c for prompts in row_prompts for _ in prompts for c in encoded]
         flat = self._score_pairs(pairs_prompt, pairs_cont, generation)
@@ -909,12 +902,7 @@ class TabularLanguageModel(BaseEstimator):
                 proba[i] = pooled / total if total > 0 else np.full(n_cand, 1.0 / n_cand)
             else:
                 proba[i] = np.mean(dists, axis=0)
-            self.callback.on_score(
-                prompts,
-                candidates,
-                [d.tolist() for d in dists],
-                raw,
-            )
+            self.callback.on_score(prompts, candidates, [d.tolist() for d in dists], raw)
         return proba
 
     def predict_proba(
