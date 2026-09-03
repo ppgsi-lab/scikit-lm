@@ -25,3 +25,8 @@ src/sklm/_version.py
 # Scratch space
 experiments/
 exps/
+benchmark/
+hpo/
+playground/
+.vscode/
+*.log
