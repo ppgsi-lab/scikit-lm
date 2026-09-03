@@ -59,9 +59,11 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
         :class:`~sklm.Serializer`. Default ``"json"``.
     max_decimals : int or None, optional
         Round numeric cells to at most this many decimal places when
-        serializing. Applies only to the string ``serializer`` selectors; a
-        :class:`~sklm.Serializer` instance keeps its own number format.
-        Default ``3``.
+        serializing. An int applies to the string ``serializer`` selectors and
+        to a :class:`~sklm.Serializer` instance alike (the instance's number
+        format is rebuilt to carry it). ``None`` (default) keeps the string
+        selectors' built-in rounding (3 places) and leaves a ``Serializer``
+        instance's own number format untouched.
     number_format : {"plain", "spaced"}, optional
         Number rendering for the string ``serializer`` selectors: ``"plain"``
         (default) builds :class:`~sklm.PlainNumber`, ``"spaced"`` builds
@@ -167,7 +169,7 @@ class LanguageModelOverSampler(_FlatParams, BaseOverSampler):
         ignored = [
             flag
             for flag, on in (
-                ("loss_on_target_only", self.training.loss_on_target_only),
+                ("target_loss_weight", self.training.target_loss_weight is not None),
                 ("target_at_end", self.training.target_at_end),
             )
             if on

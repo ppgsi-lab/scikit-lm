@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import copy
 import importlib.util
 import platform
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import fields as dataclasses_fields
+from dataclasses import is_dataclass, replace
 from typing import Literal, Protocol
 
 import numpy as np
@@ -22,13 +25,14 @@ from .config import (
     QuantizationConfig,
     TrainingConfig,
 )
-from .core import TabularLanguageModel, forget, to_frame
+from .core import TabularLanguageModel, forget, select_candidates, to_frame
 from .hf_backend import HFBackend
 from .serialize import (
     BracketSerializer,
     IfThenSerializer,
     JSONSerializer,
     KeyValueSerializer,
+    NumberFormat,
     PlainNumber,
     Serializer,
     SpacedDigits,
@@ -84,10 +88,11 @@ def resolve_serializer(
         One of ``"json"``, ``"key-value"``, ``"bracket"``, ``"if-then"`` or a
         ``Serializer`` instance. For custom delimiters, pass an instance.
     max_decimals : int or None, optional
-        Decimal places to round numeric cells to when building from a string
-        selector. Ignored when ``serializer`` is already an instance -- that
-        carries its own :class:`~sklm.NumberFormat`. Default ``None`` (no
-        rounding).
+        Decimal places to round numeric cells to. An int applies whether
+        ``serializer`` is a string selector or an instance -- an instance is
+        shallow-copied with its :class:`~sklm.NumberFormat` rebuilt to carry
+        it. ``None`` (default) keeps the string selectors' built-in rounding
+        (3 places) and leaves an instance's own number format untouched.
     number_format : {"plain", "spaced"}, optional
         Number rendering when building from a string selector: ``"plain"``
         (default) builds :class:`~sklm.PlainNumber`, ``"spaced"`` builds
@@ -102,7 +107,9 @@ def resolve_serializer(
     Raises
     ------
     ValueError
-        If ``serializer`` or ``number_format`` is an unknown string selector.
+        If ``serializer`` or ``number_format`` is an unknown string selector,
+        or if ``max_decimals`` is set with a ``Serializer`` instance whose
+        number format cannot be rebuilt to carry it.
     """
     if isinstance(serializer, str):
         builders = {
@@ -123,8 +130,36 @@ def resolve_serializer(
             raise ValueError(
                 f"unknown number_format {number_format!r}; pass one of {sorted(numbers)}"
             )
-        return builder(number=number(max_decimals=max_decimals))
-    return serializer
+        return builder(number=number(max_decimals=3 if max_decimals is None else max_decimals))
+    if max_decimals is None:
+        return serializer
+    return _with_max_decimals(serializer, max_decimals)
+
+
+def _with_max_decimals(serializer: Serializer, max_decimals: int) -> Serializer:
+    """A shallow copy of ``serializer`` whose number format rounds to ``max_decimals``.
+
+    The instance itself is never mutated -- the caller's serializer keeps its
+    own format. Works for any serializer exposing a dataclass ``number``
+    :class:`~sklm.NumberFormat` with a ``max_decimals`` field (all built-ins);
+    anything else raises rather than ignoring the setting silently.
+    """
+    number = getattr(serializer, "number", None)
+    if not (
+        isinstance(number, NumberFormat)
+        and is_dataclass(number)
+        and not isinstance(number, type)
+        and any(f.name == "max_decimals" for f in dataclasses_fields(number))
+    ):
+        raise ValueError(
+            f"max_decimals={max_decimals} cannot be applied to "
+            f"{type(serializer).__name__}: it has no dataclass `number` NumberFormat "
+            "with a max_decimals field to rebuild; set the rounding on the "
+            "serializer's own number format instead"
+        )
+    clone = copy.copy(serializer)
+    setattr(clone, "number", replace(number, max_decimals=max_decimals))  # noqa: B010
+    return clone
 
 
 def resolve_quantization(
@@ -334,64 +369,6 @@ def unique_name(base: str, taken: Sequence[str]) -> str:
     while name in taken_set:
         name += "_"
     return name
-
-
-def _representative(group: np.ndarray, kind: Literal["median", "mode", "mean"]) -> float:
-    """One value standing in for a partition of observed target values.
-
-    ``"median"`` is the lower median and ``"mode"`` the most frequent value
-    (ties broken by the smaller value) -- both real observed values; ``"mean"``
-    is the synthetic arithmetic mean.
-    """
-    if kind == "mean":
-        return float(np.mean(group))
-    if kind == "mode":
-        values, counts = np.unique(group, return_counts=True)
-        return float(values[counts == counts.max()].min())
-    return float(np.percentile(group, 50, method="lower"))
-
-
-def select_candidates(values: np.ndarray, config: DiscretizationConfig) -> list[float]:
-    """Candidate values to score, drawn from a target column's observed values.
-
-    Non-NaN values are partitioned into :meth:`DiscretizationConfig.resolve_k`
-    strata (equal-mass quantiles or equal-width bins, per ``config.strategy``)
-    and one representative is taken from each (``config.representative``). When
-    the requested count reaches the number of distinct values the full sorted
-    support is returned and partitioning is skipped.
-
-    Parameters
-    ----------
-    values : numpy.ndarray
-        Observed values of the target column (may contain NaN, dropped here).
-    config : DiscretizationConfig
-        The active discretization settings; assumed enabled (``bins`` truthy).
-
-    Returns
-    -------
-    list of float
-        Sorted, de-duplicated candidate values.
-
-    Raises
-    ------
-    ValueError
-        If no observed (non-NaN) values remain.
-    """
-    v = np.asarray(values, dtype=float)
-    v = v[~np.isnan(v)]
-    if v.size == 0:
-        raise ValueError("discretization target has no observed (non-NaN) values")
-    unique = np.unique(v)
-    k = config.resolve_k(unique.size)
-    if k >= unique.size:
-        return [float(x) for x in unique]
-    if config.strategy == "quantile":
-        labels = np.asarray(pd.qcut(v, q=k, duplicates="drop", labels=False))
-    else:
-        edges = np.linspace(v.min(), v.max(), k + 1)
-        labels = np.clip(np.digitize(v, edges[1:-1]), 0, k - 1)
-    reps = {_representative(v[labels == lbl], config.representative) for lbl in np.unique(labels)}
-    return sorted(reps)
 
 
 def reduce_estimate(

@@ -31,6 +31,7 @@ from sklm import (
     LoggingCallback,
     Serializer,
     TrainingConfig,
+    ValueConstraint,
 )
 
 from .conftest import FakeBackend, MakeEstimator
@@ -230,6 +231,52 @@ def test_imputer_fills_all_nans_and_preserves_observed(make: MakeEstimator, nan_
     )
 
 
+class _FillAwareBackend(FakeBackend):
+    """Prefers ``"b"`` exactly when the prompt carries the generated ``7.5`` fill."""
+
+    def score(self, prompts, continuations, *, reduce="mean"):
+        self.score_batches.append(len(prompts))
+        return [
+            1.0 if ('"b"' in cont) == ("7.5" in prompt) else -1.0
+            for prompt, cont in zip(prompts, continuations, strict=True)
+        ]
+
+
+_TWO_MISSING = pd.DataFrame({
+    "cat": ["a", "b", "a", "b", None],
+    "num": [3.0, 4.0, 3.5, 4.5, np.nan],
+    "x": [1.0, 2.0, 1.5, 2.5, 5.0],
+})
+
+
+def test_imputer_chain_follows_column_order() -> None:
+    # `cat` sits first in column order, so the chained pass scores it before `num`
+    # exists and never sees the generated `num`: "a" proves the sibling came later in
+    # the chain. A column_order that puts `num` first makes `cat` condition on it and flip.
+    imputer = LanguageModelImputer(backend=_FillAwareBackend(value="7.5")).fit(_TWO_MISSING)
+    out = imputer.transform(_TWO_MISSING)
+    assert isinstance(out, pd.DataFrame)
+    assert out.loc[4, "num"] == 7.5
+    assert out.loc[4, "cat"] == "a"
+
+    num_first = GenerationConfig(column_order=["num", "x", "cat"])
+    flipped = imputer.transform(_TWO_MISSING, generation=num_first)
+    assert isinstance(flipped, pd.DataFrame)
+    assert flipped.loc[4, "num"] == 7.5
+    assert flipped.loc[4, "cat"] == "b"
+
+
+def test_imputer_observed_context_ignores_prior_fills() -> None:
+    # Same order that flips `cat` under the chain: with cell_context="observed" the
+    # `num` fill never enters `cat`'s prompt, so `cat` stays "a".
+    imputer = LanguageModelImputer(backend=_FillAwareBackend(value="7.5")).fit(_TWO_MISSING)
+    num_first = GenerationConfig(column_order=["num", "x", "cat"], cell_context="observed")
+    out = imputer.transform(_TWO_MISSING, generation=num_first)
+    assert isinstance(out, pd.DataFrame)
+    assert out.loc[4, "num"] == 7.5
+    assert out.loc[4, "cat"] == "a"
+
+
 def test_imputer_get_feature_names_out(nan_data) -> None:
     imp = LanguageModelImputer(backend=FakeBackend()).fit(nan_data)
     np.testing.assert_array_equal(imp.get_feature_names_out(), np.asarray(nan_data.columns))
@@ -248,13 +295,20 @@ class _RecordingImputeBackend(FakeBackend):
     """Record the prompts ``generate`` sees, to observe which cells condition each
     imputation."""
 
-    def __init__(self) -> None:
-        super().__init__(value='"z"')  # JSON-quoted: decodable as the categorical "z"
+    def __init__(self, value: str = '"z"') -> None:  # JSON-quoted: the categorical "z"
+        super().__init__(value=value)
         self.prompts: list[str] = []
 
-    def generate(self, prompts: Sequence[str], generation: object) -> list[str]:
+    def generate(
+        self,
+        prompts: Sequence[str],
+        generation: object,
+        *,
+        constraint: object = None,
+        random_state: int | None = None,
+    ) -> list[str]:
         self.prompts.extend(prompts)
-        return super().generate(prompts, generation)
+        return super().generate(prompts, generation, random_state=random_state)
 
 
 def test_imputer_transform_aligns_reordered_columns_by_name() -> None:
@@ -276,6 +330,43 @@ def test_imputer_transform_aligns_reordered_columns_by_name() -> None:
     assert isinstance(out, pd.DataFrame)
     assert list(out.columns) == ["b", "a"]
     assert rec2.prompts == rec1.prompts
+
+
+_TWO_NUMERIC_MISSING = pd.DataFrame({
+    "a": [1.0, 2.0, np.nan],
+    "b": [3.0, 4.0, np.nan],
+    "x": [5.0, 6.0, 7.0],
+})
+
+
+def test_imputer_cell_context_applies_without_scored_columns() -> None:
+    # All-numeric frame with bins=0: nothing is scored, yet cell_context still governs
+    # the generated cells. Chained: `b` conditions on the `a` fill; observed: never.
+    chained = _RecordingImputeBackend(value="7.5")
+    LanguageModelImputer(backend=chained).fit(_TWO_NUMERIC_MISSING).transform(_TWO_NUMERIC_MISSING)
+    assert any('"a": 7.5' in prompt for prompt in chained.prompts)
+
+    observed = _RecordingImputeBackend(value="7.5")
+    imputer = LanguageModelImputer(backend=observed).fit(_TWO_NUMERIC_MISSING)
+    imputer.transform(_TWO_NUMERIC_MISSING, generation=GenerationConfig(cell_context="observed"))
+    assert not any("7.5" in prompt for prompt in observed.prompts)
+
+
+def test_imputer_chained_fill_respects_observed_decimals() -> None:
+    # `a`'s observed values carry one decimal place, so the generated fill (an
+    # aggregate whose repr can carry many) is rounded to one decimal before it is
+    # stored -- the chained prompt for `b` must condition on `7.8`, never on a
+    # full-precision mean the training text could not contain.
+    backend = _RecordingImputeBackend(value="7.849")
+    out = (
+        LanguageModelImputer(backend=backend)
+        .fit(_TWO_NUMERIC_MISSING)
+        .transform(_TWO_NUMERIC_MISSING)
+    )
+    assert not any("7.849" in prompt for prompt in backend.prompts)
+    assert any('"a": 7.8,' in prompt for prompt in backend.prompts)
+    assert isinstance(out, pd.DataFrame)
+    assert out.loc[2, "a"] == 7.8
 
 
 def test_imputer_accepts_custom_serializer(nan_data) -> None:
@@ -301,6 +392,16 @@ def test_imputer_accepts_custom_serializer(nan_data) -> None:
             prompt = self.prefix(context, target[0].name)
             return prompt, full[len(prompt) :]
 
+        def value_spans(self, fields: Sequence[Field]) -> tuple[tuple[int, int], ...]:
+            spans: list[tuple[int, int]] = []
+            pos = 0
+            for f in fields:
+                start = pos + len(f"{f.name}=")
+                end = start + len(self.encode_value(f.value, numeric=f.numeric))
+                spans.append((start, end))
+                pos = end + 1  # "|"
+            return tuple(spans)
+
         def decode_value(self, text: str, *, numeric: bool) -> object | None:
             token = text.strip().split("|")[0]
             if numeric:
@@ -309,6 +410,9 @@ def test_imputer_accepts_custom_serializer(nan_data) -> None:
                 except ValueError:
                     return None
             return token
+
+        def numeric_constraint(self) -> ValueConstraint:
+            return ValueConstraint(frozenset("0123456789+-.e "), ("|",))
 
     out = LanguageModelImputer(
         backend=FakeBackend(value="0"), serializer=KVSerializer()
@@ -329,20 +433,20 @@ def test_imputer_accepts_builtin_non_json_serializers(serializer: Serializer, na
 
 def test_imputer_complete_rows_only_restricts_training_to_complete_rows() -> None:
     """``complete_rows_only=True`` trains only on rows without missing cells while
-    keeping the ``loss_on_target_only`` masking: ``ctx`` (never missing) is masked
+    keeping the ``target_loss_weight`` masking: ``ctx`` (never missing) is masked
     context and ``a`` (has a NaN) is the supervised target column."""
     frame = pd.DataFrame({"ctx": [1.0, 2.0, 3.0, 4.0], "a": [1.0, 2.0, np.nan, 4.0]})
 
     fake_all = FakeBackend()
     LanguageModelImputer(
         backend=fake_all,
-        training=TrainingConfig(epochs=1, augmentation_factor=1, loss_on_target_only=True),
+        training=TrainingConfig(epochs=1, augmentation_factor=1, target_loss_weight=1.0),
     ).fit(frame)
 
     fake_complete = FakeBackend()
     LanguageModelImputer(
         backend=fake_complete,
-        training=TrainingConfig(epochs=1, augmentation_factor=1, loss_on_target_only=True),
+        training=TrainingConfig(epochs=1, augmentation_factor=1, target_loss_weight=1.0),
         complete_rows_only=True,
     ).fit(frame)
 
@@ -414,10 +518,10 @@ def test_oversampler_raises_when_generation_stays_malformed(imbalanced_data) -> 
         over.fit_resample(X, y)
 
 
-def test_oversampler_warns_on_loss_on_target_only(imbalanced_data) -> None:
+def test_oversampler_warns_on_target_loss_weight(imbalanced_data) -> None:
     X, y = imbalanced_data
     over = LanguageModelOverSampler(
-        backend=FakeBackend(value="0"), training=TrainingConfig(loss_on_target_only=True, epochs=1)
+        backend=FakeBackend(value="0"), training=TrainingConfig(target_loss_weight=1.0, epochs=1)
     )
     with pytest.warns(RuntimeWarning, match="oversampler"):
         over.fit_resample(X, y)

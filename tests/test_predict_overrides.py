@@ -79,7 +79,7 @@ def test_classifier_predict_proba_generation_override_used_and_preserved(clf_dat
     clf = LanguageModelClassifier(backend=fake).fit(X, y)
 
     clf.predict_proba(X, generation=GenerationConfig(inference_batch_size=1))
-    assert max(fake.score_batches) == 1  # the override's batch size was used
+    assert max(fake.score_batches) == len(clf.classes_)  # one row per call: the override was used
     assert clf.generation.inference_batch_size is None  # estimator attribute untouched
 
 
@@ -89,7 +89,7 @@ def test_classifier_predict_forwards_generation_override(clf_data) -> None:
     clf = LanguageModelClassifier(backend=fake).fit(X, y)
 
     clf.predict(X, generation=GenerationConfig(inference_batch_size=1))
-    assert max(fake.score_batches) == 1  # predict forwarded the override to predict_proba
+    assert max(fake.score_batches) == len(clf.classes_)  # one row per call: override forwarded
 
 
 def test_classifier_predict_proba_override_is_batch_invariant(clf_data) -> None:
@@ -121,5 +121,6 @@ def test_imputer_transform_generation_override_controls_n_samples() -> None:
     imp = LanguageModelImputer(backend=fake).fit(frame)  # all-generative (numeric)
 
     imp.transform(frame, generation=GenerationConfig(n_samples=4))
-    assert sum(fake.generate_batches) == 2 * 4  # two missing cells, four draws each
+    # two missing cells, four draws each
+    assert sum(fake.generate_batches) == 2 * 4
     assert imp.generation.n_samples == 1  # estimator attribute untouched

@@ -96,7 +96,7 @@ class EstimatorArgs(TypedDict, total=False):
     training: Annotated[TrainingConfig, AnnotatedDefault(TrainingConfig())]
     generation: Annotated[GenerationConfig, AnnotatedDefault(GenerationConfig())]
     serializer: Annotated[str | Serializer, AnnotatedDefault("json")]
-    max_decimals: Annotated[int | None, AnnotatedDefault(3)]
+    max_decimals: Annotated[int | None, AnnotatedDefault(None)]
     number_format: Annotated[Literal["plain", "spaced"], AnnotatedDefault("plain")]
     random_state: Annotated[int | None, AnnotatedDefault(None)]
     callback: Annotated[

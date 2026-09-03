@@ -45,6 +45,7 @@ from .classifier import LanguageModelClassifier
 from .config import (
     CheckpointConfig,
     DiscretizationConfig,
+    EvalConfig,
     GenerationConfig,
     LoRAConfig,
     LRScheduler,
@@ -70,10 +71,12 @@ from .serialize import (
     JSONSerializer,
     KeyValueSerializer,
     NumberFormat,
+    NumericSpan,
     PlainNumber,
     Serializer,
     SpacedDigits,
     TrainingExample,
+    ValueConstraint,
 )
 from .synthesizer import LanguageModelSynthesizer
 
@@ -86,6 +89,7 @@ __all__ = [
     "CompositeCallback",
     "DiscretizationConfig",
     "EstimatorArgs",
+    "EvalConfig",
     "EvalReport",
     "Event",
     "Field",
@@ -113,6 +117,7 @@ __all__ = [
     "Memory",
     "ModelConfig",
     "NumberFormat",
+    "NumericSpan",
     "Optimizer",
     "OversamplerArgs",
     "PlainNumber",
@@ -135,6 +140,7 @@ __all__ = [
     "TrainingConfig",
     "TrainingExample",
     "TrainingState",
+    "ValueConstraint",
     "aggregate_default",
 ]
 

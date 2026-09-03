@@ -1,12 +1,15 @@
 """Language-model imputer.
 
 Fits on the data as-is (missing cells are simply dropped from each row's
-serialization), then fills every NaN by conditioning on that row's observed
-cells. Categorical cells are scored over their observed levels (the most likely
-one); numeric cells are generated, or scored under ``discretization``. A row
-whose *generated* cells stay malformed raises rather than falling back to a
-baseline, so a model that cannot generate valid values never masquerades as a
-working imputer.
+serialization), then fills every NaN in one pass: each cell conditions on the
+row's observed cells -- plus, under ``generation.cell_context="chained"``, the
+cells already filled, in ``generation.column_order`` when set (else column
+order), so a cell never conditions on a fill that comes after it; under
+``"observed"`` the row's cells are imputed independently. Categorical cells are scored over
+their observed levels (the most likely one); numeric cells are generated, or
+scored under ``discretization``. A row whose *generated* cells stay malformed
+raises rather than falling back to a baseline, so a model that cannot generate
+valid values never masquerades as a working imputer.
 """
 
 from __future__ import annotations
@@ -35,7 +38,7 @@ from .base import (
 from .bridge import Model
 from .callbacks import predict_batches
 from .config import DiscretizationConfig, GenerationConfig
-from .core import _ScoreSpec
+from .core import _column_order, _ScoreSpec
 from .params import AnnotatedDefault, ImputerArgs, _FlatParams
 from .serialize import is_missing
 
@@ -48,7 +51,14 @@ def _argmax_level(proba_row: np.ndarray, candidates: Sequence[object]) -> object
 
 
 class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, BaseEstimator):
-    """Fill missing values by conditioning a language model on observed cells.
+    """Fill missing values by conditioning a language model on the rest of the row.
+
+    Imputation is multivariate: one pass fills the row's missing cells in
+    ``generation.column_order`` (else column order), each conditioning on the
+    observed cells -- plus, under ``generation.cell_context="chained"``, the
+    cells already filled (most confident first under
+    ``generation.cell_order="confidence"``) and never a fill that comes after
+    it; under ``"observed"`` each cell conditions on the observed cells alone.
 
     Parameters
     ----------
@@ -83,16 +93,18 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
     complete_rows_only : bool, optional
         When ``True``, fine-tune only on rows with no missing cells; any row with a
         missing value is excluded from training. ``target_cols`` and the
-        ``loss_on_target_only`` masking are still derived from the full table, so
+        ``target_loss_weight`` weighting are still derived from the full table, so
         only the training-row population changes. Default ``False``.
     serializer : str or Serializer, optional
         ``"json"``, ``"key-value"``, ``"bracket"``, or a custom
         :class:`~sklm.Serializer`. Default ``"json"``.
     max_decimals : int or None, optional
         Round numeric cells to at most this many decimal places when
-        serializing. Applies only to the string ``serializer`` selectors; a
-        :class:`~sklm.Serializer` instance keeps its own number format.
-        Default ``3``.
+        serializing. An int applies to the string ``serializer`` selectors and
+        to a :class:`~sklm.Serializer` instance alike (the instance's number
+        format is rebuilt to carry it). ``None`` (default) keeps the string
+        selectors' built-in rounding (3 places) and leaves a ``Serializer``
+        instance's own number format untouched.
     number_format : {"plain", "spaced"}, optional
         Number rendering for the string ``serializer`` selectors: ``"plain"``
         (default) builds :class:`~sklm.PlainNumber`, ``"spaced"`` builds
@@ -251,7 +263,9 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
         cb = self.lm_.callback
         rows = records(work)
         knowns = [{c: row[c] for c in self.feature_cols_ if not is_missing(row[c])} for row in rows]
-        targets = [[c for c in self.feature_cols_ if is_missing(row[c])] for row in rows]
+        order = _column_order(generation, self.lm_.columns_)
+        chain = self.feature_cols_ if order is None else order
+        targets = [[c for c in chain if is_missing(row[c])] for row in rows]
         batch_size = generation.inference_batch_size or self.training.batch_size
         scored = resolve_discretization(discretization, self.lm_.numeric_cols_)
         score: dict[str, _ScoreSpec] = {
@@ -266,20 +280,14 @@ class LanguageModelImputer(_FlatParams, OneToOneFeatureMixin, TransformerMixin, 
             if levels:  # a fully-unobserved categorical has no levels to score -> generate
                 score[col] = _ScoreSpec(levels, _argmax_level)
         for start, stop in predict_batches(cb, len(rows), batch_size):
-            if score:
-                filled = self.lm_.impute_many(
-                    knowns[start:stop],
-                    targets[start:stop],
-                    generation,
-                    score=score,
-                    row_ids=range(start, stop),
-                )
-            else:
-                filled = self.lm_.sample_aggregate_many(
-                    knowns[start:stop], targets[start:stop], generation, row_ids=range(start, stop)
-                )
-            for j, i in enumerate(range(start, stop)):
-                row = filled[j]
+            filled = self.lm_.impute_many(
+                knowns[start:stop],
+                targets[start:stop],
+                generation,
+                score=score,
+                row_ids=range(start, stop),
+            )
+            for i, row in zip(range(start, stop), filled, strict=True):
                 if row is None:
                     raise RuntimeError(
                         f"generation failed for column(s) {targets[i]} at row {i} after "

@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from sklm import GenerationConfig, TrainingConfig
+from sklm import GenerationConfig, TrainingConfig, ValueConstraint
 from sklm.backend import LanguageModelBackend
 
 
@@ -50,6 +50,8 @@ class FakeBackend:
         self.last_eval_examples: list | None = None
         self.generate_batches: list[int] = []
         self.score_batches: list[int] = []
+        self.last_constraints: list[ValueConstraint | None] = []
+        self.generate_random_states: list[int | None] = []
 
     def fit(
         self,
@@ -68,8 +70,17 @@ class FakeBackend:
         self.last_epoch_texts = [ex.text for ex in examples]
         self.last_eval_examples = eval_examples
 
-    def generate(self, prompts: Sequence[str], generation: object) -> list[str]:
+    def generate(
+        self,
+        prompts: Sequence[str],
+        generation: object,
+        *,
+        constraint: ValueConstraint | None = None,
+        random_state: int | None = None,
+    ) -> list[str]:
         self.generate_batches.append(len(prompts))
+        self.last_constraints.append(constraint)
+        self.generate_random_states.append(random_state)
         return [self.value for _ in prompts]
 
     def score(

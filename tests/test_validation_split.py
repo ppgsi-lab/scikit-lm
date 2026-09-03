@@ -15,7 +15,14 @@ import pandas as pd
 import pytest
 from sklearn.base import clone
 
-from sklm import CheckpointConfig, LanguageModelClassifier, LanguageModelRegressor, TrainingConfig
+from sklm import (
+    CheckpointConfig,
+    EvalConfig,
+    LanguageModelClassifier,
+    LanguageModelRegressor,
+    TrainingConfig,
+)
+from sklm.backend import EarlyStopping
 from sklm.core import _split_indices, _strata
 
 from .conftest import FakeBackend
@@ -23,11 +30,37 @@ from .conftest import FakeBackend
 # --- config validation ----------------------------------------------------
 
 
-def test_validation_split_out_of_range_raises() -> None:
-    with pytest.raises(ValueError, match="validation_split"):
-        TrainingConfig(validation_split=1.0)
-    with pytest.raises(ValueError, match="validation_split"):
-        TrainingConfig(validation_split=-0.1)
+def test_eval_config_defaults() -> None:
+    ev = EvalConfig()
+    assert (ev.split, ev.stratify, ev.each, ev.on, ev.patience) == (0.1, True, 1, "epoch", 5)
+
+
+@pytest.mark.parametrize("split", [0.0, 1.0, -0.1])
+def test_eval_split_must_be_a_proper_fraction(split: float) -> None:
+    with pytest.raises(ValueError, match="split"):
+        EvalConfig(split=split)
+
+
+def test_eval_each_must_be_positive() -> None:
+    with pytest.raises(ValueError, match="each"):
+        EvalConfig(each=0)
+
+
+def test_eval_patience_must_be_positive_or_none() -> None:
+    with pytest.raises(ValueError, match="patience"):
+        EvalConfig(patience=0)
+    assert EvalConfig(patience=None).patience is None
+
+
+def test_eval_nested_set_params_recurses() -> None:
+    clf = LanguageModelClassifier(training=TrainingConfig(evaluation=EvalConfig(each=2, on="step")))
+    clf.set_params(training__evaluation__patience=9)
+    ev = clf.training.evaluation
+    assert ev is not None and (ev.patience, ev.each, ev.on) == (9, 2, "step")
+    cloned = clone(clf)
+    assert isinstance(cloned, LanguageModelClassifier)
+    cloned_ev = cloned.training.evaluation
+    assert cloned_ev is not None and cloned_ev.on == "step"
 
 
 def test_checkpoint_config_defaults() -> None:
@@ -62,14 +95,30 @@ def test_checkpoint_nested_set_params_recurses() -> None:
     assert cloned_ckpt is not None and cloned_ckpt.on == "epoch"
 
 
-def test_early_stopping_requires_validation_split() -> None:
-    with pytest.raises(ValueError, match="validation_split > 0"):
-        TrainingConfig(early_stopping_patience=3)
+# --- early stopping -------------------------------------------------------
 
 
-def test_early_stopping_with_split_is_valid() -> None:
-    cfg = TrainingConfig(validation_split=0.2, early_stopping_patience=3)
-    assert cfg.early_stopping_patience == 3
+def test_early_stopping_exhausts_after_patience_misses() -> None:
+    stopping = EarlyStopping(patience=2)
+    verdicts = [stopping.observe(loss) for loss in [0.9, 0.5, 0.6, 0.7]]
+    assert verdicts == ["improved", "improved", "no_improvement", "exhausted"]
+    assert (stopping.best, stopping.streak) == (0.5, 2)
+
+
+def test_early_stopping_improvement_resets_streak() -> None:
+    stopping = EarlyStopping(patience=2)
+    verdicts = [stopping.observe(loss) for loss in [0.9, 0.9, 0.4, 0.5]]
+    assert verdicts == ["improved", "no_improvement", "improved", "no_improvement"]
+
+
+def test_early_stopping_without_patience_never_exhausts() -> None:
+    stopping = EarlyStopping(patience=None)
+    assert [stopping.observe(1.0) for _ in range(5)][1:] == ["no_improvement"] * 4
+
+
+def test_early_stopping_resumes_from_seeded_trackers() -> None:
+    stopping = EarlyStopping(patience=3, best=0.5, streak=2)
+    assert stopping.observe(0.6) == "exhausted"
 
 
 # --- stratification key ----------------------------------------------------
@@ -146,7 +195,7 @@ def test_fit_holds_out_eval_examples(clf_data) -> None:
     clf = LanguageModelClassifier(
         model="m",
         backend=fake,
-        training=TrainingConfig(epochs=1, validation_split=0.25),
+        training=TrainingConfig(epochs=1, evaluation=EvalConfig(split=0.25), augmentation_factor=1),
         random_state=0,
     )
     clf.fit(X, y)
@@ -159,7 +208,10 @@ def test_fit_without_split_passes_no_eval(clf_data) -> None:
     X, y = clf_data
     fake = FakeBackend()
     clf = LanguageModelClassifier(
-        model="m", backend=fake, training=TrainingConfig(epochs=1), random_state=0
+        model="m",
+        backend=fake,
+        training=TrainingConfig(epochs=1, evaluation=None, augmentation_factor=1),
+        random_state=0,
     )
     clf.fit(X, y)
     assert fake.last_eval_examples is None
@@ -174,7 +226,11 @@ def test_fit_eval_examples_single_permutation_per_row(reg_data) -> None:
         model="m",
         backend=fake,
         training=TrainingConfig(
-            epochs=1, validation_split=0.25, augmentation_factor=4, stratify=False
+            epochs=1,
+            evaluation=EvalConfig(split=0.25, stratify=False),
+            augmentation_factor=4,
+            # the target must permute with the rest for 3 columns to reach 4 orders
+            target_loss_weight=None,
         ),
         random_state=0,
     )

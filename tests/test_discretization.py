@@ -237,7 +237,9 @@ def test_regressor_discretized_scores_every_candidate_within_batch_cap(reg_data)
     reg.predict(X)
     candidates = select_candidates(reg.target_values_, reg.discretization)
     assert sum(fake.score_batches) == len(X) * len(candidates)
-    assert max(fake.score_batches) <= 8
+    # 8 rows per call, each row's candidate set whole (never split across calls)
+    assert max(fake.score_batches) <= 8 * len(candidates)
+    assert all(b % len(candidates) == 0 for b in fake.score_batches)
 
 
 def test_regressor_set_params_addresses_nested_discretization() -> None:
@@ -350,7 +352,8 @@ def test_imputer_discretized_scores_within_batch_cap() -> None:
         generation=GenerationConfig(inference_batch_size=8),
     ).fit_transform(X)
     assert sum(fake.score_batches) == 4 * 4  # 4 missing rows x 4 candidates
-    assert max(fake.score_batches) <= 8
+    assert max(fake.score_batches) <= 8 * 4  # up to 8 rows per call, candidate sets whole
+    assert all(b % 4 == 0 for b in fake.score_batches)
     assert not fake.generate_batches  # "c" fully observed
 
 

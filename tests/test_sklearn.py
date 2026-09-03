@@ -194,7 +194,7 @@ def _learn_reg() -> LanguageModelRegressor:
         random_state=0,
         callback=[],
         training=TrainingConfig(
-            epochs=10, batch_size=8, loss_on_target_only=True, augmentation_factor=16
+            epochs=10, batch_size=8, target_loss_weight=1.0, augmentation_factor=16
         ),
         discretization=DiscretizationConfig(bins=64),
     )
