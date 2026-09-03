@@ -24,7 +24,11 @@ class JupyterCallback(Callback):
     Requires the ``jupyter`` extra (``pip install scikit-lm[jupyter]``), which
     pulls in ``ipywidgets`` for the live container; the loss curve is drawn as an
     inline SVG, so it needs no plotting library. Fine-tuning shows a header with a
-    status badge, a row of stat cards (train loss, val loss, learning rate, step),
+    status badge, a row of stat cards (train loss, val loss, learning rate, step,
+    and -- once validation is on and the first eval has landed -- how many evals
+    have passed since the best validation loss, over the
+    ``EvalConfig.patience`` budget, noting that best and the epoch it was
+    reached at),
     a bordered panel pairing
     the train-loss curve with the run's hyperparameters, and -- when
     ``n_train_examples`` is set -- the latest serialized training rows.

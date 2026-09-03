@@ -341,7 +341,9 @@ class HtmlRenderer:
     def _cards_html(self, cards: StatCards, extra: str = "") -> str:
         body = (
             "".join(
-                self._card_html(s.label, f"{s.value}{self._suffix(s.suffix)}", mono=s.mono)
+                self._card_html(
+                    s.label, f"{s.value}{self._suffix(s.suffix)}", note=s.note, mono=s.mono
+                )
                 for s in cards.cards
             )
             + extra
@@ -356,12 +358,19 @@ class HtmlRenderer:
             return ""
         return f'<span style="font-size:14px;color:{_JUP_DIM}">{suffix}</span>'
 
-    def _card_html(self, label: str, value: str, *, mono: bool = False) -> str:
+    def _card_html(
+        self, label: str, value: str, *, note: str | None = None, mono: bool = False
+    ) -> str:
         font = f";font-family:{_JUP_MONO}" if mono else ""
+        foot = (
+            ""
+            if note is None
+            else f'<div style="font-size:11.5px;color:{_JUP_DIM};margin-top:4px">{note}</div>'
+        )
         return (
             f'<div style="background:{_JUP_CARD};border-radius:10px;padding:14px 16px">'
             f'<div style="font-size:13px;color:{_JUP_DIM};margin-bottom:4px">{label}</div>'
-            f'<div style="font-size:24px;font-weight:500{font}">{value}</div></div>'
+            f'<div style="font-size:24px;font-weight:500{font}">{value}</div>{foot}</div>'
         )
 
     def _retry_card_html(self, predictions: Predictions) -> str:
@@ -372,7 +381,7 @@ class HtmlRenderer:
 
     def _score_cards_html(self, cards: StatCards, predictions: Predictions, extra: str = "") -> str:
         body = "".join(
-            self._card_html(s.label, f"{s.value}{self._suffix(s.suffix)}", mono=s.mono)
+            self._card_html(s.label, f"{s.value}{self._suffix(s.suffix)}", note=s.note, mono=s.mono)
             for s in cards.cards
         )
         body += self._bins_card_html(predictions) + extra

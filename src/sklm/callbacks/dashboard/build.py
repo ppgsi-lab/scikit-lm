@@ -146,14 +146,39 @@ def _header(state: TrainingState, dash: DashboardState) -> Header:
     return Header(title, sub, _badge(state.phase))
 
 
+def _early_stop_card(state: TrainingState) -> Stat | None:
+    """The early-stopping card, or ``None`` until the first validation report.
+
+    Headlines the patience counter -- evals since the best validation loss, over
+    the budget that ends the run -- with the best loss itself as the note. Without
+    a patience budget there is nothing to count down, so the best becomes the
+    headline instead. The epoch is the one the best was reached at; the counter is
+    in evals, not epochs, because a step-cadence ``EvalConfig`` evaluates more
+    often than once an epoch.
+    """
+    if state.best_eval is None:
+        return None
+    epoch = f"ep {state.best_eval_epoch:.0f}" if state.best_eval_epoch is not None else None
+    evaluation = state.training.evaluation if state.training is not None else None
+    patience = evaluation.patience if evaluation is not None else None
+    if patience is None:
+        return Stat("best val", _metric(state.best_eval), note=epoch)
+    note = " · ".join(part for part in (f"best {_metric(state.best_eval)}", epoch) if part)
+    return Stat("patience", f"{state.evals_since_best} / {patience}", note=note)
+
+
 def _fit_cards(state: TrainingState, dash: DashboardState) -> StatCards:
     lr = _sci(state.learning_rate) if state.learning_rate is not None else "—"
-    return StatCards([
+    cards = [
         Stat("train loss", _metric(state.loss)),
         Stat("val loss", _metric(state.eval_loss)),
         Stat("learning rate", lr, mono=True),
         _step_stat("step", dash),
-    ])
+    ]
+    early_stop = _early_stop_card(state)
+    if early_stop is not None:
+        cards.append(early_stop)
+    return StatCards(cards)
 
 
 def _loss_curve(state: TrainingState) -> LossCurve:
@@ -202,8 +227,8 @@ def _hyperparameters(state: TrainingState, dash: DashboardState) -> KeyValues:
         rows.append(KeyValue("seq length", str(t.max_seq_length or "auto")))
         if t.augmentation_factor > 1:
             rows.append(KeyValue("augmentation", f"×{t.augmentation_factor}"))
-        if t.validation_split > 0:
-            rows.append(KeyValue("validation", f"{t.validation_split:g}"))
+        if t.evaluation is not None:
+            rows.append(KeyValue("validation", f"{t.evaluation.split:g}"))
     elapsed = eta = None
     if dash.t0 is not None:
         elapsed = _clock(monotonic() - dash.t0)

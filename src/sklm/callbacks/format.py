@@ -45,10 +45,10 @@ def _format_params(training: TrainingConfig) -> str:
     ]
     if training.augmentation_factor > 1:
         parts.append(f"aug={training.augmentation_factor}")
-    if training.validation_split > 0:
-        parts.append(f"val={training.validation_split:g}")
-    if training.loss_on_target_only:
-        parts.append("target-only")
+    if training.evaluation is not None:
+        parts.append(f"val={training.evaluation.split:g}")
+    if training.target_loss_weight is not None:
+        parts.append(f"target-weight={training.target_loss_weight:g}")
     elif training.target_at_end:
         parts.append("target-last")
     return " · ".join(parts)

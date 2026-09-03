@@ -2,11 +2,14 @@
 
 A single :class:`RecordingCallback` observes the event stream through the public
 estimator API; concrete dashboards (logging / tqdm / rich / jupyter) are only
-smoke-checked to run end-to-end, never asserted on their rendered output.
+smoke-checked to run end-to-end, never asserted on their rendered output. What
+they derive on top of the event stream is asserted one level down, on the
+renderer-agnostic widget tree.
 """
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Sequence
 from typing import override
 
@@ -17,6 +20,7 @@ from sklearn.base import clone
 from sklm import (
     Callback,
     CompositeCallback,
+    EvalConfig,
     Event,
     FitEnd,
     FitStart,
@@ -33,9 +37,12 @@ from sklm import (
     Score,
     TqdmCallback,
     TrainExamples,
+    TrainingConfig,
     TrainingState,
 )
 from sklm.callbacks import resolve_callback
+from sklm.callbacks.dashboard import DashboardState, RenderConfig, build_fit_dashboard
+from sklm.callbacks.dashboard.widgets import Stat, StatCards
 
 from .conftest import FakeBackend
 
@@ -83,7 +90,12 @@ class RecordingCallback(Callback):
 
 def test_lifecycle_event_order(nan_data: pd.DataFrame) -> None:
     rec = RecordingCallback()
-    imp = LanguageModelImputer(backend=FakeBackend(value="0"), callback=rec)
+    imp = LanguageModelImputer(
+        backend=FakeBackend(value="0"),
+        callback=rec,
+        # no hold-out, so fit_start reports the whole frame
+        training=TrainingConfig(evaluation=None),
+    )
     imp.fit(nan_data)
     assert rec.names() == ["fit_start", "train_examples", "fit_end"]
     assert rec.events[0] == ("fit_start", (len(nan_data), imp.training.epochs))
@@ -225,3 +237,111 @@ def test_dashboard_runs_end_to_end(
     X, y = clf_data
     clf = LanguageModelClassifier(backend=FakeBackend(), callback=build()).fit(X, y)
     assert set(clf.predict(X)).issubset(set(clf.classes_))
+
+
+class _FoldingCallback(Callback):
+    """Fold the event stream into a :class:`DashboardState`, as the live dashboards do."""
+
+    def __init__(self, dash: DashboardState) -> None:
+        super().__init__()
+        self.dash = dash
+
+    @override
+    def on_event(self, state: TrainingState, event: Event) -> None:
+        self.dash.fold(state, event)
+
+
+def _fit_cards(training: TrainingConfig, evals: Sequence[float]) -> Sequence[Stat]:
+    """The fit stat cards after one eval report per epoch, at losses ``evals``."""
+    dash = DashboardState(n_generations=0, uncertain_threshold=0.6, log_every="epoch")
+    cb = _FoldingCallback(dash)
+    cb.on_fit_info("model", training)
+    cb.on_fit_start(n_rows=10, n_epochs=len(evals))
+    for epoch, loss in enumerate(evals, start=1):
+        cb.on_train_report(
+            step=epoch, total_steps=len(evals), loss=loss, epoch=float(epoch), learning_rate=1e-4
+        )
+        cb.on_eval_report(step=epoch, loss=loss, epoch=float(epoch))
+    cfg = RenderConfig(
+        n_train_examples=0, examples_view="raw", n_log_rows=0, log_every="epoch", uid="test"
+    )
+    dashboard = build_fit_dashboard(cb.state, dash, cfg)
+    return next(c for c in dashboard.children if isinstance(c, StatCards)).cards
+
+
+def test_patience_card_counts_evals_since_best() -> None:
+    cards = _fit_cards(
+        TrainingConfig(evaluation=EvalConfig(split=0.2, patience=3)), evals=[0.9, 0.5, 0.6, 0.7]
+    )
+    assert cards[-1].label == "patience"
+    # best at epoch 2; the two worse evals after it spent 2 of the 3 budget
+    assert cards[-1].value == "2 / 3"
+    assert cards[-1].note == "best 0.5000 · ep 2"
+
+
+def test_patience_card_resets_on_a_new_best() -> None:
+    cards = _fit_cards(
+        TrainingConfig(evaluation=EvalConfig(split=0.2, patience=3)), evals=[0.9, 0.6, 0.4]
+    )
+    assert cards[-1].value == "0 / 3"
+    assert cards[-1].note == "best 0.4000 · ep 3"
+
+
+def test_best_card_replaces_patience_without_a_budget() -> None:
+    cards = _fit_cards(
+        TrainingConfig(evaluation=EvalConfig(split=0.2, patience=None)), evals=[0.9, 0.5, 0.6]
+    )
+    assert cards[-1].label == "best val"
+    assert (cards[-1].value, cards[-1].note) == ("0.5000", "ep 2")
+
+
+def test_no_early_stopping_card_without_validation() -> None:
+    cards = _fit_cards(TrainingConfig(evaluation=None), evals=[])
+    assert [c.label for c in cards] == ["train loss", "val loss", "learning rate", "step"]
+
+
+def test_eval_reports_fold_best_and_patience_into_state() -> None:
+    cb = Callback()
+    cb.on_fit_start(n_rows=10, n_epochs=4)
+    for epoch, loss in enumerate([0.9, 0.5, 0.6, 0.7], start=1):
+        cb.on_eval_report(step=epoch, loss=loss, epoch=float(epoch))
+    assert cb.state.best_eval == 0.5
+    assert cb.state.best_eval_epoch == 2.0
+    assert cb.state.evals_since_best == 2
+
+
+class _CaptureHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__()
+        self.lines: list[str] = []
+
+    @override
+    def emit(self, record: logging.LogRecord) -> None:
+        self.lines.append(record.getMessage())
+
+
+def test_logging_eval_line_carries_best_and_patience() -> None:
+    logger = logging.getLogger("sklm-test-eval-line")
+    logger.setLevel(logging.INFO)
+    capture = _CaptureHandler()
+    logger.addHandler(capture)
+    cb = LoggingCallback(logger=logger)
+    cb.on_fit_info("model", TrainingConfig(evaluation=EvalConfig(split=0.2, patience=3)))
+    cb.on_fit_start(n_rows=10, n_epochs=3)
+    for epoch, loss in enumerate([0.9, 0.5, 0.6], start=1):
+        cb.on_eval_report(step=epoch, loss=loss, epoch=float(epoch))
+    line = capture.lines[-1]
+    assert "loss 0.6000" in line
+    assert "best 0.5000 @ep 2" in line
+    assert "patience 1/3" in line
+
+
+def test_logging_autoconfig_disables_propagation() -> None:
+    auto = logging.getLogger("sklm-test-propagate-auto")
+    LoggingCallback(logger=auto)
+    assert auto.propagate is False  # a root basicConfig would double every line
+
+    owned = logging.getLogger("sklm-test-propagate-owned")
+    owned.addHandler(logging.StreamHandler())
+    LoggingCallback(logger=owned)
+    assert owned.propagate is True  # the caller's setup is left untouched

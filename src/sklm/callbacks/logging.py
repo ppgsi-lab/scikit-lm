@@ -59,8 +59,11 @@ class LoggingCallback(Callback):
     A compact, colorized line per event: fine-tuning opens with a ``╶`` header
     (model + headline hyperparameters), each surviving training report is a ``·``
     line carrying the raw loss, the running epoch loss (``mean±std`` over the
-    epoch so far), epoch, learning rate, progress, ETA and memory, and the run
-    closes with a ``✓`` summary (steps and the ``last N`` loss ``mean±std``).
+    epoch so far), epoch, learning rate, progress, ETA and memory, each validation
+    report is a ``·`` line with the eval loss, the best so far (and the epoch it
+    was reached at) and the patience counter when ``EvalConfig.patience`` is
+    set, and the run closes with a ``✓`` summary (steps and the ``last N`` loss
+    ``mean±std``).
     Inference mirrors it (``╶`` start, the per-value generations / scored rankings,
     ``✓`` end). ANSI color is applied only when this instance auto-configures a
     console handler whose stream is a TTY (and ``NO_COLOR`` is unset); routed to a
@@ -156,6 +159,9 @@ class LoggingCallback(Callback):
         handler.setFormatter(logging.Formatter(f"{time} %(message)s", datefmt="%H:%M:%S"))
         self._logger.addHandler(handler)
         self._logger.setLevel(self._level)
+        # Our handler renders the full line; propagating to the root logger would
+        # print every event a second time under any ``logging.basicConfig``.
+        self._logger.propagate = False
         return color
 
     def _c(self, text: str, *codes: str) -> str:
@@ -195,6 +201,15 @@ class LoggingCallback(Callback):
                 self._log_train(state, step, total, epoch)
             case EvalReport(step=step, loss=loss):
                 cells = [self._kv("eval step", str(step)), self._kv("loss", f"{loss:.4f}", _YELLOW)]
+                if state.best_eval is not None:
+                    best = f"{state.best_eval:.4f}"
+                    if state.best_eval_epoch is not None:
+                        best += f" @ep {state.best_eval_epoch:.0f}"
+                    cells.append(self._kv("best", best, _GREEN))
+                evaluation = state.training.evaluation if state.training is not None else None
+                patience = evaluation.patience if evaluation is not None else None
+                if patience is not None:
+                    cells.append(self._kv("patience", f"{state.evals_since_best}/{patience}"))
                 self._logger.log(self._level, "%s %s", self._c(_STEP, _DIM), "  ".join(cells))
             case FitEnd():
                 self._log_fit_end(state)

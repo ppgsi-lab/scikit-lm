@@ -7,6 +7,7 @@ import pytest
 
 from sklm import (
     DiscretizationConfig,
+    EvalConfig,
     LoRAConfig,
     LRScheduler,
     ModelConfig,
@@ -40,7 +41,8 @@ def test_default_scheduler_is_cosine_auto() -> None:
     sched = TrainingConfig().lr_scheduler
     assert isinstance(sched, CosineLR)
     assert sched.learning_rate == "auto"
-    assert sched.warmup_ratio == 0.0
+    assert sched.warmup_ratio == 0.1
+    assert sched.floor == 1e-7
 
 
 def test_default_schedulers_are_independent_per_config() -> None:
@@ -50,13 +52,15 @@ def test_default_schedulers_are_independent_per_config() -> None:
     assert a.lr_scheduler is not b.lr_scheduler
 
 
-def test_plateau_requires_validation_split() -> None:
-    with pytest.raises(ValueError, match="validation_split"):
-        TrainingConfig(lr_scheduler=LRScheduler.plateau())
+def test_plateau_requires_evaluation() -> None:
+    with pytest.raises(ValueError, match="evaluation"):
+        TrainingConfig(lr_scheduler=LRScheduler.plateau(), evaluation=None)
 
 
-def test_plateau_with_validation_split_constructs() -> None:
-    cfg = TrainingConfig(lr_scheduler=LRScheduler.plateau(patience=3), validation_split=0.2)
+def test_plateau_with_evaluation_constructs() -> None:
+    cfg = TrainingConfig(
+        lr_scheduler=LRScheduler.plateau(patience=3), evaluation=EvalConfig(split=0.2)
+    )
     assert isinstance(cfg.lr_scheduler, PlateauLR)
 
 
@@ -111,7 +115,9 @@ def test_plateau_reducer_respects_floor() -> None:
 
 
 def test_training_kwargs_step_scheduler_maps_type_and_warmup() -> None:
-    cfg = TrainingConfig(lr_scheduler=LRScheduler.cosine(learning_rate=1e-4, warmup_ratio=0.1))
+    cfg = TrainingConfig(
+        lr_scheduler=LRScheduler.cosine(learning_rate=1e-4, warmup_ratio=0.1, floor=0.0)
+    )
     kwargs = _training_kwargs(cfg, "cpu", "fp32", "/tmp/out", 16, 0, has_eval=False)
     assert kwargs["lr_scheduler_type"] == "cosine"
     assert kwargs["warmup_ratio"] == 0.1
@@ -122,7 +128,7 @@ def test_training_kwargs_step_scheduler_maps_type_and_warmup() -> None:
 def test_training_kwargs_plateau_maps_reduce_on_plateau() -> None:
     cfg = TrainingConfig(
         lr_scheduler=LRScheduler.plateau(learning_rate=2e-5, factor=0.5, patience=3),
-        validation_split=0.2,
+        evaluation=EvalConfig(split=0.2),
     )
     kwargs = _training_kwargs(cfg, "cpu", "fp32", "/tmp/out", 16, 0, has_eval=True)
     assert kwargs["lr_scheduler_type"] == "reduce_lr_on_plateau"
@@ -153,7 +159,7 @@ def test_training_kwargs_linear_floor_maps_polynomial() -> None:
 
 
 def test_training_kwargs_cosine_without_floor_stays_cosine() -> None:
-    cfg = TrainingConfig(lr_scheduler=LRScheduler.cosine(learning_rate=1e-3))
+    cfg = TrainingConfig(lr_scheduler=LRScheduler.cosine(learning_rate=1e-3, floor=0.0))
     kwargs = _training_kwargs(cfg, "cpu", "fp32", "/tmp/out", 16, 0, has_eval=False)
     assert kwargs["lr_scheduler_type"] == "cosine"
     assert "lr_scheduler_kwargs" not in kwargs

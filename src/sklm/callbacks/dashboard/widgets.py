@@ -53,8 +53,12 @@ class Stat:
     value : str
         Primary value text, pre-formatted by the builder.
     suffix : str or None
-        Dimmed trailing text appended after ``value`` (e.g. ``" / 1,000"`` for a
-        step counter). ``None`` when there is no suffix.
+        Dimmed trailing text appended after ``value`` on the same line (e.g.
+        ``" / 1,000"`` for a step counter). ``None`` when there is no suffix.
+    note : str or None
+        Dimmed footnote on its own line below ``value``, for context too long to
+        sit inline (e.g. the best validation loss under the patience counter).
+        ``None`` when there is no note.
     mono : bool
         Whether the renderer sets the value in a monospace face.
     """
@@ -62,6 +66,7 @@ class Stat:
     label: str
     value: str
     suffix: str | None = None
+    note: str | None = None
     mono: bool = False
 
 

@@ -115,6 +115,13 @@ class Callback:
         s.eval_loss = loss
         s.eval_steps.append(step)
         s.eval_losses.append(loss)
+        if s.best_eval is None or loss < s.best_eval:
+            s.best_eval = loss
+            # MLX reports no epoch on eval; fall back to the one derived from steps.
+            s.best_eval_epoch = epoch if epoch is not None else s.epoch
+            s.evals_since_best = 0
+        else:
+            s.evals_since_best += 1
         self.on_event(s, EvalReport(step, loss, epoch))
 
     @final

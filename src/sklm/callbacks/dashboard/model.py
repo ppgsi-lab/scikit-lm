@@ -45,10 +45,12 @@ class DashboardState:
     headline metrics; this holds everything the dashboards derive on top of it: the
     structured generation/score records (kept structured, not pre-formatted, so a
     Rich one-line detail and a Jupyter widget can both be built from them), the
-    aggregated training-log rows plus the open interval, the eval-by-step map, the
-    verdict aggregates (count, confidence sum, uncertain count, bin counts and the
-    candidate colors), the malformed-generation retry count and the progress cursor
-    (done / total / start time) with the log-bucket cursor.
+    aggregated training-log rows plus the open interval, the eval-by-step map (the
+    early-stopping trackers -- best validation loss, its epoch and the patience
+    counter -- live on the :class:`TrainingState` itself), the verdict aggregates (count,
+    confidence sum, uncertain count, bin counts and the candidate colors), the
+    malformed-generation retry count and the progress cursor (done / total / start
+    time) with the log-bucket cursor.
 
     Both live callbacks (:class:`JupyterCallback` and :class:`RichCallback`) fold
     events through this same accumulator; :class:`build.build_fit_dashboard` /

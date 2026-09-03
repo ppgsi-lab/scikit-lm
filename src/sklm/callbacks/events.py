@@ -37,6 +37,9 @@ class TrainingState:
     step: int | None = None
     loss: float | None = None
     eval_loss: float | None = None
+    best_eval: float | None = None
+    best_eval_epoch: float | None = None
+    evals_since_best: int = 0
     epoch: float | None = None
     learning_rate: float | None = None
     grad_norm: float | None = None
