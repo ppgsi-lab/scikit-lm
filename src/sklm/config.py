@@ -347,9 +347,9 @@ class LRScheduler(BaseEstimator, ABC):
 
         The learning rate decays from ``learning_rate`` to ``floor`` following a
         half cosine over the planned training steps, after an optional linear
-        warmup. This is the schedule :class:`TrainingConfig` defaults to, and its
-        defaults carry the tuned shape -- unlike :meth:`linear` and
-        :meth:`constant`, which warm up from zero only when asked.
+        warmup. This is the schedule :class:`TrainingConfig` defaults to; unlike
+        :meth:`linear` and :meth:`constant` it warms up and keeps a small floor
+        by default.
 
         Parameters
         ----------
@@ -501,8 +501,7 @@ class CosineLR(_DecayLR):
     """Half-cosine decay schedule. Build via :meth:`LRScheduler.cosine`.
 
     Overrides the inherited ``warmup_ratio`` / ``floor`` defaults: this is the
-    schedule :class:`TrainingConfig` uses by default, so it carries the tuned
-    shape rather than the neutral one.
+    schedule :class:`TrainingConfig` uses by default.
     """
 
     warmup_ratio: float = 0.1

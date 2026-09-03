@@ -335,23 +335,29 @@ A custom serializer just needs to implement the `Serializer` protocol (`serializ
 Fine-tuning hyperparameters. Held by the estimator as a nested, tunable object.
 
 ```python
-from sklm import LRScheduler, TrainingConfig
+from sklm import EvalConfig, LRScheduler, TrainingConfig
 
 TrainingConfig(
-    epochs=50,                 # passes over the rows
+    epochs=250,                # ceiling; early stopping normally ends it sooner
     batch_size=16,
     lr_scheduler=LRScheduler.cosine(),  # .constant() | .linear() | .cosine() | .plateau()
-    augmentation_factor=1,     # distinct column orders emitted per row each epoch
-    loss_on_target_only=False, # supervise only the target column(s), not the context
+    evaluation=EvalConfig(     # hold-out split, its cadence and early stopping
+        split=0.1, each=1, on="epoch", patience=5
+    ),
+    augmentation_factor=2,     # distinct column orders emitted per row each epoch
+    target_loss_weight=1.0,    # supervise only the target column(s), not the context
+    weight_decay=0.1,
+    label_smoothing=0.005,
+    numeric_noise=0.1,
 )
 ```
 
-The learning rate and warmup live on the schedule object — `LRScheduler.cosine(learning_rate="auto", warmup_ratio=0.0)`, where `"auto"` picks 2e-5 full-weight and 2e-4 with LoRA — and `LRScheduler.plateau(...)` lowers the rate when validation loss stalls (requires `validation_split > 0`).
+The learning rate and warmup live on the schedule object — `LRScheduler.cosine(learning_rate="auto", warmup_ratio=0.1, floor=1e-7)`, where `"auto"` picks 2e-5 full-weight and 2e-4 with LoRA — and `LRScheduler.plateau(...)` lowers the rate when validation loss stalls (requires `evaluation`).
 
 Two knobs are specific to this library's mechanism:
 
 - **`augmentation_factor`** — how many distinct column permutations to emit per row each epoch (a row with `m` present columns has at most `m!`). Raising it is a cheap form of data augmentation.
-- **`loss_on_target_only`** — when `True`, the context tokens are masked out of the loss and the model is supervised only on the column(s) it must actually predict (the label for the classifier/regressor, the missing cells for the imputer). Inert for the oversampler.
+- **`target_loss_weight`** — weight of the target-column tokens in the cross-entropy, the context getting the complement. `1.0` (the default) supervises only the column(s) the model must actually predict (the label for the classifier/regressor, the missing cells for the imputer); `None` keeps the loss on every token. Inert for the oversampler.
 
 Other fields cover the usual levers: `weight_decay`, `grad_accumulation_steps`, `max_grad_norm`, `optimizer`, `label_smoothing`, `neftune_noise_alpha`, `gradient_checkpointing`, `max_seq_length`, and `max_steps`. See the docstring for the full list and defaults.
 
