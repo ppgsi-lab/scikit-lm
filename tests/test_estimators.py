@@ -29,6 +29,8 @@ from sklm import (
     LanguageModelRegressor,
     LanguageModelSynthesizer,
     LoggingCallback,
+    NumberFormat,
+    PlainNumber,
     Serializer,
     TrainingConfig,
     ValueConstraint,
@@ -373,6 +375,8 @@ def test_imputer_accepts_custom_serializer(nan_data) -> None:
     """A serializer that only implements the protocol must work end-to-end."""
 
     class KVSerializer:
+        number: NumberFormat = PlainNumber()
+
         def encode_value(self, value: object, *, numeric: bool) -> str:
             return str(value)
 

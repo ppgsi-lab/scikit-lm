@@ -29,6 +29,7 @@ __all__ = [
     "LanguageModelBackend",
     "NumericTokenArrays",
     "Verdict",
+    "checkpoint_workdir",
     "common_token_prefix",
     "digit_scales",
     "numeric_token_arrays",

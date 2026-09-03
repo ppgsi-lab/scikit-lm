@@ -6,8 +6,6 @@ import copy
 import importlib.util
 import platform
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import fields as dataclasses_fields
-from dataclasses import is_dataclass, replace
 from typing import Literal, Protocol
 
 import numpy as np
@@ -32,7 +30,6 @@ from .serialize import (
     IfThenSerializer,
     JSONSerializer,
     KeyValueSerializer,
-    NumberFormat,
     PlainNumber,
     Serializer,
     SpacedDigits,
@@ -90,9 +87,10 @@ def resolve_serializer(
     max_decimals : int or None, optional
         Decimal places to round numeric cells to. An int applies whether
         ``serializer`` is a string selector or an instance -- an instance is
-        shallow-copied with its :class:`~sklm.NumberFormat` rebuilt to carry
-        it. ``None`` (default) keeps the string selectors' built-in rounding
-        (3 places) and leaves an instance's own number format untouched.
+        shallow-copied with its :class:`~sklm.NumberFormat` rebuilt to carry it
+        (the caller's serializer is never mutated). ``None`` (default) keeps
+        the string selectors' built-in rounding (3 places) and leaves an
+        instance's own number format untouched.
     number_format : {"plain", "spaced"}, optional
         Number rendering when building from a string selector: ``"plain"``
         (default) builds :class:`~sklm.PlainNumber`, ``"spaced"`` builds
@@ -107,9 +105,7 @@ def resolve_serializer(
     Raises
     ------
     ValueError
-        If ``serializer`` or ``number_format`` is an unknown string selector,
-        or if ``max_decimals`` is set with a ``Serializer`` instance whose
-        number format cannot be rebuilt to carry it.
+        If ``serializer`` or ``number_format`` is an unknown string selector.
     """
     if isinstance(serializer, str):
         builders = {
@@ -133,32 +129,8 @@ def resolve_serializer(
         return builder(number=number(max_decimals=3 if max_decimals is None else max_decimals))
     if max_decimals is None:
         return serializer
-    return _with_max_decimals(serializer, max_decimals)
-
-
-def _with_max_decimals(serializer: Serializer, max_decimals: int) -> Serializer:
-    """A shallow copy of ``serializer`` whose number format rounds to ``max_decimals``.
-
-    The instance itself is never mutated -- the caller's serializer keeps its
-    own format. Works for any serializer exposing a dataclass ``number``
-    :class:`~sklm.NumberFormat` with a ``max_decimals`` field (all built-ins);
-    anything else raises rather than ignoring the setting silently.
-    """
-    number = getattr(serializer, "number", None)
-    if not (
-        isinstance(number, NumberFormat)
-        and is_dataclass(number)
-        and not isinstance(number, type)
-        and any(f.name == "max_decimals" for f in dataclasses_fields(number))
-    ):
-        raise ValueError(
-            f"max_decimals={max_decimals} cannot be applied to "
-            f"{type(serializer).__name__}: it has no dataclass `number` NumberFormat "
-            "with a max_decimals field to rebuild; set the rounding on the "
-            "serializer's own number format instead"
-        )
     clone = copy.copy(serializer)
-    setattr(clone, "number", replace(number, max_decimals=max_decimals))  # noqa: B010
+    clone.number = serializer.number.with_max_decimals(max_decimals)
     return clone
 
 

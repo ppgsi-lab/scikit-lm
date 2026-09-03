@@ -350,15 +350,6 @@ def test_resolve_serializer_applies_max_decimals_to_instances() -> None:
     assert resolved.spaced_delimiters
 
 
-def test_resolve_serializer_rejects_max_decimals_without_number_format() -> None:
-    class Custom:
-        def serialize(self, fields: object) -> str:
-            return ""
-
-    with pytest.raises(ValueError, match="max_decimals=2 cannot be applied"):
-        resolve_serializer(Custom(), 2)  # pyright: ignore[reportArgumentType]
-
-
 def test_resolve_serializer_rejects_unknown() -> None:
     with pytest.raises(ValueError, match="unknown serializer"):
         resolve_serializer("toml")

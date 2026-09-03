@@ -19,12 +19,10 @@ import warnings
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from decimal import Decimal
-from itertools import pairwise, permutations
-from typing import Literal, Self
+from typing import Self
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import linear_sum_assignment
 from sklearn.base import BaseEstimator
 from sklearn.model_selection import train_test_split
 from sklearn.utils import Tags
@@ -34,6 +32,7 @@ from .backend import LanguageModelBackend, prompt_groups
 from .callbacks import Callback
 from .config import DiscretizationConfig, GenerationConfig, ModelConfig, TrainingConfig
 from .hf_backend import HFBackend
+from .order import build_probe, distinct_block_orders, distinct_orders, infer_order
 from .serialize import (
     Field,
     JSONSerializer,
@@ -45,8 +44,6 @@ from .serialize import (
 )
 
 __all__ = ["TabularLanguageModel", "forget", "select_candidates", "to_frame"]
-
-_ENUMERATE_CAP = 5040  # 7!
 
 # Per-epoch serialized rows surfaced to the callback for preview; the full epoch
 # list is already in memory, so this only bounds how many are handed over.
@@ -82,202 +79,17 @@ def to_frame(X: object, columns: Sequence[str] | None = None) -> pd.DataFrame:
     return pd.DataFrame(arr, columns=pd.Index(names))
 
 
-def _distinct_orders(columns: list[str], k: int, rng: np.random.Generator) -> list[list[str]]:
-    """Up to ``k`` distinct orderings of ``columns`` (capped at ``len(columns)!``)."""
-    n = len(columns)
-    if k <= 1 or n <= 1:
-        order = list(columns)
-        rng.shuffle(order)
-        return [order]
-    if n <= 7:  # n! <= 5040 -- enumerate and sample without replacement
-        perms = [list(p) for p in permutations(columns)]
-        idx = rng.permutation(len(perms))[: min(k, len(perms))]
-        return [perms[i] for i in idx]
-    seen: set[tuple[str, ...]] = set()
-    out: list[list[str]] = []
-    while len(out) < k:  # n >= 8 => k << n!, rejection collisions negligible
-        p = tuple(rng.permutation(columns).tolist())
-        if p not in seen:
-            seen.add(p)
-            out.append(list(p))
-    return out
-
-
-def _distinct_block_orders(
-    ctx: list[str], tgt: list[str], k: int, rng: np.random.Generator
-) -> list[tuple[list[str], list[str]]]:
-    """Up to ``k`` distinct ``(context_order, target_order)`` pairs.
-
-    Each block is permuted independently, so the distinct count caps at
-    ``|ctx|! * |tgt|!`` (empty blocks contribute a single empty order).
-    """
-    max_unique = math.factorial(len(ctx)) * math.factorial(len(tgt))
-    k = min(k, max_unique)
-    if k <= 1:
-        c, t = list(ctx), list(tgt)
-        rng.shuffle(c)
-        rng.shuffle(t)
-        return [(c, t)]
-    if max_unique <= _ENUMERATE_CAP:  # enumerate and sample without replacement
-        pairs = [(list(c), list(t)) for c in permutations(ctx) for t in permutations(tgt)]
-        idx = rng.permutation(len(pairs))[:k]
-        return [pairs[i] for i in idx]
-    seen: set[tuple[tuple[str, ...], tuple[str, ...]]] = set()
-    out: list[tuple[list[str], list[str]]] = []
-    while len(out) < k:
-        c = tuple(rng.permutation(ctx).tolist()) if ctx else ()
-        t = tuple(rng.permutation(tgt).tolist()) if tgt else ()
-        if (c, t) not in seen:
-            seen.add((c, t))
-            out.append((list(c), list(t)))
-    return out
-
-
-def _strata(values: pd.Series, n_bins: int = 10) -> np.ndarray:
-    """Discrete stratification key for ``values``.
-
-    Numeric columns with more than ``n_bins`` distinct values are binned into
-    quantiles (so a regression target stratifies like a set of class labels);
-    everything else is used verbatim. This makes the hold-out's stratification
-    target-type agnostic -- one rule covers classification and regression.
-    """
-    if pd.api.types.is_numeric_dtype(values) and values.nunique() > n_bins:
-        return np.asarray(pd.qcut(values, q=n_bins, duplicates="drop", labels=False))
-    return values.to_numpy()
-
-
-def _split_indices(
-    frame: pd.DataFrame,
-    target_cols: frozenset[str],
-    split: float,
-    stratify: bool,
-    random_state: int | None,
-) -> tuple[list[int], list[int]]:
-    """Partition ``frame``'s row indices into ``(train, eval)`` for the hold-out.
-
-    Stratifies on the sole target column when ``stratify`` is set and that column
-    is fully observed -- binning it if numeric -- so classifier labels and
-    regressor targets are both balanced across the split; otherwise splits at
-    random. Falls back to a random split (with a warning) when a stratified split
-    is infeasible, e.g. a class with too few members for both sides.
-    """
-    indices = np.arange(len(frame))
-    strata: np.ndarray | None = None
-    if stratify and len(target_cols) == 1:
-        (col,) = target_cols
-        column = frame[col]
-        if isinstance(column, pd.Series) and bool(column.notna().all()):
-            strata = _strata(column)
-    try:
-        train_idx, eval_idx = train_test_split(
-            indices, test_size=split, random_state=random_state, stratify=strata
-        )
-    except ValueError:
-        if strata is None:
-            raise
-        warnings.warn(
-            "stratified validation split was infeasible (a class has too few "
-            "members); falling back to a random split.",
-            RuntimeWarning,
-            stacklevel=2,
-        )
-        train_idx, eval_idx = train_test_split(
-            indices, test_size=split, random_state=random_state, stratify=None
-        )
-    return np.asarray(train_idx).tolist(), np.asarray(eval_idx).tolist()
-
-
-def _native(value: object) -> object:
-    """Unbox a NumPy scalar into its native Python equivalent.
-
-    Inference inputs (knowns, candidates, sample conditions) arrive from user
-    code and often carry NumPy scalars; serializers must see native types
-    (``repr(np.float64(1.5))`` is ``"np.float64(1.5)"`` on NumPy >= 2)."""
-    return value.item() if isinstance(value, np.generic) else value
-
-
-def _noisy(value: object, sigma: float, rng: np.random.Generator) -> object:
-    """Perturb one numeric cell with Gaussian noise at the cell's own precision.
-
-    The perturbed value must serialize exactly like the original would: an
-    integer cell stays an integer and a float cell keeps its decimal count, so
-    ``numeric_noise`` augments the value without changing the number format the
-    model sees. A float whose repr is scientific notation has no decimal count
-    to preserve and is left unperturbed.
-    """
-    v = value.item() if isinstance(value, np.generic) else value
-    if not isinstance(v, int | float):
-        return value
-    draw = float(rng.normal(0.0, sigma))
-    if isinstance(v, int):
-        return round(v + draw)
-    text = repr(v)
-    if "e" in text or "E" in text:
-        return value
-    decimals = len(text.split(".")[1]) if "." in text else 0
-    return round(v + draw, decimals)
-
-
-def _decimal_places(value: object) -> int:
-    """Decimal places the value's serialized text carries (0 for integers).
-
-    ``Decimal(repr(v))`` rather than splitting on ``"."``: a scientific-notation
-    repr (``repr(1e-05) == "1e-05"``) has no point to split on but still encodes
-    five decimal places.
-    """
-    v = value.item() if isinstance(value, np.generic) else value
-    if isinstance(v, int):
-        return 0
-    exponent = Decimal(repr(v)).as_tuple().exponent
-    return max(0, -exponent) if isinstance(exponent, int) else 0
-
-
-@dataclass(frozen=True, slots=True)
-class _ScoreSpec:
-    """How to fill one scored column: candidates to rank and a reducer.
-
-    Lets :meth:`TabularLanguageModel.impute_many` stay agnostic of what makes a
-    column discrete -- the imputer injects, per column, the candidate set (a
-    numeric grid or a categorical's observed levels) and a
-    ``(proba_row, candidates) -> value`` reduction closure (the numeric estimate
-    or a categorical argmax).
-    """
-
-    candidates: Sequence[object]
-    reduce: Callable[[np.ndarray, Sequence[object]], object]
-
-
-def _normalized_entropy(proba: np.ndarray) -> float:
-    """Entropy of a probability row, scaled to [0, 1] by its support size."""
-    if len(proba) < 2:
-        return 0.0
-    positive = proba[proba > 0]
-    return float(-(positive * np.log(positive)).sum() / math.log(len(proba)))
-
-
-def _representative(group: np.ndarray, kind: Literal["median", "mode", "mean"]) -> float:
-    """One value standing in for a partition of observed target values.
-
-    ``"median"`` is the lower median and ``"mode"`` the most frequent value
-    (ties broken by the smaller value) -- both real observed values; ``"mean"``
-    is the synthetic arithmetic mean.
-    """
-    if kind == "mean":
-        return float(np.mean(group))
-    if kind == "mode":
-        values, counts = np.unique(group, return_counts=True)
-        return float(values[counts == counts.max()].min())
-    return float(np.percentile(group, 50, method="lower"))
-
-
 def select_candidates(values: np.ndarray, config: DiscretizationConfig) -> list[float]:
     """Candidate values to score, drawn from a target column's observed values.
 
     Non-NaN values are partitioned into :meth:`DiscretizationConfig.resolve_k`
     strata (equal-mass quantiles or equal-width bins, per ``config.strategy``)
-    and one representative is taken from each (``config.representative``). When
-    the requested count reaches the number of distinct values the full sorted
-    support is returned and partitioning is skipped.
+    and one representative is taken from each (``config.representative``:
+    ``"median"`` is the lower median and ``"mode"`` the most frequent value,
+    ties broken by the smaller one -- both real observed values; ``"mean"`` is
+    the synthetic arithmetic mean). When the requested count reaches the number
+    of distinct values the full sorted support is returned and partitioning is
+    skipped.
 
     Parameters
     ----------
@@ -296,6 +108,17 @@ def select_candidates(values: np.ndarray, config: DiscretizationConfig) -> list[
     ValueError
         If no observed (non-NaN) values remain.
     """
+
+    def representative(group: np.ndarray) -> float:
+        match config.representative:
+            case "mean":
+                return float(np.mean(group))
+            case "mode":
+                levels, counts = np.unique(group, return_counts=True)
+                return float(levels[counts == counts.max()].min())
+            case "median":
+                return float(np.percentile(group, 50, method="lower"))
+
     v = np.asarray(values, dtype=float)
     v = v[~np.isnan(v)]
     if v.size == 0:
@@ -309,98 +132,7 @@ def select_candidates(values: np.ndarray, config: DiscretizationConfig) -> list[
     else:
         edges = np.linspace(v.min(), v.max(), k + 1)
         labels = np.clip(np.digitize(v, edges[1:-1]), 0, k - 1)
-    reps = {_representative(v[labels == lbl], config.representative) for lbl in np.unique(labels)}
-    return sorted(reps)
-
-
-def _ordered(columns: Sequence[str], order: Sequence[str]) -> list[str]:
-    """``columns`` in the order ``order`` lists them."""
-    present = set(columns)
-    return [c for c in order if c in present]
-
-
-def _column_order(generation: GenerationConfig, columns: Sequence[str]) -> list[str] | None:
-    """``generation.column_order``, checked to be a permutation of the training ``columns``."""
-    order = generation.column_order
-    if order is None:
-        return None
-    if sorted(order) != sorted(columns):
-        raise ValueError(
-            f"column_order must be a permutation of the training columns {list(columns)}, "
-            f"got {list(order)}"
-        )
-    return list(order)
-
-
-def _positional_order(
-    orders: Sequence[Sequence[str]], hits: Sequence[Sequence[float]]
-) -> list[str]:
-    """Best column order under an additive position model fit to scored orders.
-
-    ``hits[k]`` holds order ``k``'s log p(true) on the first ``len(hits[k])``
-    calibration rows. Each observation contributes
-    ``hit ~ sum_i w[column at i, i] + row effect``; the row effects absorb
-    per-row difficulty, so orders scored on different numbers of rows stay
-    comparable (an order that only saw the easy rows is not credited for it).
-    ``w`` is fit by ridge regression on the indicator design and the order
-    maximizing the additive total is the linear assignment of columns to
-    positions -- it need not be one of the scored orders.
-    """
-    cols = sorted(orders[0])
-    n = len(cols)
-    index = {c: i for i, c in enumerate(cols)}
-    positional = np.zeros((len(orders), n * n))
-    for k, order in enumerate(orders):
-        for pos, c in enumerate(order):
-            positional[k, index[c] * n + pos] = 1.0
-    who = np.concatenate([np.full(len(h), k) for k, h in enumerate(hits)])
-    row = np.concatenate([np.arange(len(h)) for h in hits])
-    design = np.hstack([positional[who], np.eye(max(len(h) for h in hits))[row]])
-    y = np.concatenate([np.asarray(h, dtype=float) for h in hits])
-    y = y - y.mean()
-    ridge = 1e-3 * np.eye(design.shape[1])
-    w = np.linalg.solve(design.T @ design + ridge, design.T @ y)[: n * n].reshape(n, n)
-    rows, positions = linear_sum_assignment(-w)
-    out = [""] * n
-    for r, pos in zip(rows, positions, strict=True):
-        out[pos] = cols[r]
-    return out
-
-
-@dataclass(frozen=True)
-class _ImputeRow:
-    """One row mid-imputation: its observed cells, the cells filled so far, the pending ones."""
-
-    known: Mapping[str, object]
-    filled: Mapping[str, object]
-    pending: tuple[str, ...]
-    alive: bool = True
-
-
-def _fill_scored(
-    row: _ImputeRow,
-    cells: Mapping[str, np.ndarray],
-    score: Mapping[str, _ScoreSpec],
-    quantize: Callable[[str, object], object],
-) -> _ImputeRow:
-    """Fill the probed cell whose distribution is most confident (lowest entropy)."""
-    col, proba = min(cells.items(), key=lambda item: _normalized_entropy(item[1]))
-    return replace(
-        row,
-        filled={**row.filled, col: quantize(col, score[col].reduce(proba, score[col].candidates))},
-        pending=tuple(c for c in row.pending if c != col),
-    )
-
-
-def _fill_generated(
-    row: _ImputeRow, out: Mapping[str, object] | None, quantize: Callable[[str, object], object]
-) -> _ImputeRow:
-    """Fill the row's next pending cell with a generated value, or kill the row."""
-    if out is None:
-        return replace(row, alive=False)
-    col = row.pending[0]
-    filled = {**row.filled, col: quantize(col, out[col])}
-    return replace(row, filled=filled, pending=row.pending[1:])
+    return sorted({representative(v[labels == lbl]) for lbl in np.unique(labels)})
 
 
 @dataclass(kw_only=True)
@@ -522,8 +254,9 @@ class TabularLanguageModel(BaseEstimator):
         duplicates = frame.columns[frame.columns.duplicated()].unique().tolist()
         if duplicates:
             raise ValueError(f"duplicate column names are not supported: {duplicates}")
-        if self.training.numeric_loss_weight > 0 and not isinstance(
-            getattr(self.serializer, "number", None), SpacedDigits
+        training = self.training
+        if training.numeric_loss_weight > 0 and not isinstance(
+            self.serializer.number, SpacedDigits
         ):
             raise ValueError(
                 "numeric_loss_weight requires a serializer rendering numbers with "
@@ -548,125 +281,48 @@ class TabularLanguageModel(BaseEstimator):
             if c not in self.numeric_cols_
         }
         self.n_features_in_ = frame.shape[1]
-        self._prior_cache_: dict[tuple[str, tuple[object, ...], str], np.ndarray] = {}
+        self._prior_cache: dict[tuple[str, tuple[object, ...], str], np.ndarray] = {}
         if isinstance(X, pd.DataFrame):
             self.feature_names_in_ = np.asarray(X.columns, dtype=object)
         else:
             forget(self, "feature_names_in_")
-        # sklearn convention: random_state=None is non-deterministic. Draw one base
-        # seed per fit so each epoch's permutation is seeded on (base_seed, epoch) --
-        # idempotent within the fit, fresh across fits when None.
-        base_seed = (
-            self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
-        )
         # A filled prompt marks the context/target boundary for the backend:
         # the context tokens weigh 1 - target_loss_weight in the loss (0 at 1.0).
-        masking = self.training.target_loss_weight is not None and bool(target_cols)
-        target_last = masking or (self.training.target_at_end and bool(target_cols))
+        masking = training.target_loss_weight is not None and bool(target_cols)
         # The block layout is a property of the fitted model: inference-side order
         # marginalization mirrors it (target cells in a tail block) when set.
         self.target_cols_ = frozenset(target_cols)
-        self.target_last_ = target_last
-        permute = self.training.permute_order
-        spans_on = self.training.numeric_loss_weight > 0
-        # The auxiliary numeric error is squared in the column's own unit, so a
-        # large-scale column would otherwise monopolize the term; 1/sigma puts
-        # every column's error in standard deviations. A constant column has
-        # nothing to normalize by.
-        inv_scales = (
-            {
-                c: 1.0 / sigma if (sigma := float(frame[c].std(ddof=0))) > 0 else 1.0
-                for c in self.numeric_cols_
-            }
-            if spans_on
-            else {}
+        self.target_last_ = masking or (training.target_at_end and bool(target_cols))
+        sigmas = {c: float(frame[c].std(ddof=0)) for c in self.numeric_cols_}
+        examples = _ExampleFactory(
+            serializer=self.serializer,
+            columns=self.columns_,
+            numeric_cols=self.numeric_cols_,
+            target_cols=self.target_cols_,
+            target_last=self.target_last_,
+            masking=masking,
+            permute=training.permute_order,
+            dropout=training.column_dropout,
+            # numeric_noise is a fraction of each column's own sigma, so one knob
+            # covers heterogeneous units; a constant column has no scale to noise by.
+            noise_scales=(
+                {c: training.numeric_noise * s for c, s in sigmas.items() if s > 0}
+                if training.numeric_noise > 0
+                else {}
+            ),
+            # The auxiliary numeric error is squared in the column's own unit, so a
+            # large-scale column would otherwise monopolize the term; 1/sigma puts
+            # every column's error in standard deviations. A constant column has
+            # nothing to normalize by.
+            inv_scales=(
+                {c: 1.0 / s if s > 0 else 1.0 for c, s in sigmas.items()}
+                if training.numeric_loss_weight > 0
+                else {}
+            ),
         )
-        # numeric_noise is a fraction of each column's own sigma, so one knob
-        # covers heterogeneous units; a constant column has no scale to noise by.
-        noise_scales = (
-            {
-                c: self.training.numeric_noise * sigma
-                for c in self.numeric_cols_
-                if (sigma := float(frame[c].std(ddof=0))) > 0
-            }
-            if self.training.numeric_noise > 0
-            else {}
-        )
-
-        def _noisy_row(row: Mapping[str, object], rng: np.random.Generator) -> Mapping[str, object]:
-            if not noise_scales:
-                return row
-            return {
-                c: _noisy(v, noise_scales[c], rng) if c in noise_scales and not is_missing(v) else v
-                for c, v in row.items()
-            }
-
-        def _ordered_fields(row: Mapping[str, object], order: Sequence[str]) -> list[Field]:
-            return [Field(c, row[c], c in self.numeric_cols_) for c in order]
-
-        def _numeric_spans(
-            fields: list[Field], text: str, prompt_len: int
-        ) -> tuple[NumericSpan, ...]:
-            if not spans_on:
-                return ()
-            # The true value is what the digits encode (max_decimals applied),
-            # not the raw cell -- the auxiliary loss compares against the text.
-            return tuple(
-                NumericSpan(start, end, float(text[start:end].replace(" ", "")), inv_scales[f.name])
-                for f, (start, end) in zip(fields, self.serializer.value_spans(fields), strict=True)
-                if f.numeric and start >= prompt_len
-            )
-
-        def row_examples(
-            row: Mapping[str, object], rng: np.random.Generator, aug: int, *, noisy: bool = True
-        ) -> list[TrainingExample]:
-            present = [c for c in self.columns_ if not is_missing(row[c])]
-            observed_targets = [c for c in present if c in target_cols]
-            observed_context = [c for c in present if c not in target_cols]
-            tgt_present = observed_targets if target_last else []
-            dropout = self.training.column_dropout if noisy and observed_targets else 0.0
-            # Without permutation the copies share one order and differ only by
-            # their noise draw; nothing to noise collapses back to a single copy.
-            copies = aug if noise_scales or (observed_context and dropout > 0) else 1
-            if not tgt_present:
-                orders = _distinct_orders(present, aug, rng) if permute else [present] * copies
-                examples: list[TrainingExample] = []
-                for order in orders:
-                    if dropout > 0:
-                        order = [c for c in order if c in target_cols or rng.random() >= dropout]
-                    fields = _ordered_fields(_noisy_row(row, rng) if noisy else row, order)
-                    text = self.serializer.serialize(fields)
-                    examples.append(TrainingExample("", text, _numeric_spans(fields, text, 0)))
-                return examples
-            ctx_cols = observed_context
-            pairs = (
-                _distinct_block_orders(ctx_cols, tgt_present, aug, rng)
-                if permute
-                else [(ctx_cols, tgt_present)] * copies
-            )
-            examples = []
-            for ctx, tgt in pairs:
-                if dropout > 0:
-                    ctx = [c for c in ctx if rng.random() >= dropout]
-                src = _noisy_row(row, rng) if noisy else row
-                ctx_fields = _ordered_fields(src, ctx)
-                tgt_fields = _ordered_fields(src, tgt)
-                prompt, completion = self.serializer.split(ctx_fields, tgt_fields)
-                # The prompt boundary is the loss mask: masking supervises only the
-                # target (context lives in the prompt); otherwise the loss stays on
-                # the whole row (empty prompt) but the target is still fixed last.
-                spans = _numeric_spans(
-                    ctx_fields + tgt_fields, prompt + completion, len(prompt) if masking else 0
-                )
-                examples.append(
-                    TrainingExample(prompt, completion, spans)
-                    if masking
-                    else TrainingExample("", prompt + completion, spans)
-                )
-            return examples
 
         all_rows = frame.to_dict("records")
-        if (evaluation := self.training.evaluation) is not None:
+        if (evaluation := training.evaluation) is not None:
             train_idx, eval_idx = _split_indices(
                 frame, target_cols, evaluation.split, evaluation.stratify, self.random_state
             )
@@ -675,7 +331,13 @@ class TabularLanguageModel(BaseEstimator):
         train_rows = [all_rows[i] for i in train_idx]
         eval_rows = [all_rows[i] for i in eval_idx]
 
-        aug = self.training.augmentation_factor
+        # sklearn convention: random_state=None is non-deterministic. Draw one base
+        # seed per fit so each epoch's permutation is seeded on (base_seed, epoch) --
+        # idempotent within the fit, fresh across fits when None.
+        base_seed = (
+            self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
+        )
+        aug = training.augmentation_factor
 
         def epoch_texts(epoch: int) -> list[TrainingExample]:
             # Seed per epoch so the call is pure in ``epoch``: the backend requests
@@ -683,25 +345,25 @@ class TabularLanguageModel(BaseEstimator):
             # must get identical data, and the permutation stream must not depend on
             # whether ``max_seq_length`` was auto-measured.
             rng = np.random.default_rng([base_seed, epoch])
-            examples = [ex for row in train_rows for ex in row_examples(row, rng, aug)]
-            rng.shuffle(examples)
-            self.callback.on_train_examples(examples[:_TRAIN_PREVIEW], epoch)
-            return examples
+            texts = [ex for row in train_rows for ex in examples(row, rng, aug)]
+            rng.shuffle(texts)
+            self.callback.on_train_examples(texts[:_TRAIN_PREVIEW], epoch)
+            return texts
 
         eval_examples: list[TrainingExample] | None = None
         if eval_rows:
             eval_rng = np.random.default_rng(self.random_state)
             eval_examples = [
-                ex for row in eval_rows for ex in row_examples(row, eval_rng, 1, noisy=False)
+                ex for row in eval_rows for ex in examples(row, eval_rng, 1, noisy=False)
             ]
 
         configured = self.model.model
         label = configured if isinstance(configured, str) else type(configured).__name__
-        self.callback.on_fit_info(label, self.training)
-        self.callback.on_fit_start(len(train_rows), self.training.epochs)
+        self.callback.on_fit_info(label, training)
+        self.callback.on_fit_start(len(train_rows), training.epochs)
         self.backend.fit(
             epoch_texts,
-            self.training,
+            training,
             self.model,
             random_state=self.random_state,
             callback=self.callback,
@@ -709,119 +371,6 @@ class TabularLanguageModel(BaseEstimator):
         )
         self.callback.on_fit_end()
         return self
-
-    def _fields(self, known: Mapping[str, object]) -> list[Field]:
-        return [Field(c, _native(v), c in self.numeric_cols_) for c, v in known.items()]
-
-    def _ensure_permutable(self) -> None:
-        """Reject order marginalization on a model that never saw permuted orders."""
-        if not self.training.permute_order:
-            raise ValueError(
-                "generation.permute_order with n_samples > 1 requires a model trained "
-                "with training.permute_order=True; this fit only saw the canonical "
-                "column order"
-            )
-
-    def _order_rng(self, row_id: int) -> np.random.Generator:
-        """RNG for one row's column-order draws, seeded on ``(random_state, row_id)``.
-
-        Seeding on the row's absolute identity rather than its position within
-        one call keeps order draws invariant to how callers chunk rows across
-        calls -- the batch-size invariance the estimators promise.
-        """
-        base = self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
-        return np.random.default_rng([base, row_id])
-
-    def _sample_rng(self, row_id: int, step: int) -> np.random.Generator:
-        """RNG for drawing one categorical cell, seeded on ``(random_state, row_id, step)``.
-
-        Keyed on the row's absolute identity and the target step so the draw is
-        reproducible and invariant to how callers chunk rows -- the batch-size
-        invariance the estimators promise -- while differing across cells.
-        """
-        base = self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
-        return np.random.default_rng([base, row_id, step])
-
-    def _generate_random_state(self, row_id: int, step: int, attempt: int) -> int | None:
-        """Sampler seed for one generation batch.
-
-        Keyed on ``(random_state, row_id, step, attempt)``: ``row_id`` is the
-        absolute identity of the batch's first row, so the same rows chunked
-        the same way redraw the same texts across calls, and
-        each retry re-seeds differently. ``None`` under ``random_state=None``
-        (the backend's stream is left alone: non-deterministic, sklearn
-        convention).
-        """
-        if self.random_state is None:
-            return None
-        rng = np.random.default_rng([self.random_state, row_id, step, attempt])
-        return int(rng.integers(2**32))
-
-    def _resolve_batch_size(self, generation: GenerationConfig) -> int:
-        """Inference batch size: ``generation.inference_batch_size`` or training ``batch_size``."""
-        return generation.inference_batch_size or self.training.batch_size
-
-    def _generate_values(
-        self,
-        requests: Sequence[tuple[str, str]],
-        generation: GenerationConfig,
-        *,
-        row_ids: Sequence[int],
-        step: int,
-    ) -> list[object | None]:
-        """Decode one value per ``(prompt, target)`` request, batched with retries.
-
-        Requests are generated in chunks of ``inference_batch_size``; malformed
-        decodings are re-batched and retried (firing ``on_retry`` each round)
-        until they parse or ``max_retries`` is exhausted, where they stay
-        ``None``. Per-request attempt budget matches the unbatched path. With
-        greedy decoding (``generation.temperature <= 0``) every retry would
-        reproduce the same text byte for byte, so a single attempt is made.
-        With ``generation.constrain_numeric``, numeric requests are grouped
-        apart from the rest so a whole batch shares one logits constraint.
-        Each backend call is seeded by :meth:`_generate_random_state` on its
-        first request's ``row_ids`` entry, ``step`` and the attempt, so a fitted
-        model with ``random_state`` set redraws the same texts call after call.
-        """
-        results: list[object | None] = [None] * len(requests)
-        pending = list(range(len(requests)))
-        batch_size = self._resolve_batch_size(generation)
-        max_attempts = 1 if generation.temperature <= 0 else self.max_retries
-        constraint = self.serializer.numeric_constraint() if generation.constrain_numeric else None
-        for attempt in range(1, max_attempts + 1):
-            if not pending:
-                break
-            if constraint is None:
-                groups = [(pending, None)]
-            else:
-                numeric = [i for i in pending if requests[i][1] in self.numeric_cols_]
-                free = [i for i in pending if requests[i][1] not in self.numeric_cols_]
-                groups = [(numeric, constraint), (free, None)]
-            still: list[int] = []
-            for group, group_constraint in groups:
-                for start in range(0, len(group), batch_size):
-                    chunk = group[start : start + batch_size]
-                    prompts = [requests[i][0] for i in chunk]
-                    continuations = self.backend.generate(
-                        prompts,
-                        generation,
-                        constraint=group_constraint,
-                        random_state=self._generate_random_state(row_ids[chunk[0]], step, attempt),
-                    )
-                    for i, continuation in zip(chunk, continuations, strict=True):
-                        numeric_cell = requests[i][1] in self.numeric_cols_
-                        value = self.serializer.decode_value(continuation, numeric=numeric_cell)
-                        self.callback.on_generation(
-                            requests[i][0], continuation, requests[i][1], value
-                        )
-                        if value is None:
-                            still.append(i)
-                        else:
-                            results[i] = value
-            for i in still:
-                self.callback.on_retry(requests[i][1], attempt, max_attempts)
-            pending = still
-        return results
 
     def complete_many(
         self,
@@ -1069,15 +618,7 @@ class TabularLanguageModel(BaseEstimator):
             if order is not None:
                 orders = [_ordered(cols, order)] * n
             elif generation.permute_order and n > 1 and len(cols) > 1:
-                # Target columns stay in a tail block under the per-draw permutation,
-                # mirroring the target-last training layout; see predict_proba_many.
-                tail = [c for c in cols if c in self.target_cols_] if self.target_last_ else []
-                if tail:
-                    ctx = [c for c in cols if c not in self.target_cols_]
-                    pairs = _distinct_block_orders(ctx, tail, n, self._order_rng(row_id))
-                    distinct = [c_order + t_order for c_order, t_order in pairs]
-                else:
-                    distinct = _distinct_orders(cols, n, self._order_rng(row_id))
+                distinct = self._marginal_orders(cols, n, row_id)
                 orders = [distinct[j % len(distinct)] for j in range(n)]
             else:
                 orders = [cols] * n
@@ -1112,28 +653,15 @@ class TabularLanguageModel(BaseEstimator):
     ) -> list[dict[str, object] | None]:
         """Fill each row's targets cell by cell, scoring some and generating the rest.
 
-        Under ``generation.cell_context="chained"`` cells condition on the prior
-        fills; under ``"observed"`` every cell conditions on the row's observed
-        cells alone. Numeric fills are rounded to the column's observed decimal
-        precision (:attr:`decimals_`) as they are stored, so a chained prompt
-        never carries a full-precision mean the training text could not contain.
-        On a ``target-last`` fitted model, target-column cells in
-        the context (prior fills, or observed target cells) serialize in a tail
-        block under order marginalization -- the two blocks permute
-        independently, mirroring the training layout. The same column is
-        batched across rows (grouped by column, since candidates are
-        per-column).
-        ``generation.cell_order`` picks the within-row order: ``"column"``
-        (default) follows ``targets`` as given; ``"confidence"`` re-scores every
-        still-pending scored cell each round and fills the one whose distribution
-        has the lowest normalized entropy, so later fills condition on the values
-        the model was most certain about. Columns in ``score`` are ranked with
-        :meth:`predict_proba_many` and reduced to a value; a row whose turn falls
-        on a generated column (under ``"confidence"``, one with only generated
-        columns pending) draws it with :meth:`sample_aggregate_many` on a
-        single-column target (so ``generation.n_samples`` aggregates per cell). A
-        scored cell always yields a value, so only generated cells can fail and
-        drop a row to ``None``.
+        Columns in ``score`` are ranked with :meth:`predict_proba_many` and
+        reduced to a value; the rest are drawn with :meth:`sample_aggregate_many`
+        one cell at a time. Under ``generation.cell_context="chained"`` a cell
+        conditions on the row's observed cells plus the fills before it, in
+        ``targets`` order (or most-confident-first under
+        ``generation.cell_order="confidence"``); under ``"observed"`` every cell
+        conditions on the observed cells alone. Numeric fills are rounded to the
+        column's observed precision (:attr:`decimals_`) before they re-enter a
+        prompt. The same column is batched across rows.
 
         Parameters
         ----------
@@ -1157,7 +685,7 @@ class TabularLanguageModel(BaseEstimator):
         list[dict[str, object] or None]
             One result per row: ``known`` merged with its filled targets, or
             ``None`` if one of that row's generated cells stayed malformed after
-            ``max_retries``.
+            ``max_retries`` (a scored cell always yields a value).
         """
         ids = list(row_ids) if row_ids is not None else list(range(len(knowns)))
         rows = [
@@ -1209,37 +737,6 @@ class TabularLanguageModel(BaseEstimator):
                     for i, row in enumerate(rows)
                 ]
         return [dict(row.filled) if row.alive else None for row in rows]
-
-    def _quantized(self, col: str, value: object) -> object:
-        """Round a computed numeric fill to the column's observed precision.
-
-        A scored estimate or a generated aggregate is an arithmetic mean, so its
-        repr carries far more decimals than any observed value; serialized into a
-        chained prompt it would be text the model never trained on. Non-numeric
-        columns and non-numeric values pass through untouched; an integer
-        column's fill becomes an ``int`` so it serializes without a decimal
-        point, exactly like its observed cells.
-        """
-        decimals = self.decimals_.get(col)
-        v = _native(value)
-        if decimals is None or not isinstance(v, int | float):
-            return value
-        return int(round(v)) if decimals == 0 else round(float(v), decimals)
-
-    def _distribution(self, logprobs: np.ndarray) -> np.ndarray:
-        """Softmax a candidate log-likelihood vector into a probability row.
-
-        Falls back to a uniform distribution when no candidate is finite.
-        """
-        n = len(logprobs)
-        uniform = np.full(n, 1.0 / n)
-        finite = np.isfinite(logprobs)
-        if not finite.any():
-            return uniform
-        weights = np.exp(logprobs - logprobs[finite].max())
-        weights[~finite] = 0.0  # -inf candidates are impossible -> zero mass
-        total = weights.sum()
-        return weights / total if total > 0 else uniform
 
     def predict_proba_many(
         self,
@@ -1318,21 +815,11 @@ class TabularLanguageModel(BaseEstimator):
         row_prompts: list[list[str]] = []
         for k, row_id in zip(knowns, ids, strict=True):
             cols = list(k) if order is None else _ordered(list(k), order)
-            if not (multi and len(cols) > 1):
-                orders = [cols]
-            else:
-                # The target-last fine-tune only ever showed target columns (observed
-                # or chained fills) in a tail block, so the marginalization permutes
-                # the two blocks independently (the training layout), never mixing them.
-                tail = [c for c in cols if c in self.target_cols_] if self.target_last_ else []
-                if tail:
-                    ctx = [c for c in cols if c not in self.target_cols_]
-                    pairs = _distinct_block_orders(
-                        ctx, tail, generation.n_samples, self._order_rng(row_id)
-                    )
-                    orders = [c_order + t_order for c_order, t_order in pairs]
-                else:
-                    orders = _distinct_orders(cols, generation.n_samples, self._order_rng(row_id))
+            orders = (
+                self._marginal_orders(cols, generation.n_samples, row_id)
+                if multi and len(cols) > 1
+                else [cols]
+            )
             row_prompts.append([
                 self.serializer.prefix(
                     [Field(c, _native(k[c]), c in self.numeric_cols_) for c in order], target
@@ -1363,18 +850,6 @@ class TabularLanguageModel(BaseEstimator):
             proba = proba / np.clip(prior, 1e-12, None) ** generation.prior_correction
             proba /= proba.sum(axis=1, keepdims=True)
         return proba
-
-    def _prior_distribution(
-        self, target: str, candidates: Sequence[object], generation: GenerationConfig
-    ) -> np.ndarray:
-        """The model's empty-context distribution over ``candidates``, cached per fit."""
-        key = (target, tuple(candidates), generation.candidate_scoring)
-        cached = self._prior_cache_.get(key)
-        if cached is None:
-            neutral = replace(generation, prior_correction=0.0)
-            cached = self.predict_proba_many([{}], target, candidates, neutral)[0]
-            self._prior_cache_[key] = cached
-        return cached
 
     def predict_proba(
         self, known: Mapping[str, object], target: str, candidates: Sequence[object]
@@ -1416,53 +891,21 @@ class TabularLanguageModel(BaseEstimator):
     ) -> list[str]:
         """Learn the column order the model predicts ``targets`` best under.
 
-        The model was fine-tuned on permuted column orders, so any order is
-        admissible at inference -- but it is not equally accurate under all of
-        them. One order is learned for the whole table: it lays out every
-        target's conditioning cells (:attr:`GenerationConfig.column_order`) and
-        is the order the imputer fills a row's missing cells in, so under
-        ``cell_context="chained"`` a cell conditions on the fills before it and
-        never on the ones after. Each
-        target is calibrated on rows of ``X`` where it is *observed*: the cell
-        is hidden, the other columns are serialized in each of ``n_orders``
-        sampled orders, and an order is scored by the log-probability the model
-        assigns to the true value among the candidates (the levels of a
-        categorical target; for a numeric one, ``bins`` representatives of its
-        observed values). The calibration context mirrors inference: each
-        calibration row also hides a pattern of columns drawn from those missing
-        *alongside* the target in the rows to be predicted, so the learned
-        order never leans on a column that will be absent when the target is
-        scored. An additive position model (``score ~ sum of per-(column,
-        position) effects``) is fit to the scored orders of every target at
-        once and the assignment of columns to positions that maximizes it is
-        returned -- typically an order that was never scored directly.
-
-        Columns never conditioned on during calibration -- missing alongside
-        every target -- carry no positional evidence and come last, right
-        before the target being predicted, the best-predicted among them (by
-        calibration log-likelihood over chance) first. That is the layout
-        training produced them in: under
-        :attr:`TrainingConfig.target_loss_weight` the target columns are
-        serialized as a block at the row's end, never inside the context -- so
-        a prompt that holds one (an observed target cell, or a chained fill)
-        matches training only with that cell adjacent to the predicted target.
-        The skill ordering also makes a hard target's fill condition on an
-        easier target's fill and not the other way round.
-
-        Cost is at most ``n_rows * n_orders * n_candidates`` scored pairs per
-        target, independent of the number of permutations. The rows are scored
-        in three batches (a quarter, a quarter, a half) and only the better
-        half of the orders survives each batch (successive halving); orders cut
-        early still enter the position model with the rows they saw, a per-row
-        effect keeping them comparable to orders that saw more. Scoring stops
-        as soon as the assignment stops changing between batches.
+        One order is learned for the whole table: it lays out every target's
+        conditioning cells (:attr:`GenerationConfig.column_order`) and is the
+        order the imputer fills a row's missing cells in. Each target is
+        calibrated on rows of ``X`` where it is observed: the cell is hidden --
+        along with a pattern of columns missing alongside the target in the
+        rows to be predicted, so the calibration conditions on what inference
+        will have -- and sampled orders are scored by the log-probability the
+        model assigns to the true value among the candidates (a categorical
+        target's levels; ``bins`` representatives of a numeric one). See
+        :func:`sklm.order.infer_order` for the racing and position model.
 
         Parameters
         ----------
         X : array-like or pandas.DataFrame of shape (n_samples, n_features)
-            Rows in the training columns; may contain NaN. Calibration uses the
-            rows where each target is observed, conditioning on their observed
-            cells.
+            Rows in the training columns; may contain NaN.
         targets : collection of str or None, optional
             Columns to calibrate on. ``None`` (default) takes the columns with
             at least one missing cell in ``X``, or every column when ``X`` is
@@ -1491,134 +934,219 @@ class TabularLanguageModel(BaseEstimator):
         """
         check_is_fitted(self)
         frame = to_frame(X, self.columns_)
-        base = GenerationConfig() if generation is None else generation
-        single = replace(base, n_samples=1, column_order=None)
+        single = replace(generation or GenerationConfig(), n_samples=1, column_order=None)
         if targets is None:
             missing = [c for c in self.columns_ if bool(frame[c].isna().any())]
             targets = missing or list(self.columns_)
         rng = np.random.default_rng(self.random_state)
-        columns = list(self.columns_)
 
-        @dataclass(frozen=True)
-        class Probe:
-            """One target's calibration set: observed rows, what each hides, the truth."""
+        def candidates(target: str) -> list[object]:
+            if target in self.numeric_cols_:
+                observed = frame[target].dropna().to_numpy()
+                return list(select_candidates(observed, DiscretizationConfig(bins=bins)))
+            return list(self.categories_[target])
 
-            target: str
-            rows: list[dict[str, object]]
-            hidden: list[frozenset[str]]
-            candidates: list[object]
-            true_idx: np.ndarray
-
-            def knowns(self, order: Sequence[str], lo: int, hi: int) -> list[dict[str, object]]:
-                return [
-                    {
-                        c: row[c]
-                        for c in order
-                        if c != self.target and c not in hide and not is_missing(row[c])
-                    }
-                    for row, hide in zip(self.rows[lo:hi], self.hidden[lo:hi], strict=True)
-                ]
-
-        def probe(target: str) -> Probe | None:
-            numeric = target in self.numeric_cols_
-            observed = frame.loc[frame[target].notna()]
-            if numeric:
-                candidates: list[object] = list(
-                    select_candidates(observed[target].to_numpy(), DiscretizationConfig(bins=bins))
+        probes = [
+            probe
+            for t in targets
+            if (
+                probe := build_probe(
+                    frame,
+                    t,
+                    candidates(t),
+                    columns=self.columns_,
+                    numeric=t in self.numeric_cols_,
+                    n_rows=n_rows,
+                    rng=rng,
                 )
-            else:
-                candidates = list(self.categories_[target])
-                observed = observed.loc[observed[target].isin(candidates)]
-            if len(candidates) < 2 or observed.empty or len(columns) < 3:
-                return None
-            picks = rng.choice(len(observed), size=min(n_rows, len(observed)), replace=False)
-            rows = observed.iloc[picks].to_dict("records")
-            # Calibrate in the context inference will have: hide, in each calibration
-            # row, the pattern of other columns missing alongside the target in the
-            # rows to be predicted (sampled from their empirical patterns).
-            context = [c for c in columns if c != target]
-            to_fill = frame.loc[frame[target].isna(), context]
-            patterns = [frozenset(to_fill.columns[r]) for r in to_fill.isna().to_numpy()] or [
-                frozenset()
-            ]
-            hidden = [patterns[i] for i in rng.integers(len(patterns), size=len(rows))]
-            truth = [_native(row[target]) for row in rows]
-            if numeric:
-                grid = np.asarray(candidates, dtype=float)
-                true_idx = np.abs(np.asarray(truth, dtype=float)[:, None] - grid).argmin(axis=1)
-            else:
-                lookup = {c: i for i, c in enumerate(candidates)}
-                true_idx = np.asarray([lookup[v] for v in truth])
-            return Probe(target, rows, hidden, candidates, true_idx)
+            )
+            is not None
+        ]
+        return infer_order(
+            lambda knowns, target, cands: self.predict_proba_many(knowns, target, cands, single),
+            probes,
+            self.columns_,
+            n_orders=n_orders,
+            rng=rng,
+        )
 
-        probes = [p for p in (probe(t) for t in targets) if p is not None]
-        if not probes:
-            return columns
-        orders = _distinct_orders(columns, n_orders, rng)
-        seen = {
-            c
-            for p in probes
-            for row, hide in zip(p.rows, p.hidden, strict=True)
-            for c in columns
-            if c != p.target and c not in hide and not is_missing(row[c])
-        }
-        # per target, log p(true) over chance (log n_candidates) of every scored pair:
-        # how well it is predicted, comparable across candidate counts
-        gain: dict[str, list[float]] = {p.target: [] for p in probes}
+    def __sklearn_tags__(self) -> Tags:
+        tags = super().__sklearn_tags__()
+        tags.input_tags.string = True
+        tags.input_tags.categorical = True
+        tags.input_tags.allow_nan = True
+        return tags
 
-        @dataclass(frozen=True)
-        class Race:
-            """Per order, the log p(true) of every (target, row) scored so far; who still runs."""
+    def _fields(self, known: Mapping[str, object]) -> list[Field]:
+        return [Field(c, _native(v), c in self.numeric_cols_) for c, v in known.items()]
 
-            hits: tuple[tuple[float, ...], ...]
-            alive: frozenset[int]
-            best: tuple[str, ...] | None = None
-            converged: bool = False
-
-        def score_batch(race: Race, lo: int, hi: int) -> dict[int, list[float]]:
-            """The effectful step: score every live order on rows[lo:hi], one call per target."""
-            alive = sorted(race.alive)
-            logs: dict[int, list[float]] = {k: [] for k in alive}
-            for p in probes:
-                knowns = [known for k in alive for known in p.knowns(orders[k], lo, hi)]
-                if not knowns:
-                    continue
-                proba = self.predict_proba_many(knowns, p.target, p.candidates, single)
-                truth_idx = np.tile(p.true_idx[lo:hi], len(alive))
-                hit = np.log(np.clip(proba[np.arange(len(knowns)), truth_idx], 1e-12, None))
-                per_order = len(knowns) // len(alive)
-                for i, k in enumerate(alive):
-                    logs[k].extend(hit[i * per_order : (i + 1) * per_order].tolist())
-                gain[p.target].extend((hit + np.log(len(p.candidates))).tolist())
-            return logs
-
-        def advance(race: Race, scored: Mapping[int, Sequence[float]]) -> Race:
-            """Fold one batch in: extend the hits, keep the better half, refit."""
-            hits = tuple(h + tuple(scored.get(k, ())) for k, h in enumerate(race.hits))
-            means = [float(np.mean(h)) for h in hits]
-            ranked = sorted(race.alive, key=means.__getitem__, reverse=True)
-            best = tuple(_positional_order(orders, hits))
-            return Race(
-                hits=hits,
-                alive=frozenset(ranked[: max(2, len(ranked) // 2)]),
-                best=best,
-                converged=best == race.best,
+    def _ensure_permutable(self) -> None:
+        """Reject order marginalization on a model that never saw permuted orders."""
+        if not self.training.permute_order:
+            raise ValueError(
+                "generation.permute_order with n_samples > 1 requires a model trained "
+                "with training.permute_order=True; this fit only saw the canonical "
+                "column order"
             )
 
-        def batches(n: int) -> list[tuple[int, int]]:
-            """Row slices doubling in size (n/4, n/4, n/2): a successive-halving schedule."""
-            edges = [0, n // 4, n // 2, n]
-            return [(lo, hi) for lo, hi in pairwise(edges) if hi > lo]
+    def _marginal_orders(self, cols: list[str], n: int, row_id: int) -> list[list[str]]:
+        """Up to ``n`` distinct orders of ``cols`` for one row's order marginalization.
 
-        race = Race(hits=tuple(() for _ in orders), alive=frozenset(range(len(orders))))
-        for lo, hi in batches(max(len(p.rows) for p in probes)):
-            race = advance(race, score_batch(race, lo, hi))
-            if race.converged:
+        The target-last fine-tune only ever showed target columns (observed or
+        chained fills) in a tail block, so on such a model the context and
+        target blocks permute independently -- the training layout -- and are
+        never mixed.
+        """
+        rng = self._order_rng(row_id)
+        tail = [c for c in cols if c in self.target_cols_] if self.target_last_ else []
+        if not tail:
+            return distinct_orders(cols, n, rng)
+        ctx = [c for c in cols if c not in self.target_cols_]
+        return [c_order + t_order for c_order, t_order in distinct_block_orders(ctx, tail, n, rng)]
+
+    def _order_rng(self, row_id: int) -> np.random.Generator:
+        """RNG for one row's column-order draws, seeded on ``(random_state, row_id)``.
+
+        Seeding on the row's absolute identity rather than its position within
+        one call keeps order draws invariant to how callers chunk rows across
+        calls -- the batch-size invariance the estimators promise.
+        """
+        base = self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
+        return np.random.default_rng([base, row_id])
+
+    def _sample_rng(self, row_id: int, step: int) -> np.random.Generator:
+        """RNG for drawing one categorical cell, seeded on ``(random_state, row_id, step)``.
+
+        Keyed on the row's absolute identity and the target step so the draw is
+        reproducible and invariant to how callers chunk rows -- the batch-size
+        invariance the estimators promise -- while differing across cells.
+        """
+        base = self.random_state if self.random_state is not None else int.from_bytes(os.urandom(8))
+        return np.random.default_rng([base, row_id, step])
+
+    def _generate_random_state(self, row_id: int, step: int, attempt: int) -> int | None:
+        """Sampler seed for one generation batch.
+
+        Keyed on ``(random_state, row_id, step, attempt)``: ``row_id`` is the
+        absolute identity of the batch's first row, so the same rows chunked
+        the same way redraw the same texts across calls, and
+        each retry re-seeds differently. ``None`` under ``random_state=None``
+        (the backend's stream is left alone: non-deterministic, sklearn
+        convention).
+        """
+        if self.random_state is None:
+            return None
+        rng = np.random.default_rng([self.random_state, row_id, step, attempt])
+        return int(rng.integers(2**32))
+
+    def _resolve_batch_size(self, generation: GenerationConfig) -> int:
+        """Inference batch size: ``generation.inference_batch_size`` or training ``batch_size``."""
+        return generation.inference_batch_size or self.training.batch_size
+
+    def _generate_values(
+        self,
+        requests: Sequence[tuple[str, str]],
+        generation: GenerationConfig,
+        *,
+        row_ids: Sequence[int],
+        step: int,
+    ) -> list[object | None]:
+        """Decode one value per ``(prompt, target)`` request, batched with retries.
+
+        Requests are generated in chunks of ``inference_batch_size``; malformed
+        decodings are re-batched and retried (firing ``on_retry`` each round)
+        until they parse or ``max_retries`` is exhausted, where they stay
+        ``None``. Per-request attempt budget matches the unbatched path. With
+        greedy decoding (``generation.temperature <= 0``) every retry would
+        reproduce the same text byte for byte, so a single attempt is made.
+        With ``generation.constrain_numeric``, numeric requests are grouped
+        apart from the rest so a whole batch shares one logits constraint.
+        Each backend call is seeded by :meth:`_generate_random_state` on its
+        first request's ``row_ids`` entry, ``step`` and the attempt, so a fitted
+        model with ``random_state`` set redraws the same texts call after call.
+        """
+        results: list[object | None] = [None] * len(requests)
+        pending = list(range(len(requests)))
+        batch_size = self._resolve_batch_size(generation)
+        max_attempts = 1 if generation.temperature <= 0 else self.max_retries
+        constraint = self.serializer.numeric_constraint() if generation.constrain_numeric else None
+        for attempt in range(1, max_attempts + 1):
+            if not pending:
                 break
-        best = list(race.best or orders[0])
-        skill = {target: float(np.mean(g)) for target, g in gain.items() if g}
-        unseen = sorted((c for c in best if c not in seen), key=lambda c: -skill.get(c, -np.inf))
-        return [c for c in best if c in seen] + unseen
+            if constraint is None:
+                groups = [(pending, None)]
+            else:
+                numeric = [i for i in pending if requests[i][1] in self.numeric_cols_]
+                free = [i for i in pending if requests[i][1] not in self.numeric_cols_]
+                groups = [(numeric, constraint), (free, None)]
+            still: list[int] = []
+            for group, group_constraint in groups:
+                for start in range(0, len(group), batch_size):
+                    chunk = group[start : start + batch_size]
+                    prompts = [requests[i][0] for i in chunk]
+                    continuations = self.backend.generate(
+                        prompts,
+                        generation,
+                        constraint=group_constraint,
+                        random_state=self._generate_random_state(row_ids[chunk[0]], step, attempt),
+                    )
+                    for i, continuation in zip(chunk, continuations, strict=True):
+                        numeric_cell = requests[i][1] in self.numeric_cols_
+                        value = self.serializer.decode_value(continuation, numeric=numeric_cell)
+                        self.callback.on_generation(
+                            requests[i][0], continuation, requests[i][1], value
+                        )
+                        if value is None:
+                            still.append(i)
+                        else:
+                            results[i] = value
+            for i in still:
+                self.callback.on_retry(requests[i][1], attempt, max_attempts)
+            pending = still
+        return results
+
+    def _quantized(self, col: str, value: object) -> object:
+        """Round a computed numeric fill to the column's observed precision.
+
+        A scored estimate or a generated aggregate is an arithmetic mean, so its
+        repr carries far more decimals than any observed value; serialized into a
+        chained prompt it would be text the model never trained on. Non-numeric
+        columns and non-numeric values pass through untouched; an integer
+        column's fill becomes an ``int`` so it serializes without a decimal
+        point, exactly like its observed cells.
+        """
+        decimals = self.decimals_.get(col)
+        v = _native(value)
+        if decimals is None or not isinstance(v, int | float):
+            return value
+        return int(round(v)) if decimals == 0 else round(float(v), decimals)
+
+    def _distribution(self, logprobs: np.ndarray) -> np.ndarray:
+        """Softmax a candidate log-likelihood vector into a probability row.
+
+        Falls back to a uniform distribution when no candidate is finite.
+        """
+        n = len(logprobs)
+        uniform = np.full(n, 1.0 / n)
+        finite = np.isfinite(logprobs)
+        if not finite.any():
+            return uniform
+        weights = np.exp(logprobs - logprobs[finite].max())
+        weights[~finite] = 0.0  # -inf candidates are impossible -> zero mass
+        total = weights.sum()
+        return weights / total if total > 0 else uniform
+
+    def _prior_distribution(
+        self, target: str, candidates: Sequence[object], generation: GenerationConfig
+    ) -> np.ndarray:
+        """The model's empty-context distribution over ``candidates``, cached per fit."""
+        key = (target, tuple(candidates), generation.candidate_scoring)
+        cached = self._prior_cache.get(key)
+        if cached is None:
+            neutral = replace(generation, prior_correction=0.0)
+            cached = self.predict_proba_many([{}], target, candidates, neutral)[0]
+            self._prior_cache[key] = cached
+        return cached
 
     def _score_pairs(
         self, prompts: Sequence[str], continuations: Sequence[str], generation: GenerationConfig
@@ -1645,9 +1173,271 @@ class TabularLanguageModel(BaseEstimator):
             )
         return scores
 
-    def __sklearn_tags__(self) -> Tags:
-        tags = super().__sklearn_tags__()
-        tags.input_tags.string = True
-        tags.input_tags.categorical = True
-        tags.input_tags.allow_nan = True
-        return tags
+
+def _strata(values: pd.Series, n_bins: int = 10) -> np.ndarray:
+    """Discrete stratification key for ``values``.
+
+    Numeric columns with more than ``n_bins`` distinct values are binned into
+    quantiles (so a regression target stratifies like a set of class labels);
+    everything else is used verbatim. This makes the hold-out's stratification
+    target-type agnostic -- one rule covers classification and regression.
+    """
+    if pd.api.types.is_numeric_dtype(values) and values.nunique() > n_bins:
+        return np.asarray(pd.qcut(values, q=n_bins, duplicates="drop", labels=False))
+    return values.to_numpy()
+
+
+def _split_indices(
+    frame: pd.DataFrame,
+    target_cols: frozenset[str],
+    split: float,
+    stratify: bool,
+    random_state: int | None,
+) -> tuple[list[int], list[int]]:
+    """Partition ``frame``'s row indices into ``(train, eval)`` for the hold-out.
+
+    Stratifies on the sole target column when ``stratify`` is set and that column
+    is fully observed -- binning it if numeric -- so classifier labels and
+    regressor targets are both balanced across the split; otherwise splits at
+    random. Falls back to a random split (with a warning) when a stratified split
+    is infeasible, e.g. a class with too few members for both sides.
+    """
+    indices = np.arange(len(frame))
+    strata: np.ndarray | None = None
+    if stratify and len(target_cols) == 1:
+        (col,) = target_cols
+        column = frame[col]
+        if isinstance(column, pd.Series) and bool(column.notna().all()):
+            strata = _strata(column)
+    try:
+        train_idx, eval_idx = train_test_split(
+            indices, test_size=split, random_state=random_state, stratify=strata
+        )
+    except ValueError:
+        if strata is None:
+            raise
+        warnings.warn(
+            "stratified validation split was infeasible (a class has too few "
+            "members); falling back to a random split.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        train_idx, eval_idx = train_test_split(
+            indices, test_size=split, random_state=random_state, stratify=None
+        )
+    return np.asarray(train_idx).tolist(), np.asarray(eval_idx).tolist()
+
+
+def _native(value: object) -> object:
+    """Unbox a NumPy scalar into its native Python equivalent.
+
+    Inference inputs (knowns, candidates, sample conditions) arrive from user
+    code and often carry NumPy scalars; serializers must see native types
+    (``repr(np.float64(1.5))`` is ``"np.float64(1.5)"`` on NumPy >= 2)."""
+    return value.item() if isinstance(value, np.generic) else value
+
+
+def _decimal_places(value: object) -> int:
+    """Decimal places the value's serialized text carries (0 for integers).
+
+    ``Decimal(repr(v))`` rather than splitting on ``"."``: a scientific-notation
+    repr (``repr(1e-05) == "1e-05"``) has no point to split on but still encodes
+    five decimal places.
+    """
+    v = _native(value)
+    if isinstance(v, int):
+        return 0
+    exponent = Decimal(repr(v)).as_tuple().exponent
+    return max(0, -exponent) if isinstance(exponent, int) else 0
+
+
+def _noisy(value: object, sigma: float, rng: np.random.Generator) -> object:
+    """Perturb one numeric cell with Gaussian noise at the cell's own precision.
+
+    The perturbed value serializes exactly like the original would: an integer
+    cell stays an integer and a float cell keeps its decimal count
+    (:func:`_decimal_places`), so ``numeric_noise`` never changes the number
+    format the model sees.
+    """
+    v = _native(value)
+    if not isinstance(v, int | float):
+        return value
+    draw = float(rng.normal(0.0, sigma))
+    return round(v + draw) if isinstance(v, int) else round(v + draw, _decimal_places(v))
+
+
+def _normalized_entropy(proba: np.ndarray) -> float:
+    """Entropy of a probability row, scaled to [0, 1] by its support size."""
+    if len(proba) < 2:
+        return 0.0
+    positive = proba[proba > 0]
+    return float(-(positive * np.log(positive)).sum() / math.log(len(proba)))
+
+
+def _ordered(columns: Sequence[str], order: Sequence[str]) -> list[str]:
+    """``columns`` in the order ``order`` lists them."""
+    present = set(columns)
+    return [c for c in order if c in present]
+
+
+def _column_order(generation: GenerationConfig, columns: Sequence[str]) -> list[str] | None:
+    """``generation.column_order``, checked to be a permutation of the training ``columns``."""
+    order = generation.column_order
+    if order is None:
+        return None
+    if sorted(order) != sorted(columns):
+        raise ValueError(
+            f"column_order must be a permutation of the training columns {list(columns)}, "
+            f"got {list(order)}"
+        )
+    return list(order)
+
+
+@dataclass(frozen=True, slots=True)
+class _ScoreSpec:
+    """How to fill one scored column: candidates to rank and a reducer.
+
+    Lets :meth:`TabularLanguageModel.impute_many` stay agnostic of what makes a
+    column discrete -- the imputer injects, per column, the candidate set (a
+    numeric grid or a categorical's observed levels) and a
+    ``(proba_row, candidates) -> value`` reduction closure (the numeric estimate
+    or a categorical argmax).
+    """
+
+    candidates: Sequence[object]
+    reduce: Callable[[np.ndarray, Sequence[object]], object]
+
+
+@dataclass(frozen=True)
+class _ImputeRow:
+    """One row mid-imputation: its observed cells, the cells filled so far, the pending ones."""
+
+    known: Mapping[str, object]
+    filled: Mapping[str, object]
+    pending: tuple[str, ...]
+    alive: bool = True
+
+
+def _fill_scored(
+    row: _ImputeRow,
+    cells: Mapping[str, np.ndarray],
+    score: Mapping[str, _ScoreSpec],
+    quantize: Callable[[str, object], object],
+) -> _ImputeRow:
+    """Fill the probed cell whose distribution is most confident (lowest entropy)."""
+    col, proba = min(cells.items(), key=lambda item: _normalized_entropy(item[1]))
+    return replace(
+        row,
+        filled={**row.filled, col: quantize(col, score[col].reduce(proba, score[col].candidates))},
+        pending=tuple(c for c in row.pending if c != col),
+    )
+
+
+def _fill_generated(
+    row: _ImputeRow, out: Mapping[str, object] | None, quantize: Callable[[str, object], object]
+) -> _ImputeRow:
+    """Fill the row's next pending cell with a generated value, or kill the row."""
+    if out is None:
+        return replace(row, alive=False)
+    col = row.pending[0]
+    filled = {**row.filled, col: quantize(col, out[col])}
+    return replace(row, filled=filled, pending=row.pending[1:])
+
+
+@dataclass(frozen=True)
+class _ExampleFactory:
+    """Serializes one training row into its per-epoch variants.
+
+    Holds what ``fit`` resolves once -- the block layout (targets last, context
+    down-weighted), whether orders are permuted, the per-column noise and
+    inverse scales -- so drawing a row's ``aug`` variants from an RNG is a pure
+    call. ``noisy=False`` serializes the row clean (validation rows).
+    """
+
+    serializer: Serializer
+    columns: Sequence[str]
+    numeric_cols: frozenset[str]
+    target_cols: frozenset[str]
+    target_last: bool
+    masking: bool
+    permute: bool
+    dropout: float
+    noise_scales: Mapping[str, float]
+    inv_scales: Mapping[str, float]
+
+    def __call__(
+        self, row: Mapping[str, object], rng: np.random.Generator, aug: int, *, noisy: bool = True
+    ) -> list[TrainingExample]:
+        present = [c for c in self.columns if not is_missing(row[c])]
+        observed_targets = [c for c in present if c in self.target_cols]
+        context = [c for c in present if c not in self.target_cols]
+        dropout = self.dropout if noisy and observed_targets else 0.0
+        # Without permutation the copies share one order and differ only by
+        # their noise draw; nothing to noise collapses back to a single copy.
+        copies = aug if self.noise_scales or (context and dropout > 0) else 1
+        if not (self.target_last and observed_targets):
+            orders = distinct_orders(present, aug, rng) if self.permute else [present] * copies
+            examples: list[TrainingExample] = []
+            for order in orders:
+                if dropout > 0:
+                    order = [c for c in order if c in self.target_cols or rng.random() >= dropout]
+                fields = self._fields(self._noisy_row(row, rng) if noisy else row, order)
+                text = self.serializer.serialize(fields)
+                examples.append(TrainingExample("", text, self._spans(order, fields, text, 0)))
+            return examples
+        pairs = (
+            distinct_block_orders(context, observed_targets, aug, rng)
+            if self.permute
+            else [(context, observed_targets)] * copies
+        )
+        examples = []
+        for ctx, tgt in pairs:
+            if dropout > 0:
+                ctx = [c for c in ctx if rng.random() >= dropout]
+            src = self._noisy_row(row, rng) if noisy else row
+            ctx_fields, tgt_fields = self._fields(src, ctx), self._fields(src, tgt)
+            prompt, completion = self.serializer.split(ctx_fields, tgt_fields)
+            # The prompt boundary is the loss mask: masking supervises only the
+            # target (context lives in the prompt); otherwise the loss stays on
+            # the whole row (empty prompt) but the target is still fixed last.
+            spans = self._spans(
+                ctx + tgt,
+                ctx_fields + tgt_fields,
+                prompt + completion,
+                len(prompt) if self.masking else 0,
+            )
+            examples.append(
+                TrainingExample(prompt, completion, spans)
+                if self.masking
+                else TrainingExample("", prompt + completion, spans)
+            )
+        return examples
+
+    def _noisy_row(
+        self, row: Mapping[str, object], rng: np.random.Generator
+    ) -> Mapping[str, object]:
+        if not self.noise_scales:
+            return row
+        return {
+            c: _noisy(v, self.noise_scales[c], rng)
+            if c in self.noise_scales and not is_missing(v)
+            else v
+            for c, v in row.items()
+        }
+
+    def _fields(self, row: Mapping[str, object], order: Sequence[str]) -> list[Field]:
+        return [Field(c, row[c], c in self.numeric_cols) for c in order]
+
+    def _spans(
+        self, order: Sequence[str], fields: list[Field], text: str, prompt_len: int
+    ) -> tuple[NumericSpan, ...]:
+        if not self.inv_scales:
+            return ()
+        # The true value is what the digits encode (max_decimals applied), not
+        # the raw cell -- the auxiliary loss compares against the text.
+        spans = self.serializer.value_spans(fields)
+        return tuple(
+            NumericSpan(start, end, float(text[start:end].replace(" ", "")), self.inv_scales[c])
+            for c, (start, end) in zip(order, spans, strict=True)
+            if c in self.numeric_cols and start >= prompt_len
+        )

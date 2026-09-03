@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import NamedTuple, Protocol, runtime_checkable
 
 import numpy as np
@@ -149,7 +149,15 @@ class ValueConstraint:
 
 @runtime_checkable
 class Serializer(Protocol):
-    """Convert tabular rows to and from the text the model trains and samples on."""
+    """Convert tabular rows to and from the text the model trains and samples on.
+
+    ``number`` is the :class:`NumberFormat` numeric cells are rendered with; the
+    estimators' ``max_decimals`` rebuilds it through
+    :meth:`NumberFormat.with_max_decimals`, and ``numeric_loss_weight`` checks it
+    renders one digit per token.
+    """
+
+    number: NumberFormat
 
     def serialize(self, fields: Sequence[Field]) -> str:
         """Serialize a full (ordered) row into one training/sampling string."""
@@ -214,6 +222,10 @@ class NumberFormat(Protocol):
 
     @property
     def alphabet(self) -> frozenset[str]: ...
+
+    def with_max_decimals(self, max_decimals: int | None) -> NumberFormat:
+        """This format rounding to ``max_decimals`` places (``None``: no rounding)."""
+        ...
 
     def encode(self, value: object) -> str:
         """Render a numeric value as text."""
@@ -292,6 +304,9 @@ class PlainNumber:
     def alphabet(self) -> frozenset[str]:
         return _PLAIN_ALPHABET
 
+    def with_max_decimals(self, max_decimals: int | None) -> NumberFormat:
+        return replace(self, max_decimals=max_decimals)
+
     def encode(self, value: object) -> str:
         return _digits(value, self.max_decimals)
 
@@ -320,6 +335,9 @@ class SpacedDigits:
     @property
     def alphabet(self) -> frozenset[str]:
         return _PLAIN_ALPHABET | {" "}
+
+    def with_max_decimals(self, max_decimals: int | None) -> NumberFormat:
+        return replace(self, max_decimals=max_decimals)
 
     def encode(self, value: object) -> str:
         return " ".join(_digits(value, self.max_decimals))

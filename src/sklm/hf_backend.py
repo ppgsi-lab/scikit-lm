@@ -1020,7 +1020,7 @@ def _causal_collator(
             slotted["numeric_targets"] = [f.pop("numeric_targets") for f in features]
             slotted["numeric_weights"] = [f.pop("numeric_weights") for f in features]
         batch = tokenizer.pad(features, return_tensors="pt")
-        width = batch["input_ids"].shape[1]
+        token_width = batch["input_ids"].shape[1]
 
         def right_pad(rows: list[list[Any]], fill: float | int, dtype: Any, width: int) -> Any:
             out = torch.full((len(rows), width), fill, dtype=dtype)
@@ -1029,7 +1029,7 @@ def _causal_collator(
             return out
 
         for key, rows, fill, dtype in extras:
-            batch[key] = right_pad(rows, fill, dtype, width)
+            batch[key] = right_pad(rows, fill, dtype, token_width)
         if slotted:
             slots = max((len(t) for t in slotted["numeric_targets"]), default=0) or 1
             for key, rows in slotted.items():

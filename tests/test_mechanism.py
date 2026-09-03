@@ -30,7 +30,8 @@ from sklm import (
     TabularLanguageModel,
     TrainingConfig,
 )
-from sklm.core import _positional_order, _ScoreSpec
+from sklm.core import _ScoreSpec
+from sklm.order import positional_order
 
 from .conftest import FakeBackend, _stable
 
@@ -1159,7 +1160,7 @@ def test_positional_order_discounts_the_rows_each_order_saw() -> None:
     hits = [
         [v + 0.1 * o.index("t") for v in (easy + hard if o[-1] == "t" else easy)] for o in orders
     ]
-    assert _positional_order(orders, hits)[-1] == "t"
+    assert positional_order(orders, hits)[-1] == "t"
 
 
 def test_infer_optimal_order_defaults_to_missing_columns_and_is_deterministic() -> None:
