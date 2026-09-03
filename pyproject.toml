@@ -92,8 +92,9 @@ dev = [
     "pyampute>=0.0.3",
     "xgboost>=2.1",
     "sdv>=1.13",
-    "skyward>=0.9.2",
+    "skyward[client,providers,server]>=0.11.1",
     "cyclopts>=3.0",
+    "hyperimpute>=0.1.17",
 ]
 
 [build-system]
@@ -132,20 +133,28 @@ dev = [
     "jupyterlab>=4.5.7",
 ]
 
+# The global uv config caps the index at "7 days"; skyward 0.11.1 was published
+# 2026-08-27, so lift the cap for it. The floor must match what the remote
+# bootstrap's unpinned `uv add skyward` resolves: local 0.10.0 against a
+# remote 0.11.x broke the worker (`skyward.infra` no longer exists).
+[tool.uv]
+exclude-newer-package = { skyward = "2026-08-27T19:00:00Z" }
+
 [tool.uv.extra-build-dependencies]
 # mps-bitsandbytes needs torch at build time but doesn't declare it.
 mps-bitsandbytes = ["torch"]
 
-# [tool.uv.sources]
 # Dev-only: resolve the `skyward` extra from the local checkout instead of PyPI.
-# Not written into the published wheel/sdist, so the `skyward>=0.9.2` floor stands.
+# Not written into the published wheel/sdist, so the `skyward>=0.10.0` floor stands.
+# Keep this block commented in commits.
+# [tool.uv.sources]
 # skyward = { path = "../skyward", editable = true }
 
 [tool.ruff]
 line-length = 100
 target-version = "py312"
 src = ["src", "tests", "exps"]
-extend-exclude = ["examples", "src/sklm/_version.py"]
+extend-exclude = ["examples", "playground", "src/sklm/_version.py"]
 
 [tool.ruff.format]
 preview = true
