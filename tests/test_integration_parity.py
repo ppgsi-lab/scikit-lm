@@ -4,12 +4,12 @@ fine-tuning on each installed backend must reach a comparable training loss and 
 comparable reconstruction accuracy.
 
 This is the net for bugs the per-backend unit tests miss. It runs the
-``loss_on_target_only`` path on purpose: that mask is plumbed differently on each
-backend (HF emits ``labels`` with the prompt set to -100; MLX masks by token
-offset), and a backend that drops it silently supervises the whole row instead of
-the target -- which shows up here as a backend whose masked training loss never
-collapses on a trivially reconstructible target. Speed is out of scope (MLX is
-typically faster); only quality has to match.
+``target_loss_weight=1.0`` path on purpose: that mask is plumbed differently on
+each backend (HF rides a ``loss_weights`` column into a custom Trainer loss; MLX
+weights by token offset), and a backend that drops it silently supervises the
+whole row instead of the target -- which shows up here as a backend whose masked
+training loss never collapses on a trivially reconstructible target. Speed is out
+of scope (MLX is typically faster); only quality has to match.
 
 The test self-skips unless at least two of the requested backends are importable,
 so in practice it runs on a dev box rather than CI. Adding a backend to compare is
@@ -18,9 +18,10 @@ a one-line entry in the parametrized ``backends`` set.
 
 from __future__ import annotations
 
+import math
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import override
+from typing import Literal, override
 
 import numpy as np
 import pandas as pd
@@ -29,6 +30,7 @@ from sklearn.metrics import accuracy_score
 
 from sklm import (
     Callback,
+    EvalConfig,
     Event,
     LanguageModelClassifier,
     TrainingConfig,
@@ -82,10 +84,10 @@ def _xy(n: int, seed: int) -> tuple[pd.DataFrame, np.ndarray]:
 
 
 def _params() -> TrainingConfig:
-    """The shared ``P``. ``loss_on_target_only`` focuses the loss on the target,
+    """The shared ``P``. ``target_loss_weight=1.0`` focuses the loss on the target,
     which every backend must honor; ``label_smoothing`` is pinned to 0 so the
     reported losses are plain per-token cross-entropy and thus comparable."""
-    return TrainingConfig(epochs=12, batch_size=8, label_smoothing=0.0, loss_on_target_only=True)
+    return TrainingConfig(epochs=12, batch_size=8, label_smoothing=0.0, target_loss_weight=1.0)
 
 
 class _LossRecorder(Callback):
@@ -147,3 +149,73 @@ def test_backend_loss_and_accuracy_parity(backends: tuple[_Backend, ...]) -> Non
     # 2) the backends agree with each other on loss and accuracy
     assert max(losses) - min(losses) <= _LOSS_BAND, summary
     assert max(accs) - min(accs) <= _ACC_BAND, summary
+
+
+# --- custom-loss paths (mirrored on both backends, invariant 3) --------------
+
+
+def _fit_with(
+    spec: _Backend, training: TrainingConfig, number_format: Literal["plain", "spaced"] = "plain"
+) -> _LossRecorder:
+    """Short real fine-tune; returns the loss recorder for finiteness checks."""
+    rec = _LossRecorder()
+    clf = LanguageModelClassifier(
+        model=spec.model,
+        backend=spec.backend,
+        training=training,
+        callback=rec,
+        random_state=0,
+        number_format=number_format,
+    )
+    X, y = _xy(24, seed=0)
+    clf.fit(X, y)
+    assert clf.predict(X.head(4)).shape == (4,)
+    return rec
+
+
+@pytest.mark.parametrize("spec", [pytest.param(_HF, id="hf"), pytest.param(_MLX, id="mlx")])
+def test_target_loss_weight_trains_with_finite_loss(spec: _Backend) -> None:
+    if not spec.available():
+        pytest.skip(f"requires the {spec.name!r} stack")
+    rec = _fit_with(spec, TrainingConfig(epochs=2, batch_size=8, target_loss_weight=0.65))
+    assert rec.losses and all(math.isfinite(loss) for loss in rec.losses)
+
+
+@pytest.mark.parametrize("spec", [pytest.param(_HF, id="hf"), pytest.param(_MLX, id="mlx")])
+def test_numeric_loss_weight_trains_with_finite_loss(spec: _Backend) -> None:
+    if not spec.available():
+        pytest.skip(f"requires the {spec.name!r} stack")
+    rec = _fit_with(
+        spec,
+        TrainingConfig(epochs=2, batch_size=8, numeric_loss_weight=0.5),
+        number_format="spaced",
+    )
+    assert rec.losses and all(math.isfinite(loss) for loss in rec.losses)
+
+
+# --- score grouping invariance (prefix-cached two-phase path) ----------------
+
+
+@pytest.mark.parametrize("spec", [pytest.param(_HF, id="hf"), pytest.param(_MLX, id="mlx")])
+def test_score_grouping_invariance(spec: _Backend) -> None:
+    """``score`` may not depend on how pairs are grouped: a batch whose
+    consecutive pairs share a prompt (one prefill amortized over the group's
+    candidates) must match scoring each pair alone, for both reductions."""
+    if not spec.available():
+        pytest.skip(f"requires the {spec.name!r} stack")
+    clf = LanguageModelClassifier(
+        model=spec.model,
+        backend=spec.backend,
+        training=TrainingConfig(epochs=1, batch_size=4, evaluation=EvalConfig(patience=None)),
+        random_state=0,
+    )
+    clf.fit(*_xy(48, seed=0))
+    backend = clf.lm_.backend
+    prompts = ['{"a": 1.5, "b": '] * 4 + ['{"a": 2.5, "c": 7, "b": '] * 3 + ['{"q": ']
+    conts = ["1.5", "22.75", "0.4", "9", "1.5", "3", "8.25", "0"]
+    for reduce in ("mean", "sum"):
+        grouped = backend.score(prompts, conts, reduce=reduce)
+        singles = [
+            backend.score([p], [c], reduce=reduce)[0] for p, c in zip(prompts, conts, strict=True)
+        ]
+        assert grouped == pytest.approx(singles, abs=2e-2), reduce

@@ -16,6 +16,7 @@ import pytest
 from sklm import (
     Callback,
     CheckpointConfig,
+    EvalConfig,
     EvalReport,
     Event,
     LanguageModelClassifier,
@@ -77,7 +78,7 @@ def _eval_reports_fire(model: str, backend: str) -> None:
     clf = LanguageModelClassifier(
         model=model,
         backend=backend,
-        training=TrainingConfig(epochs=2, batch_size=8, validation_split=0.25),
+        training=TrainingConfig(epochs=2, batch_size=8, evaluation=EvalConfig(split=0.25)),
         callback=rec,
         random_state=0,
     )
@@ -100,9 +101,7 @@ def _early_stopping_stops_short(model: str, backend: str) -> None:
             batch_size=8,
             # overfit fast so validation loss rises and early stop fires
             lr_scheduler=LRScheduler.cosine(learning_rate=2e-3),
-            validation_split=0.25,
-            stratify=False,
-            early_stopping_patience=2,
+            evaluation=EvalConfig(split=0.25, stratify=False, patience=2),
         ),
         callback=rec,
         random_state=0,
@@ -125,8 +124,7 @@ def _plateau_reduces_lr(model: str, backend: str) -> None:
             batch_size=8,
             # a high LR makes validation loss stop improving; plateau then halves it
             lr_scheduler=LRScheduler.plateau(learning_rate=2e-3, patience=1, factor=0.5),
-            validation_split=0.25,
-            stratify=False,
+            evaluation=EvalConfig(split=0.25, stratify=False),
         ),
         callback=rec,
         random_state=0,
@@ -217,6 +215,29 @@ def _resume_continues_to_budget(model: str, backend: str, tmp_path: Path) -> Non
     assert set(clf.predict(X.head(4))).issubset(set(clf.classes_))
 
 
+def _eval_on_step_cadence(model: str, backend: str) -> None:
+    """``EvalConfig(each=2, on="step")`` evaluates every second optimizer step on
+    both backends, not once per epoch: 30 training rows x 2 variants at batch 8
+    is 8 steps per epoch, so 2 epochs report evaluations at every even step."""
+    X, y = _clf_xy()
+    rec = _EvalRecorder()
+    clf = LanguageModelClassifier(
+        model=model,
+        backend=backend,
+        training=TrainingConfig(
+            epochs=2,
+            batch_size=8,
+            evaluation=EvalConfig(split=0.25, stratify=False, each=2, on="step", patience=None),
+        ),
+        callback=rec,
+        random_state=0,
+    )
+    clf.fit(X, y)
+    steps = [step for step, _ in rec.eval_reports]
+    assert steps == list(range(2, max(rec.train_steps) + 1, 2))
+    assert set(clf.predict(X.head(4))).issubset(set(clf.classes_))
+
+
 # --- HuggingFace ----------------------------------------------------------
 
 
@@ -250,6 +271,11 @@ def test_hf_resume_continues_to_budget(tmp_path: Path) -> None:
     _resume_continues_to_budget("distilgpt2", "huggingface", tmp_path)
 
 
+@pytest.mark.skipif(not _has_hf(), reason="requires the 'hf' extra")
+def test_hf_eval_on_step_cadence() -> None:
+    _eval_on_step_cadence("distilgpt2", "huggingface")
+
+
 # --- MLX ------------------------------------------------------------------
 
 
@@ -281,6 +307,11 @@ def test_mlx_checkpoint_resumes_from_dir(tmp_path: Path) -> None:
 @pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon")
 def test_mlx_resume_continues_to_budget(tmp_path: Path) -> None:
     _resume_continues_to_budget(_MLX_MODEL, "mlx", tmp_path)
+
+
+@pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon")
+def test_mlx_eval_on_step_cadence() -> None:
+    _eval_on_step_cadence(_MLX_MODEL, "mlx")
 
 
 @pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon")

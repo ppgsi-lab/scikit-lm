@@ -1,6 +1,9 @@
 # torch/transformers come from the optional 'hf' extra and are absent from the
 # type-check environment, so pyright cannot resolve them; suppress the import errors.
+# When torch is installed locally its stubs also fail to re-export public names
+# (torch.where, torch.arange, ...), so the private-import check is silenced too.
 # pyright: reportMissingImports=false, reportMissingModuleSource=false
+# pyright: reportPrivateImportUsage=false
 """Hugging Face causal-LM backend built on the ``transformers`` ``Trainer``.
 
 Requires the ``hf`` extra (``pip install scikit-lm[hf]``). torch and
@@ -13,14 +16,26 @@ from __future__ import annotations
 import contextlib
 import gc
 import importlib.util
+import json
+import math
 import os
-import tempfile
 import warnings
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Literal
 
-from .backend import common_token_prefix, resolve_max_new_tokens, resolve_max_seq_length
+from .backend import (
+    DigitTokens,
+    EarlyStopping,
+    checkpoint_workdir,
+    common_token_prefix,
+    numeric_token_arrays,
+    prompt_groups,
+    resolve_digit_tokens,
+    resolve_max_new_tokens,
+    resolve_max_seq_length,
+)
 from .bridge import Model
 from .callbacks import Callback
 from .config import (
@@ -35,7 +50,7 @@ from .config import (
     QuantizationConfig,
     TrainingConfig,
 )
-from .serialize import TrainingExample
+from .serialize import TrainingExample, ValueConstraint
 
 __all__ = ["HFBackend"]
 
@@ -78,6 +93,7 @@ class HFBackend:
         self._precision: str = "fp32"
         self._max_seq_length: int = 256
         self._mps_quantized: bool = False
+        self._constraint_masks: dict[ValueConstraint, Any] = {}
 
     def _resolve_device(self, device: str) -> str:
         torch = self._torch
@@ -189,6 +205,7 @@ class HFBackend:
         self._model = lm
         self._device = device
         self._precision = model_config.precision
+        self._constraint_masks = {}  # per-tokenizer cache; a reload invalidates it
 
     def _resolve_tokenizer(self, model_config: ModelConfig, model: Model) -> Any:
         """Resolve the tokenizer spec to a loaded tokenizer.
@@ -223,7 +240,7 @@ class HFBackend:
         callback: Callback,
         eval_examples: list[TrainingExample] | None = None,
     ) -> None:
-        from transformers import EarlyStoppingCallback, Trainer, TrainingArguments
+        from transformers import Trainer, TrainingArguments
         from transformers.trainer_callback import PrinterCallback, ProgressCallback
         from transformers.trainer_utils import get_last_checkpoint
 
@@ -259,62 +276,105 @@ class HFBackend:
             training = replace(training, max_seq_length=seq_len)
         self._max_seq_length = seq_len
 
-        with tempfile.TemporaryDirectory(prefix="sklm_hf_") as tmp:
+        custom_loss = training.target_loss_weight is not None or training.numeric_loss_weight > 0
+        digit_tokens = (
+            resolve_digit_tokens(lambda t: tok(t, add_special_tokens=False)["input_ids"])
+            if training.numeric_loss_weight > 0
+            else None
+        )
+
+        with checkpoint_workdir("sklm_hf_") as tmp:
             ckpt = training.checkpoint
             output_dir = (ckpt.dir if ckpt is not None else None) or tmp
-            dataset = _text_dataset(epoch_texts, tok, seq_len)
+            dataset = _text_dataset(epoch_texts, tok, seq_len, training, digit_tokens)
             eval_dataset = (
-                _text_dataset(lambda _: eval_examples, tok, seq_len) if eval_examples else None
+                _text_dataset(lambda _: eval_examples, tok, seq_len, training, digit_tokens)
+                if eval_examples
+                else None
             )
-            args = TrainingArguments(
-                **_training_kwargs(
-                    training,
-                    self._device or "cpu",
-                    self._precision,
-                    output_dir,
-                    len(dataset),
-                    random_state,
-                    has_eval=eval_dataset is not None,
-                )
+            train_kwargs = _training_kwargs(
+                training,
+                self._device or "cpu",
+                self._precision,
+                output_dir,
+                len(dataset),
+                random_state,
+                has_eval=eval_dataset is not None,
             )
+            if custom_loss:
+                # The custom compute_loss applies the smoothing itself; leaving the
+                # factor set would also build the Trainer's unused label_smoother.
+                train_kwargs["label_smoothing_factor"] = 0.0
+                # The Trainer wraps the collator to drop columns outside the model's
+                # forward signature; the weighted-loss columns must reach compute_loss
+                # (which pops them before the forward) instead.
+                train_kwargs["remove_unused_columns"] = False
+            args = TrainingArguments(**train_kwargs)
 
-            trainer_callbacks: list[Any] = [
-                _reshuffle_callback(dataset),
-                _loss_callback(callback, self._device_memory_bytes),
-            ]
-            if eval_dataset is not None and training.early_stopping_patience is not None:
-                trainer_callbacks.append(
-                    EarlyStoppingCallback(early_stopping_patience=training.early_stopping_patience)
-                )
-
-            trainer = Trainer(
+            # When ``dir`` already holds checkpoints, resume from the most recent
+            # one (weights + optimizer + scheduler + step) instead of the base
+            # model; ``get_last_checkpoint`` returns None for an empty/new dir.
+            resumable = ckpt is not None and ckpt.dir is not None
+            resume = (
+                get_last_checkpoint(output_dir) if resumable and os.path.isdir(output_dir) else None
+            )
+            best, stopping = _resume_trackers(
+                output_dir,
+                resume,
+                training.evaluation.patience if training.evaluation is not None else None,
+            )
+            report = _report_callback(
+                callback,
+                self._device_memory_bytes,
+                lm,
+                stopping,
+                best=best,
+                ckpt_dir=output_dir if resumable else None,
+            )
+            trainer_cls = _make_weighted_trainer(training, digit_tokens) if custom_loss else Trainer
+            trainer = trainer_cls(
                 model=lm,
                 args=args,
                 train_dataset=dataset,
                 eval_dataset=eval_dataset,
-                data_collator=_causal_collator(tok),
-                callbacks=trainer_callbacks,
+                data_collator=_causal_collator(tok, training),
+                callbacks=[_reshuffle_callback(dataset), report],
                 optimizers=self._resolve_mps_optimizer(training),
             )
             with contextlib.suppress(ValueError):
                 trainer.remove_callback(PrinterCallback)
                 trainer.remove_callback(ProgressCallback)
-            # When ``dir`` already holds checkpoints, resume from the most recent
-            # one (weights + optimizer + scheduler + step) instead of the base
-            # model; ``get_last_checkpoint`` returns None for an empty/new dir.
-            resume = (
-                get_last_checkpoint(output_dir)
-                if ckpt is not None and ckpt.dir is not None and os.path.isdir(output_dir)
-                else None
-            )
             lm.train()
             trainer.train(resume_from_checkpoint=resume)
+            if report.best is not None:
+                _load_weights(lm, report.best)
             lm.eval()
 
-    def generate(self, prompts: Sequence[str], generation: GenerationConfig) -> list[str]:
+    def _constraint_mask(self, constraint: ValueConstraint) -> Any:
+        """Boolean vocab mask of the tokens ``constraint`` allows (plus EOS)."""
+        mask = self._constraint_masks.get(constraint)
+        if mask is None:
+            tok = self._tokenizer
+            allowed = [constraint.allows(tok.decode([i])) for i in range(len(tok))]
+            mask = self._torch.tensor(allowed, dtype=self._torch.bool)
+            if tok.eos_token_id is not None:
+                mask[tok.eos_token_id] = True
+            self._constraint_masks[constraint] = mask
+        return mask
+
+    def generate(
+        self,
+        prompts: Sequence[str],
+        generation: GenerationConfig,
+        *,
+        constraint: ValueConstraint | None = None,
+        random_state: int | None = None,
+    ) -> list[str]:
         """Sample a continuation per prompt (greedy when ``temperature <= 0``)."""
         if not prompts:
             return []
+        if random_state is not None:
+            self._torch.manual_seed(random_state)
         tok, lm = self._tokenizer, self._model
         tok.padding_side = "left"
         tok.truncation_side = "left"
@@ -343,6 +403,21 @@ class HFBackend:
             sampling = {"do_sample": False}
         if generation.repetition_penalty is not None:
             sampling["repetition_penalty"] = generation.repetition_penalty
+        if constraint is not None:
+            from transformers import LogitsProcessorList
+
+            allowed = self._constraint_mask(constraint).to(device)
+
+            def _mask_logits(input_ids: Any, scores: Any) -> Any:
+                n = allowed.shape[0]
+                scores[:, :n] = scores[:, :n].masked_fill(~allowed, float("-inf"))
+                # Model logits may be padded past the tokenizer vocab; those ids
+                # decode to nothing meaningful, so they are always masked.
+                if scores.shape[-1] > n:
+                    scores[:, n:] = float("-inf")
+                return scores
+
+            sampling["logits_processor"] = LogitsProcessorList([_mask_logits])
         with self._inference_context(device):
             out = lm.generate(
                 **enc,
@@ -362,44 +437,106 @@ class HFBackend:
     ) -> list[float]:
         """Per-token log-likelihood of ``continuations[i]`` given ``prompts[i]``.
 
-        Pairs are scored as one right-padded batch in a single forward pass. The
-        continuation boundary per pair is the end of the longest token prefix
-        shared with its prompt, so a BPE merge at the prompt's trailing space
-        (the boundary token) is scored rather than dropped. ``reduce`` collapses
-        each pair's per-token log-likelihoods to the ``"mean"`` (default) or the
-        ``"sum"`` -- kept identical to :meth:`MLXBackend.score` (invariant #3).
+        Pairs are scored in two phases: consecutive pairs sharing a prompt form
+        a group whose common token prefix runs once (a left-padded batch with
+        one row per group, primed into the model's KV cache), then every pair's
+        remaining tokens are scored in one right-padded batch on top of its
+        group's replicated cache -- the shared prompt is not re-forwarded per
+        candidate. The continuation boundary per pair is the end of the longest
+        token prefix shared with its prompt, so a BPE merge at the prompt's
+        trailing space (the boundary token) is scored rather than dropped.
+        ``reduce`` collapses each pair's per-token log-likelihoods to the
+        ``"mean"`` (default) or the ``"sum"`` -- kept identical to
+        :meth:`MLXBackend.score` (invariant #3).
         """
         if not prompts:
             return []
         torch, tok, lm = self._torch, self._tokenizer, self._model
-        tok.padding_side = "right"
         # Right truncation keeps the prompt prefix intact so the longest-common-prefix
         # boundary below stays valid; MLX truncates the same side, so both score the
         # same span for over-length pairs (invariant: identical ranking per backend).
         tok.truncation_side = "right"
         device = next(lm.parameters()).device
+        groups = prompt_groups(prompts)
         full_ids: list[list[int]] = []
         starts: list[int] = []
-        for prompt, continuation in zip(prompts, continuations, strict=True):
-            prompt_ids = tok(prompt)["input_ids"]
-            ids = tok(prompt + continuation, truncation=True, max_length=self._max_seq_length)[
-                "input_ids"
-            ]
-            starts.append(max(common_token_prefix(prompt_ids, ids), 1))
-            full_ids.append(ids)
-        enc = tok.pad({"input_ids": full_ids}, return_tensors="pt").to(device)
-        input_ids, attention_mask = enc["input_ids"], enc["attention_mask"]
+        for a, b in groups:
+            prompt_ids = tok(prompts[a])["input_ids"]  # once per run, not per pair
+            for i in range(a, b):
+                ids = tok(
+                    prompts[i] + continuations[i], truncation=True, max_length=self._max_seq_length
+                )["input_ids"]
+                starts.append(max(common_token_prefix(prompt_ids, ids), 1))
+                full_ids.append(ids)
+
+        # Every full in a group agrees with its shared prompt on the first ``start``
+        # tokens, so ``min(starts) - 1`` is a token prefix common to the whole group;
+        # the ``- 1`` keeps the boundary token in the suffix, so its logit comes from
+        # the suffix pass and the prefill's logits are never needed.
+        prefix_lens = [max(min(starts[a:b]) - 1, 0) for a, b in groups]
+        pair_prefix = [0] * len(prompts)
+        for g, (a, b) in enumerate(groups):
+            pair_prefix[a:b] = [prefix_lens[g]] * (b - a)
+        suffixes = [ids[c : len(ids) - 1] for ids, c in zip(full_ids, pair_prefix, strict=True)]
+        s_max = max(len(s) for s in suffixes)
+        if s_max == 0:  # every full is a single token: nothing is scorable
+            return [float("-inf")] * len(prompts)
+
+        pad_id = tok.pad_token_id or 0
         scores: list[float] = []
         with self._inference_context(device):
-            logits = lm(input_ids=input_ids, attention_mask=attention_mask).logits
+            past = prefix_mask = None
+            if max(prefix_lens) > 0:
+                c_max = max(prefix_lens)
+                prefix_ids = torch.full((len(groups), c_max), pad_id, dtype=torch.long)
+                prefix_mask = torch.zeros((len(groups), c_max), dtype=torch.long)
+                for g, (a, _) in enumerate(groups):
+                    if prefix_lens[g]:  # left padding; a 0-length prefix row stays all-pad
+                        prefix_ids[g, c_max - prefix_lens[g] :] = torch.tensor(
+                            full_ids[a][: prefix_lens[g]]
+                        )
+                        prefix_mask[g, c_max - prefix_lens[g] :] = 1
+                prefix_ids, prefix_mask = prefix_ids.to(device), prefix_mask.to(device)
+                positions = (prefix_mask.cumsum(-1) - 1).clamp(min=0)
+                past = lm(
+                    input_ids=prefix_ids,
+                    attention_mask=prefix_mask,
+                    position_ids=positions,
+                    use_cache=True,
+                ).past_key_values
+                members = torch.tensor(
+                    [g for g, (a, b) in enumerate(groups) for _ in range(a, b)], device=device
+                )
+                past.batch_select_indices(members)  # replicate each group's row, one per pair
+                prefix_mask = prefix_mask[members]
+            suffix_ids = torch.full((len(suffixes), s_max), pad_id, dtype=torch.long)
+            suffix_mask = torch.zeros((len(suffixes), s_max), dtype=torch.long)
+            targets = torch.zeros((len(suffixes), s_max), dtype=torch.long)
+            for i, (suffix, ids) in enumerate(zip(suffixes, full_ids, strict=True)):
+                suffix_ids[i, : len(suffix)] = torch.tensor(suffix)
+                suffix_mask[i, : len(suffix)] = 1
+                targets[i, : len(suffix)] = torch.tensor(ids[pair_prefix[i] + 1 :])
+            suffix_ids, suffix_mask = suffix_ids.to(device), suffix_mask.to(device)
+            positions = torch.tensor(pair_prefix, device=device)[:, None] + torch.arange(
+                s_max, device=device
+            )
+            mask = (
+                suffix_mask if prefix_mask is None else torch.cat([prefix_mask, suffix_mask], dim=1)
+            )
+            logits = lm(
+                input_ids=suffix_ids,
+                attention_mask=mask,
+                position_ids=positions,
+                past_key_values=past,
+            ).logits
             # Cast to fp32 before the softmax so bf16/fp16 weights rank verbalizers
             # the same as the MLX backend (which casts identically); see invariant #3.
-            logprobs = torch.log_softmax(logits[:, :-1].float(), dim=-1)
-            token_logprobs = logprobs.gather(-1, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
+            logprobs = torch.log_softmax(logits.float(), dim=-1)
+            token_logprobs = logprobs.gather(-1, targets.to(device).unsqueeze(-1)).squeeze(-1)
             for row, ids in enumerate(full_ids):
-                # token_logprobs[row, j] scores token j+1; right padding keeps the
-                # continuation span (start..len(ids)-1) before any pad position.
-                cont = token_logprobs[row, starts[row] - 1 : len(ids) - 1]
+                cont = token_logprobs[
+                    row, starts[row] - 1 - pair_prefix[row] : len(ids) - 1 - pair_prefix[row]
+                ]
                 if not cont.numel():
                     scores.append(float("-inf"))
                 else:
@@ -585,19 +722,41 @@ def _reshuffle_callback(dataset: Any) -> Any:
     return _Reshuffle()
 
 
-def _loss_callback(callback: Callback, device_memory: Callable[[], int | None]) -> Any:
-    """Build a ``TrainerCallback`` that forwards ``on_log`` loss and the current
-    device memory to ``callback`` (both at each logging step)."""
+type _Weights = dict[str, Any]
+
+_BEST_FILE = "best.safetensors"
+_STATE_FILE = "sklm_state.json"
+
+
+def _report_callback(
+    callback: Callback,
+    device_memory: Callable[[], int | None],
+    lm: Any,
+    stopping: EarlyStopping,
+    *,
+    best: _Weights | None,
+    ckpt_dir: str | None,
+) -> Any:
+    """Build a ``TrainerCallback`` that forwards train/eval loss and the current
+    device memory to ``callback`` and runs early stopping.
+
+    Every evaluation is fed to ``stopping``: an improvement snapshots the
+    trainable weights into ``.best`` for the caller to restore (and, with
+    ``ckpt_dir`` set, persists them to ``best.safetensors`` on the spot);
+    exhausted patience stops the ``Trainer``. With ``ckpt_dir`` set, every
+    checkpoint the ``Trainer`` writes gets a ``sklm_state.json`` sidecar carrying
+    the no-improvement streak, so a resumed run continues the count 1:1 -- the
+    mirror of the MLX backend's ``state-<step>`` sidecar. ``best`` seeds the
+    snapshot from a resumed ``best.safetensors``.
+    """
     from transformers import TrainerCallback
 
-    class _LossReport(TrainerCallback):
+    class _Report(TrainerCallback):
+        def __init__(self) -> None:
+            self.best = best
+
         def on_log(self, args: object, state: Any, control: object, **kw: Any) -> None:
             logs = kw.get("logs") or {}
-            if "eval_loss" in logs:
-                callback.on_eval_report(
-                    step=state.global_step, loss=float(logs["eval_loss"]), epoch=state.epoch
-                )
-                return
             if "loss" not in logs:
                 return
             callback.on_memory(device_memory())
@@ -611,7 +770,78 @@ def _loss_callback(callback: Callback, device_memory: Callable[[], int | None]) 
                 grad_norm=logs.get("grad_norm"),
             )
 
-    return _LossReport()
+        def on_evaluate(self, args: object, state: Any, control: Any, **kw: Any) -> Any:
+            loss = float(kw["metrics"]["eval_loss"])
+            callback.on_eval_report(step=state.global_step, loss=loss, epoch=state.epoch)
+            match stopping.observe(loss):
+                case "improved":
+                    self.best = {
+                        name: p.detach().to("cpu", copy=True)
+                        for name, p in lm.named_parameters()
+                        if p.requires_grad
+                    }
+                    if ckpt_dir is not None:
+                        _save_best(ckpt_dir, self.best, loss)
+                case "exhausted":
+                    control.should_training_stop = True
+                case "no_improvement":
+                    pass
+            return control
+
+        def on_save(self, args: object, state: Any, control: object, **kw: Any) -> None:
+            if ckpt_dir is None:
+                return
+            sidecar = Path(ckpt_dir) / f"checkpoint-{state.global_step}" / _STATE_FILE
+            sidecar.write_text(json.dumps({"streak": stopping.streak}))
+
+    return _Report()
+
+
+def _save_best(ckpt_dir: str, weights: _Weights, loss: float) -> None:
+    """Persist the best (lowest-eval-loss) trainable weights to ``best.safetensors``.
+
+    Written the moment the best improves (not only at the end) so an interrupted
+    run can still restore it; the loss rides in the file's metadata so resume
+    recovers the bar to beat."""
+    from safetensors.torch import save_file
+
+    save_file(weights, str(Path(ckpt_dir) / _BEST_FILE), metadata={"loss": repr(loss)})
+
+
+def _resume_trackers(
+    ckpt_dir: str, resume: str | None, patience: int | None
+) -> tuple[_Weights | None, EarlyStopping]:
+    """The best weights and early-stopping tracker a resumed run continues from.
+
+    ``best.safetensors`` (when ``ckpt_dir`` holds one) seeds the best weights and
+    loss; the ``sklm_state.json`` sidecar inside the ``resume`` checkpoint seeds
+    the no-improvement streak. A fresh run starts both empty.
+    """
+    from safetensors import safe_open
+    from safetensors.torch import load_file
+
+    best: _Weights | None = None
+    best_loss = math.inf
+    best_file = Path(ckpt_dir) / _BEST_FILE
+    if best_file.exists():
+        best = load_file(str(best_file))
+        with safe_open(str(best_file), framework="pt") as f:
+            best_loss = float(f.metadata()["loss"])
+    streak = 0
+    sidecar = Path(resume) / _STATE_FILE if resume is not None else None
+    if sidecar is not None and sidecar.exists():
+        streak = int(json.loads(sidecar.read_text())["streak"])
+    return best, EarlyStopping(patience, best=best_loss, streak=streak)
+
+
+def _load_weights(lm: Any, weights: _Weights) -> None:
+    """Copy ``weights`` (a ``named_parameters`` subset) back into ``lm`` in place."""
+    import torch
+
+    with torch.no_grad():
+        for name, p in lm.named_parameters():
+            if name in weights:
+                p.copy_(weights[name])
 
 
 def _training_kwargs(
@@ -638,7 +868,8 @@ def _training_kwargs(
             optim = "adamw_torch"
 
     per_step = training.batch_size * training.grad_accumulation_steps
-    epoch_steps = -(-n_rows // per_step) * training.epochs  # ceil div * epochs
+    steps_per_epoch = -(-n_rows // per_step)  # ceil div
+    epoch_steps = steps_per_epoch * training.epochs
     max_steps = min(epoch_steps, training.max_steps) if training.max_steps is not None else -1
 
     kwargs: dict[str, Any] = dict(
@@ -671,7 +902,7 @@ def _training_kwargs(
         seed=random_state if random_state is not None else int.from_bytes(os.urandom(4)),
     )
     _apply_lr_scheduler_kwargs(kwargs, training.lr_scheduler)
-    _apply_eval_kwargs(kwargs, training, has_eval)
+    _apply_eval_kwargs(kwargs, training, steps_per_epoch, has_eval)
     return kwargs
 
 
@@ -714,90 +945,128 @@ def _apply_lr_scheduler_kwargs(kwargs: dict[str, Any], scheduler: LRScheduler) -
                 "min_lr": scheduler.floor,
                 "cooldown": scheduler.cooldown,
             }
+            # The Trainer steps ReduceLROnPlateau with the metric named here.
+            kwargs["metric_for_best_model"] = "eval_loss"
+            kwargs["greater_is_better"] = False
         case _:
             raise ValueError(f"unknown lr_scheduler {type(scheduler).__name__}")
 
 
-def _apply_eval_kwargs(kwargs: dict[str, Any], training: TrainingConfig, has_eval: bool) -> None:
-    """Layer the validation / checkpoint / best-model args onto ``kwargs``.
+def _apply_eval_kwargs(
+    kwargs: dict[str, Any], training: TrainingConfig, steps_per_epoch: int, has_eval: bool
+) -> None:
+    """Layer the checkpoint and evaluation cadences onto ``kwargs``.
 
-    A :class:`~sklm.CheckpointConfig` sets the save cadence (steps or epochs),
-    directory and retention. A held-out set adds evaluation on the same cadence
-    and tracks the lowest-validation-loss checkpoint: the ``Trainer`` requires the
-    save and eval strategies to match for ``load_best_model_at_end``, so a save
-    cadence is forced on (per epoch into the tmp ``output_dir``) even when no
-    explicit checkpoint config was given.
+    Both cadences are expressed in optimizer steps (``on="epoch"`` scales
+    ``each`` by ``steps_per_epoch``), the same conversion the MLX backend
+    applies, so save and eval schedules are independent of each other and
+    identical across backends. Best-model tracking and early stopping live in
+    :func:`_report_callback`, not in the ``Trainer``.
     """
     ckpt = training.checkpoint
-    if ckpt is not None and ckpt.on == "step":
-        save_strategy, save_steps = "steps", ckpt.each
-    else:
-        save_strategy, save_steps = "epoch", None
-
     if ckpt is not None:
-        kwargs["save_strategy"] = save_strategy
-        if save_steps is not None:
-            kwargs["save_steps"] = save_steps
+        kwargs["save_strategy"] = "steps"
+        kwargs["save_steps"] = ckpt.each * (steps_per_epoch if ckpt.on == "epoch" else 1)
         kwargs["save_total_limit"] = ckpt.keep
-
-    if not has_eval:
-        return
-    kwargs["per_device_eval_batch_size"] = training.batch_size
-    if save_strategy == "steps":
+        kwargs["save_only_model"] = not training.save_optimizer_state
+    evaluation = training.evaluation
+    if has_eval and evaluation is not None:
+        kwargs["per_device_eval_batch_size"] = training.batch_size
         kwargs["eval_strategy"] = "steps"
-        kwargs["eval_steps"] = save_steps
-    else:
-        kwargs["eval_strategy"] = "epoch"
-    # A validation set means a "best" checkpoint exists: track and restore it
-    # (HF protects it from ``save_total_limit`` pruning). Saving must be on for
-    # the restore; default to per-epoch saves in the tmp dir when no checkpoint
-    # config was given.
-    if ckpt is None:
-        kwargs["save_strategy"] = save_strategy
-        kwargs["save_total_limit"] = 1
-    kwargs["load_best_model_at_end"] = True
-    kwargs["metric_for_best_model"] = "eval_loss"
-    kwargs["greater_is_better"] = False
+        kwargs["eval_steps"] = evaluation.each * (
+            steps_per_epoch if evaluation.on == "epoch" else 1
+        )
 
 
-def _causal_collator(tokenizer: Any) -> Callable[[list[dict[str, Any]]], dict[str, Any]]:
+def _causal_collator(
+    tokenizer: Any, training: TrainingConfig
+) -> Callable[[list[dict[str, Any]]], dict[str, Any]]:
     def collate(features: list[dict[str, Any]]) -> dict[str, Any]:
-        # ``labels`` rides as a first-class column (the dataset masks the prompt
-        # with -100), so it survives the Trainer's ``remove_unused_columns``. Pull
-        # it out before ``tokenizer.pad`` -- which only pads input_ids/
-        # attention_mask -- then right-pad it with -100 to the batch width (matches
-        # the right-padded input_ids; -100 positions are ignored by the loss).
-        labels = [f.pop("labels") for f in features]
+        import torch
+
+        # ``labels`` (and the weighted-loss columns, when active) ride as
+        # first-class columns, so they survive the Trainer's
+        # ``remove_unused_columns``. Pull them out before ``tokenizer.pad`` --
+        # which only pads input_ids/attention_mask -- then right-pad each to the
+        # batch width (matching the right-padded input_ids; -100 labels and
+        # zero weights/scales are ignored by the loss).
+        extras: list[tuple[str, list[list[Any]], float | int, Any]] = [
+            ("labels", [f.pop("labels") for f in features], -100, torch.int64)
+        ]
+        if training.target_loss_weight is not None:
+            extras.append((
+                "loss_weights",
+                [f.pop("loss_weights") for f in features],
+                0.0,
+                torch.float32,
+            ))
+        # Per-number columns (one entry per numeric span, not per token) pad to
+        # the batch's slot count instead of its token width.
+        slotted: dict[str, list[list[float]]] = {}
+        if training.numeric_loss_weight > 0:
+            extras.append((
+                "digit_scale",
+                [f.pop("digit_scale") for f in features],
+                0.0,
+                torch.float32,
+            ))
+            extras.append((
+                "digit_variant",
+                [f.pop("digit_variant") for f in features],
+                -1,
+                torch.int64,
+            ))
+            extras.append(("number_id", [f.pop("number_id") for f in features], -1, torch.int64))
+            slotted["numeric_targets"] = [f.pop("numeric_targets") for f in features]
+            slotted["numeric_weights"] = [f.pop("numeric_weights") for f in features]
         batch = tokenizer.pad(features, return_tensors="pt")
-        ids = batch["input_ids"]
-        padded = ids.new_full((len(labels), ids.shape[1]), -100)
-        for i, lab in enumerate(labels):
-            padded[i, : len(lab)] = ids.new_tensor(lab)
-        batch["labels"] = padded
+        width = batch["input_ids"].shape[1]
+
+        def right_pad(rows: list[list[Any]], fill: float | int, dtype: Any, width: int) -> Any:
+            out = torch.full((len(rows), width), fill, dtype=dtype)
+            for i, row in enumerate(rows):
+                out[i, : len(row)] = torch.tensor(row, dtype=dtype)
+            return out
+
+        for key, rows, fill, dtype in extras:
+            batch[key] = right_pad(rows, fill, dtype, width)
+        if slotted:
+            slots = max((len(t) for t in slotted["numeric_targets"]), default=0) or 1
+            for key, rows in slotted.items():
+                batch[key] = right_pad(rows, 0.0, torch.float32, slots)
         return batch
 
     return collate
 
 
 def _text_dataset(
-    epoch_texts: Callable[[int], list[TrainingExample]], tokenizer: Any, max_seq_length: int
+    epoch_texts: Callable[[int], list[TrainingExample]],
+    tokenizer: Any,
+    max_seq_length: int,
+    training: TrainingConfig,
+    digit_tokens: DigitTokens | None,
 ) -> Any:
     """Build a torch map-style dataset over per-epoch (re)serialized rows.
 
     ``reshuffle`` refreshes the buffer from ``epoch_texts`` for the next epoch
     index so the column-order permutation is redrawn at each epoch boundary
-    (driven by a Trainer callback). Tokenization is lazy in ``__getitem__``, which
-    also builds ``labels``: a copy of ``input_ids`` with the prompt span set to
-    -100. When an example carries a non-empty ``prompt`` (loss-on-target-only),
-    the masked span is the longest common token prefix between the prompt and the
-    full text (robust to BPE merging the boundary); the causal collator pads
-    dynamically, padding ``labels`` with -100. Emitting ``labels`` directly keeps
-    the mask a first-class column that survives the Trainer's
-    ``remove_unused_columns``.
+    (driven by a Trainer callback). Tokenization is lazy in ``__getitem__``;
+    ``labels`` is a copy of ``input_ids`` (the collator pads it with -100).
+
+    Under ``target_loss_weight`` an example's non-empty ``prompt`` becomes the
+    ``loss_weights`` column (``1 - alpha`` up to the boundary, ``alpha``
+    after); the boundary is the longest common token prefix between the prompt
+    and the full text (robust to BPE merging the edge). Under
+    ``numeric_loss_weight`` the example's ``numeric_spans`` become the
+    per-token digit columns of :func:`~sklm.backend.numeric_token_arrays`.
+    Both are consumed by the custom-loss Trainer.
     """
     from torch.utils.data import Dataset as TorchDataset
 
     eos = tokenizer.eos_token or ""
+    alpha = training.target_loss_weight
+    numeric = training.numeric_loss_weight > 0
+    variant_of = digit_tokens.variant_of if digit_tokens is not None else {}
 
     class _TextDataset(TorchDataset):
         def __init__(self) -> None:
@@ -814,17 +1083,117 @@ def _text_dataset(
         def __getitem__(self, idx: int) -> dict[str, Any]:
             ex = self._buffer[idx]
             enc = tokenizer(ex.text + eos, truncation=True, max_length=max_seq_length)
-            labels = list(enc["input_ids"])
-            if ex.prompt:
-                prompt_ids = tokenizer(ex.prompt)["input_ids"]
-                n = common_token_prefix(prompt_ids, enc["input_ids"])
-                # Always supervise at least one token to avoid an all-masked row.
-                plen = min(n, len(enc["input_ids"]) - 1)
-                labels[:plen] = [-100] * plen
-            return {
-                "input_ids": enc["input_ids"],
-                "attention_mask": enc["attention_mask"],
-                "labels": labels,
-            }
+            ids = enc["input_ids"]
+            item = {"input_ids": ids, "attention_mask": enc["attention_mask"], "labels": list(ids)}
+            if alpha is not None:
+                plen = 0
+                if ex.prompt:
+                    prompt_ids = tokenizer(ex.prompt)["input_ids"]
+                    # Always keep at least one full-weight token: at alpha=1.0 an
+                    # all-prompt row would otherwise have zero loss weight.
+                    plen = min(common_token_prefix(prompt_ids, ids), len(ids) - 1)
+                item["loss_weights"] = [1.0 - alpha] * plen + [alpha] * (len(ids) - plen)
+            if numeric:
+                arrays = numeric_token_arrays(
+                    ex, ids, lambda t: tokenizer(t)["input_ids"], variant_of
+                )
+                item["digit_scale"] = arrays.scale
+                item["digit_variant"] = arrays.variant
+                item["number_id"] = arrays.number_id
+                item["numeric_targets"] = arrays.targets
+                item["numeric_weights"] = arrays.weights
+            return item
 
     return _TextDataset()
+
+
+def _make_weighted_trainer(training: TrainingConfig, digit_tokens: DigitTokens | None) -> type:
+    """Trainer subclass computing the weighted / numeric-augmented loss.
+
+    Active when ``target_loss_weight`` or ``numeric_loss_weight`` is set: the
+    cross-entropy is computed manually (label smoothing included -- the
+    ``label_smoothing_factor`` argument is zeroed by ``fit``) over shifted
+    logits, weighted per token and normalized by the total weight. The numeric
+    term restricts a softmax to the digit-token candidates at each digit
+    position, reconstructs the expected number per ``number_id`` slot and adds
+    the mean squared error against ``numeric_targets``, each slot's error
+    scaled by ``numeric_weights`` (the reciprocal of its column's standard
+    deviation, so unlike-magnitude columns weigh alike)
+    (kept behaviorally identical to ``mlx_backend._make_loss`` -- invariant 3).
+    """
+    import torch
+    import torch.nn.functional as F
+    from transformers import Trainer
+
+    eps = training.label_smoothing
+    numeric_weight = training.numeric_loss_weight
+    candidates = digit_tokens.candidates if digit_tokens is not None else ((), ())
+
+    class _WeightedLossTrainer(Trainer):
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            super().__init__(*args, **kwargs)
+            # The loss is a per-micro-batch weighted mean; opt out of the
+            # Trainer's num_items_in_batch scaling (see Trainer.compute_loss).
+            self.model_accepts_loss_kwargs = False
+
+        def compute_loss(
+            self,
+            model: Any,
+            inputs: dict[str, Any],
+            return_outputs: bool = False,
+            num_items_in_batch: Any = None,
+        ) -> Any:
+            labels = inputs.pop("labels")
+            weights = inputs.pop("loss_weights", None)
+            scale = inputs.pop("digit_scale", None)
+            variant = inputs.pop("digit_variant", None)
+            number_id = inputs.pop("number_id", None)
+            targets = inputs.pop("numeric_targets", None)
+            inv_scale = inputs.pop("numeric_weights", None)
+            outputs = model(**inputs)
+            logits = outputs.logits if hasattr(outputs, "logits") else outputs[0]
+            shift_logits = logits[:, :-1].float()
+            shift_labels = labels[:, 1:]
+            ce = F.cross_entropy(
+                shift_logits.transpose(1, 2),
+                shift_labels,
+                ignore_index=-100,
+                label_smoothing=eps,
+                reduction="none",
+            )
+            if weights is not None:
+                w = weights[:, 1:] * (shift_labels != -100)
+            else:
+                w = (shift_labels != -100).to(ce.dtype)
+            loss = (ce * w).sum() / w.sum()
+            if scale is not None:
+                # Position t's digit token is predicted by the logits at t - 1,
+                # so the per-token arrays shift exactly like the labels.
+                s, v, nid = scale[:, 1:], variant[:, 1:], number_id[:, 1:]
+                expected = torch.zeros_like(s)
+                for var, cand in enumerate(candidates):
+                    if not cand:
+                        continue
+                    p = torch.softmax(shift_logits[..., list(cand)], dim=-1)
+                    digits = torch.arange(10, dtype=p.dtype, device=p.device)
+                    expected = torch.where(v == var, (p * digits).sum(-1), expected)
+                bsz, slots = targets.shape
+                base = torch.arange(bsz, device=nid.device).unsqueeze(1) * slots
+                # Non-digit positions land in a dump slot past the real ones.
+                flat = torch.where(nid >= 0, nid + base, torch.full_like(nid, bsz * slots))
+                sums = torch.zeros(bsz * slots + 1, dtype=s.dtype, device=s.device)
+                sums.index_add_(0, flat.reshape(-1), (expected * s).reshape(-1))
+                counts = torch.zeros_like(sums)
+                counts.index_add_(0, flat.reshape(-1), (nid >= 0).reshape(-1).to(s.dtype))
+                valid = counts[:-1] > 0
+                # inv_scale puts the error in standard deviations of its column,
+                # so columns of unlike magnitude weigh alike (invariant 3: MLX
+                # computes the same product).
+                err = (
+                    (sums[:-1] - targets.reshape(-1).to(s.dtype))
+                    * inv_scale.reshape(-1).to(s.dtype)
+                ) ** 2
+                loss = loss + numeric_weight * (err * valid).sum() / valid.sum().clamp(min=1)
+            return (loss, outputs) if return_outputs else loss
+
+    return _WeightedLossTrainer

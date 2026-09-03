@@ -34,7 +34,17 @@ from typing import Any, Literal
 
 import numpy as np
 
-from .backend import common_token_prefix, resolve_max_new_tokens, resolve_max_seq_length
+from .backend import (
+    DigitTokens,
+    EarlyStopping,
+    checkpoint_workdir,
+    common_token_prefix,
+    numeric_token_arrays,
+    prompt_groups,
+    resolve_digit_tokens,
+    resolve_max_new_tokens,
+    resolve_max_seq_length,
+)
 from .bridge import Model
 from .callbacks import Callback
 from .config import (
@@ -48,7 +58,7 @@ from .config import (
     QuantizationConfig,
     TrainingConfig,
 )
-from .serialize import TrainingExample
+from .serialize import TrainingExample, ValueConstraint
 
 __all__ = ["MLXBackend"]
 
@@ -59,7 +69,7 @@ _DTYPE_NAMES: dict[str, str] = {"fp32": "float32", "bf16": "bfloat16", "fp16": "
 
 
 class _StopTraining(Exception):
-    """Raised from the validation callback to stop ``mlx_lm`` training early.
+    """Raised from the training callback to stop ``mlx_lm`` training early.
 
     ``mlx_lm.tuner.trainer.train`` has no early-stopping hook, so the patience
     check raises this to break out of the loop; the caller catches it and
@@ -79,6 +89,7 @@ class MLXBackend:
         self._model: Any = None
         self._tokenizer: Any = None
         self._max_seq_length: int = 256
+        self._constraint_biases: dict[ValueConstraint, Any] = {}
 
     def _load(self, model: Model, model_config: ModelConfig) -> None:
         try:
@@ -164,6 +175,7 @@ class MLXBackend:
 
         self._model = lm
         self._tokenizer = tokenizer
+        self._constraint_biases = {}  # per-tokenizer cache; a reload invalidates it
 
     def _resolve_tokenizer(self, model_config: ModelConfig) -> Any:
         """Resolve the tokenizer spec to a loaded tokenizer, or ``None`` if unset.
@@ -221,21 +233,22 @@ class MLXBackend:
         self._max_seq_length = seq_len
         lm = self._model
 
-        dataset = _MLXTextDataset(epoch_texts, self._tokenizer, seq_len)
+        digit_tokens = (
+            resolve_digit_tokens(lambda t: tok.encode(t, add_special_tokens=False))
+            if training.numeric_loss_weight > 0
+            else None
+        )
+        dataset = _MLXTextDataset(epoch_texts, self._tokenizer, seq_len, digit_tokens)
         # mlx_lm's batcher needs a full batch per step; clamp batch_size down to the
         # dataset size so tiny inputs (down to sklearn's 1-row conformance checks)
         # still train, the way HFBackend's Trainer already does.
         if len(dataset) < training.batch_size:
             training = replace(training, batch_size=len(dataset))
-        val_dataset = None
-        if eval_examples:
-            val_dataset = _MLXTextDataset(lambda _: eval_examples, self._tokenizer, seq_len)
-            if len(val_dataset) < training.batch_size:
-                raise ValueError(
-                    f"MLXBackend needs at least batch_size={training.batch_size} validation rows, "
-                    f"got {len(val_dataset)}; lower batch_size or validation_split, "
-                    "or use HFBackend."
-                )
+        val_dataset = (
+            _MLXTextDataset(lambda _: eval_examples, self._tokenizer, seq_len, digit_tokens)
+            if eval_examples
+            else None
+        )
 
         # ``train`` counts micro-steps as ``iters`` and applies the optimizer
         # every ``grad_accumulation_steps``; scale so ``max_steps`` stays an
@@ -253,14 +266,22 @@ class MLXBackend:
             max(1, iters // training.grad_accumulation_steps),
             sched.resolved_learning_rate(model_config),
         )
-        iterate_fn = _make_iterate_batches(random_state)
-        loss_fn = _make_loss(training.label_smoothing) if training.label_smoothing > 0 else None
-        patience = training.early_stopping_patience
+        iterate_fn = _make_iterate_batches(random_state, training.numeric_loss_weight > 0)
+        loss_fn = (
+            _make_loss(training, digit_tokens)
+            if (
+                training.label_smoothing > 0
+                or training.target_loss_weight is not None
+                or training.numeric_loss_weight > 0
+            )
+            else None
+        )
+        evaluation = training.evaluation
         plateau = _PlateauReducer(sched) if isinstance(sched, PlateauLR) else None
 
         ckpt = training.checkpoint
         resumable = ckpt is not None and ckpt.dir is not None
-        with tempfile.TemporaryDirectory(prefix="sklm_mlx_") as tmpdir:
+        with checkpoint_workdir("sklm_mlx_") as tmpdir:
             ckpt_dir = (ckpt.dir if ckpt is not None else None) or tmpdir
             Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
             # Resume: when ``dir`` already holds snapshots, restore the most recent
@@ -296,21 +317,43 @@ class MLXBackend:
                 else ckpt.each
                 * (training.grad_accumulation_steps if ckpt.on == "step" else micro_per_epoch)
             )
+            stopping = EarlyStopping(
+                evaluation.patience if evaluation is not None else None,
+                best=resume.best_loss if resume is not None else math.inf,
+                streak=resume.no_improve if resume is not None else 0,
+            )
+            validation = (
+                _Validation(
+                    dataset=val_dataset,
+                    every=evaluation.each
+                    * (
+                        training.grad_accumulation_steps
+                        if evaluation.on == "step"
+                        else micro_per_epoch
+                    ),
+                    batch_size=training.batch_size,
+                    max_seq_length=seq_len,
+                    loss=loss_fn,
+                    iterate_batches=iterate_fn,
+                )
+                if evaluation is not None and val_dataset is not None
+                else None
+            )
             report = _loss_report_callback(
                 callback,
                 lm,
                 optimizer,
                 iters,
-                patience,
+                stopping,
+                validation,
                 ckpt_dir=ckpt_dir,
                 save_every=save_every,
                 keep=ckpt.keep if ckpt is not None else None,
                 plateau=plateau,
                 step_offset=step_offset,
                 resumable=resumable,
+                save_optimizer_state=training.save_optimizer_state,
                 init_best=resume.best if resume is not None else None,
-                init_best_loss=resume.best_loss if resume is not None else math.inf,
-                init_no_improve=resume.no_improve if resume is not None else 0,
             )
             remaining = iters - step_offset
             if remaining > 0:
@@ -322,17 +365,15 @@ class MLXBackend:
                     max_seq_length=seq_len,
                     adapter_file=str(Path(ckpt_dir) / "adapters.safetensors"),
                     steps_per_report=1,
-                    steps_per_eval=micro_per_epoch if val_dataset is not None else remaining + 1,
-                    # mlx-lm's own saving is disabled; the report callback writes
-                    # numbered checkpoint-<step>.safetensors snapshots instead.
+                    # mlx-lm's own saving and evaluation are disabled (no
+                    # ``val_dataset``); the report callback writes numbered
+                    # checkpoint-<step>.safetensors snapshots and evaluates itself.
                     steps_per_save=remaining + 1,
-                    val_batches=-1,
                 )
                 train_kwargs: dict[str, Any] = {
                     "model": lm,
                     "optimizer": optimizer,
                     "train_dataset": dataset,
-                    "val_dataset": val_dataset,
                     "args": args,
                     "iterate_batches": iterate_fn,
                     "training_callback": report,
@@ -352,21 +393,63 @@ class MLXBackend:
                 mx.eval(lm.parameters())
         lm.eval()
 
-    def generate(self, prompts: Sequence[str], generation: GenerationConfig) -> list[str]:
+    def _constraint_bias(self, constraint: ValueConstraint) -> Any:
+        """Additive logits bias: ``0`` for the tokens ``constraint`` allows (plus
+        EOS), ``-inf`` for the rest -- the same mask :meth:`HFBackend.generate`
+        applies (invariant #3)."""
+        bias = self._constraint_biases.get(constraint)
+        if bias is None:
+            import mlx.core as mx
+
+            tok = self._tokenizer
+            # TokenizerWrapper has no __len__; the full vocab (added tokens
+            # included) is recovered from the id mapping instead.
+            vocab = max(tok.get_vocab().values()) + 1
+            allowed = [constraint.allows(tok.decode([i])) for i in range(vocab)]
+            if tok.eos_token_id is not None:
+                allowed[tok.eos_token_id] = True
+            bias = mx.where(mx.array(allowed), 0.0, float("-inf"))
+            self._constraint_biases[constraint] = bias
+        return bias
+
+    def generate(
+        self,
+        prompts: Sequence[str],
+        generation: GenerationConfig,
+        *,
+        constraint: ValueConstraint | None = None,
+        random_state: int | None = None,
+    ) -> list[str]:
         """Sample a continuation per prompt (greedy when ``temperature <= 0``)."""
         if not prompts:
             return []
+        import mlx.core as mx
         from mlx_lm import batch_generate
         from mlx_lm.sample_utils import make_logits_processors, make_sampler
 
         self._model.eval()
+        if random_state is not None:
+            mx.random.seed(random_state)
         temp = generation.temperature if generation.temperature > 0 else 0.0
         sampler = make_sampler(temp=temp, top_p=generation.top_p, top_k=generation.top_k)
         processors = (
             make_logits_processors(repetition_penalty=generation.repetition_penalty)
             if generation.repetition_penalty is not None
-            else None
+            else []
         )
+        if constraint is not None:
+            bias = self._constraint_bias(constraint)
+
+            def _mask_logits(_tokens: Any, logits: Any) -> Any:
+                n = bias.shape[0]
+                # Model logits may be padded past the tokenizer vocab; those ids
+                # decode to nothing meaningful, so they are always masked.
+                if logits.shape[-1] > n:
+                    pad = mx.full((logits.shape[-1] - n,), float("-inf"))
+                    return logits + mx.concatenate([bias, pad])
+                return logits + bias
+
+            processors = [*processors, _mask_logits]
         prompt_ids = self._truncated_prompt_ids(prompts)
         response = batch_generate(
             self._model,
@@ -374,7 +457,7 @@ class MLXBackend:
             prompts=prompt_ids,
             max_tokens=resolve_max_new_tokens(generation, self._max_seq_length),
             sampler=sampler,
-            logits_processors=processors,
+            logits_processors=processors or None,
         )
         return list(response.texts)
 
@@ -399,10 +482,14 @@ class MLXBackend:
     ) -> list[float]:
         """Per-token log-likelihood of ``continuations[i]`` given ``prompts[i]``.
 
-        Pairs are scored as one right-padded batch in a single forward pass. The
-        continuation boundary per pair is the end of the longest token prefix
-        shared with its prompt (so a BPE merge at the prompt's trailing space is
-        scored rather than dropped) -- identical semantics to
+        Pairs are scored in two phases: consecutive pairs sharing a prompt form
+        a group whose common token prefix runs once (a left-padded batch with
+        one row per group, primed into a ``BatchKVCache``), then every pair's
+        remaining tokens are scored in one right-padded batch on top of its
+        group's replicated cache -- the shared prompt is not re-forwarded per
+        candidate. The continuation boundary per pair is the end of the longest
+        token prefix shared with its prompt (so a BPE merge at the prompt's
+        trailing space is scored rather than dropped) -- identical semantics to
         :meth:`HFBackend.score`, so the classifier ranks verbalizers the same way
         on both backends. ``reduce`` collapses each pair's per-token
         log-likelihoods to the ``"mean"`` (default) or the ``"sum"``.
@@ -411,32 +498,65 @@ class MLXBackend:
             return []
         import mlx.core as mx
         import mlx.nn as nn
+        from mlx_lm.models.cache import BatchKVCache
 
         self._model.eval()
+        groups = prompt_groups(prompts)
         fulls: list[list[int]] = []
         starts: list[int] = []
-        for prompt, continuation in zip(prompts, continuations, strict=True):
-            prompt_ids = self._tokenizer.encode(prompt)
-            full = self._tokenizer.encode(prompt + continuation)[: self._max_seq_length]
-            starts.append(max(common_token_prefix(prompt_ids, full), 1))
-            fulls.append(full)
-        max_len = max(len(f) for f in fulls)
+        for a, b in groups:
+            prompt_ids = self._tokenizer.encode(prompts[a])  # once per run, not per pair
+            for i in range(a, b):
+                full = self._tokenizer.encode(prompts[i] + continuations[i])
+                full = full[: self._max_seq_length]
+                starts.append(max(common_token_prefix(prompt_ids, full), 1))
+                fulls.append(full)
+
+        # Every full in a group agrees with its shared prompt on the first ``start``
+        # tokens, so ``min(starts) - 1`` is a token prefix common to the whole group;
+        # the ``- 1`` keeps the boundary token in the suffix, so its logit comes from
+        # the suffix pass and the prefill's logits are never needed.
+        prefix_lens = [max(min(starts[a:b]) - 1, 0) for a, b in groups]
+        pair_prefix = [0] * len(prompts)
+        for g, (a, b) in enumerate(groups):
+            pair_prefix[a:b] = [prefix_lens[g]] * (b - a)
+        suffixes = [full[c : len(full) - 1] for full, c in zip(fulls, pair_prefix, strict=True)]
+        s_max = max(len(s) for s in suffixes)
+        if s_max == 0:  # every full is a single token: nothing is scorable
+            return [float("-inf")] * len(prompts)
+
+        cache = None
+        if max(prefix_lens) > 0:
+            c_max = max(prefix_lens)
+            prefix = np.zeros((len(groups), c_max), dtype=np.int32)
+            for g, (a, _) in enumerate(groups):
+                if prefix_lens[g]:
+                    prefix[g, c_max - prefix_lens[g] :] = fulls[a][: prefix_lens[g]]
+            # One BatchKVCache per layer: it carries per-row left padding, and the
+            # model builds position ids and the attention mask from it, so rows
+            # with different prefix lengths batch together.
+            cache = [BatchKVCache([c_max - c for c in prefix_lens]) for _ in self._model.layers]
+            self._model(mx.array(prefix), cache=cache)
+            members = mx.array([g for g, (a, b) in enumerate(groups) for _ in range(a, b)])
+            for layer in cache:
+                layer.filter(members)  # replicate each group's row, one per pair
+
         # Right padding with 0: causal attention keeps real tokens unaffected by
         # trailing pad positions, and per-pair slicing never reads them.
-        arr = np.zeros((len(fulls), max_len), dtype=np.int32)
-        for i, full in enumerate(fulls):
-            arr[i, : len(full)] = full
-        ids = mx.array(arr)
-        # No attention mask: causal attention already prevents real tokens from
-        # reading trailing right-pad, and per-pair slicing below never scores pad
-        # positions, so a mask would change nothing (HF passes one only because
-        # its tokenizer.pad returns it for free).
-        logits = self._model(ids[:, :-1]).astype(mx.float32)
+        arr = np.zeros((len(suffixes), s_max), dtype=np.int32)
+        targets = np.zeros((len(suffixes), s_max), dtype=np.int32)
+        for i, (suffix, full) in enumerate(zip(suffixes, fulls, strict=True)):
+            arr[i, : len(suffix)] = suffix
+            targets[i, : len(suffix)] = full[pair_prefix[i] + 1 :]
+        logits = self._model(mx.array(arr), cache=cache).astype(mx.float32)
         logprobs = nn.log_softmax(logits, axis=-1)
-        token_logprobs = mx.take_along_axis(logprobs, ids[:, 1:][..., None], axis=-1).squeeze(-1)
+        token_logprobs = mx.take_along_axis(
+            logprobs, mx.array(targets)[..., None], axis=-1
+        ).squeeze(-1)
         scores: list[float] = []
         for i, full in enumerate(fulls):
-            cont = token_logprobs[i, starts[i] - 1 : len(full) - 1]
+            lo, hi = starts[i] - 1 - pair_prefix[i], len(full) - 1 - pair_prefix[i]
+            cont = token_logprobs[i, lo:hi]
             if len(full) < 2 or cont.size == 0:
                 scores.append(float("-inf"))
             else:
@@ -449,12 +569,16 @@ class _MLXTextDataset:
     """Map-style dataset over per-epoch (re)serialized rows.
 
     ``__getitem__`` returns ``(token_ids, prompt_offset)``: ``prompt_offset`` is
-    the number of leading tokens ``iterate_batches`` masks out of the loss
-    (``0`` unless ``loss_on_target_only`` masks the row), found as the longest
-    common token prefix between the example's prompt and full text. ``reshuffle``
-    re-draws the buffer from ``epoch_texts`` for the next epoch index so the
-    column-order permutation is redrawn at each epoch boundary; tokenization is
-    lazy and memoized per epoch.
+    the number of leading tokens the loss down-weights (``0`` unless
+    ``target_loss_weight`` marks the row's context), found as the longest
+    common token prefix between the example's prompt and full text. With
+    ``digit_tokens`` set
+    (``numeric_loss_weight``), items grow to ``(ids, offset, digit_scale,
+    digit_variant, number_id, numeric_targets, numeric_weights)``
+    -- the arrays of :func:`~sklm.backend.numeric_token_arrays`.
+    ``reshuffle`` re-draws the buffer from ``epoch_texts`` for the next epoch
+    index so the column-order permutation is redrawn at each epoch boundary;
+    tokenization is lazy and memoized per epoch.
     """
 
     def __init__(
@@ -462,14 +586,16 @@ class _MLXTextDataset:
         epoch_texts: Callable[[int], list[TrainingExample]],
         tokenizer: Any,
         max_seq_length: int,
+        digit_tokens: DigitTokens | None = None,
     ) -> None:
         self._epoch_texts = epoch_texts
         self._tok = tokenizer
         self._max = max_seq_length
         self._eos = tokenizer.eos_token_id
+        self._digit_tokens = digit_tokens
         self._epoch = 0
         self._buffer = epoch_texts(0)
-        self._cache: dict[int, tuple[list[int], int]] = {}
+        self._cache: dict[int, tuple[Any, ...]] = {}
 
     def reshuffle(self) -> None:
         self._epoch += 1
@@ -479,7 +605,7 @@ class _MLXTextDataset:
     def __len__(self) -> int:
         return len(self._buffer)
 
-    def __getitem__(self, idx: int) -> tuple[list[int], int]:
+    def __getitem__(self, idx: int) -> tuple[Any, ...]:
         cached = self._cache.get(idx)
         if cached is not None:
             return cached
@@ -492,7 +618,10 @@ class _MLXTextDataset:
             prompt_ids = self._tok.encode(ex.prompt)
             # Always supervise >=1 token.
             offset = min(common_token_prefix(prompt_ids, ids), len(ids) - 1)
-        result = (ids, offset)
+        result: tuple[Any, ...] = (ids, offset)
+        if self._digit_tokens is not None:
+            arrays = numeric_token_arrays(ex, ids, self._tok.encode, self._digit_tokens.variant_of)
+            result = (ids, offset, *arrays)
         self._cache[idx] = result
         return result
 
@@ -677,12 +806,26 @@ class _PlateauReducer:
         self._best, self._num_bad, self._cooldown = best, num_bad, cooldown
 
 
+@dataclass(frozen=True)
+class _Validation:
+    """The hold-out and how to evaluate it: every ``every`` micro-steps, with
+    mlx-lm's ``evaluate`` over the whole ``dataset`` under the training loss."""
+
+    dataset: Any
+    every: int
+    batch_size: int
+    max_seq_length: int
+    loss: Callable[..., Any] | None
+    iterate_batches: Callable[..., Iterator[Any]]
+
+
 def _loss_report_callback(
     callback: Callback,
     lm: Any,
     optimizer: Any,
     iters: int,
-    patience: int | None,
+    stopping: EarlyStopping,
+    validation: _Validation | None,
     *,
     ckpt_dir: str,
     save_every: int | None,
@@ -690,9 +833,8 @@ def _loss_report_callback(
     plateau: _PlateauReducer | None = None,
     step_offset: int = 0,
     resumable: bool = False,
+    save_optimizer_state: bool = True,
     init_best: Any = None,
-    init_best_loss: float = math.inf,
-    init_no_improve: int = 0,
 ) -> Any:
     """Build an mlx-lm ``TrainingCallback`` that forwards train/val loss, the
     gradient norm and the current device memory to ``callback``.
@@ -701,31 +843,35 @@ def _loss_report_callback(
     (``max_grad_norm`` unset), since nothing computes it then.
 
     ``step_offset`` is added to every mlx-lm iteration so a resumed run reports
-    and names checkpoints on the original absolute step axis. The best/loss/
-    no-improve trackers are seeded from ``init_*`` so early stopping and best
-    restoration survive a resume.
+    and names checkpoints on the original absolute step axis. ``stopping`` (its
+    best loss and streak seeded from the resumed checkpoint) and ``init_best``
+    (the resumed best weights) let early stopping and best restoration survive
+    a resume.
+
+    Evaluation is run here rather than by mlx-lm's loop, which validates before
+    a step (and always at its first and last iteration): after every
+    ``validation.every``-th micro-step the hold-out is scored, so the reports
+    land on the same absolute steps as the HF backend's. Each loss is fed to
+    ``stopping``: an improvement snapshots the weights into ``.best`` for the
+    caller to restore (and, when ``resumable``, persists them to
+    ``best.safetensors`` on the spot); exhausted patience raises
+    :class:`_StopTraining`.
 
     When ``save_every`` is set, every that-many micro-steps a numbered checkpoint
     is written under ``ckpt_dir`` and pruned to the ``keep`` most recent; when
-    ``resumable`` it carries a ``state-<step>`` sidecar (optimizer state, RNG,
-    trackers) so the next ``fit`` continues 1:1. Whenever a validation set yields
-    reports the best (lowest-loss) snapshot is tracked and exposed as ``.best``
-    for the caller to restore (and, when ``resumable``, persisted to
-    ``best.safetensors`` the moment it improves); with ``patience`` set it also
-    raises :class:`_StopTraining` once validation stops improving for ``patience``
-    reports.
+    ``resumable`` (and ``save_optimizer_state``) it carries a ``state-<step>``
+    sidecar (optimizer state, RNG, trackers) so the next ``fit`` continues 1:1.
     """
     import mlx.core as mx
     from mlx.utils import tree_flatten
     from mlx_lm.tuner.callbacks import TrainingCallback
+    from mlx_lm.tuner.trainer import default_loss, evaluate
 
     class _LossReport(TrainingCallback):
         def __init__(self) -> None:
             # tree_flatten's result (a list of (path, array)); typed Any
             # because mlx-lm ships no stubs for it.
             self.best: Any = init_best
-            self.best_loss = init_best_loss
-            self.no_improve = init_no_improve
 
         def on_train_loss_report(self, train_info: dict[str, Any]) -> None:
             callback.on_memory(int(mx.get_active_memory()))
@@ -739,9 +885,11 @@ def _loss_report_callback(
                 learning_rate=train_info.get("learning_rate"),
                 grad_norm=float(norm.item()) if norm is not None else None,
             )
+            if validation is not None and step % validation.every == 0:
+                self._evaluate(step)
             if save_every is not None and step % save_every == 0:
                 weights = tree_flatten(lm.trainable_parameters())
-                sidecar = self._sidecar(step) if resumable else None
+                sidecar = self._sidecar(step) if resumable and save_optimizer_state else None
                 mx.eval([v for _, v in weights])
                 _save_checkpoint(ckpt_dir, step, weights, sidecar, keep)
 
@@ -753,7 +901,7 @@ def _loss_report_callback(
             # No stub for the ``mx.random.state`` global; type it for enumerate.
             rng: list[Any] = mx.random.state  # type: ignore[attr-defined]
             sidecar |= {f"rng.{i}": a for i, a in enumerate(rng)}
-            sidecar["meta.no_improve"] = mx.array(self.no_improve)
+            sidecar["meta.no_improve"] = mx.array(stopping.streak)
             if plateau is not None:
                 best, num_bad, cooldown = plateau.export()
                 sidecar["meta.plateau_best"] = mx.array(best)
@@ -761,39 +909,53 @@ def _loss_report_callback(
                 sidecar["meta.plateau_cooldown"] = mx.array(cooldown)
             return sidecar
 
-        def on_val_loss_report(self, val_info: dict[str, Any]) -> None:
-            loss = float(val_info["val_loss"])
-            callback.on_eval_report(
-                step=int(val_info["iteration"]) + step_offset, loss=loss, epoch=None
+        def _evaluate(self, step: int) -> None:
+            assert validation is not None
+            loss = float(
+                evaluate(
+                    model=lm,
+                    dataset=validation.dataset,
+                    batch_size=validation.batch_size,
+                    num_batches=-1,
+                    max_seq_length=validation.max_seq_length,
+                    loss=validation.loss if validation.loss is not None else default_loss,
+                    iterate_batches=validation.iterate_batches,
+                )
             )
-            if loss < self.best_loss - 1e-9:
-                self.best_loss = loss
-                # mlx arrays are immutable, so snapshotting the current leaves
-                # is enough -- the optimizer rebinds new arrays on each step.
-                snapshot = tree_flatten(lm.trainable_parameters())
-                mx.eval([v for _, v in snapshot])
-                self.best = snapshot
-                self.no_improve = 0
-                if resumable:
-                    _save_best(ckpt_dir, snapshot, loss)
-            elif patience is not None:
-                self.no_improve += 1
-                if self.no_improve >= patience:
-                    raise _StopTraining
+            lm.train()
+            callback.on_eval_report(step=step, loss=loss, epoch=None)
+            verdict = stopping.observe(loss)
             if plateau is not None:
                 optimizer.learning_rate = plateau.step(loss, float(optimizer.learning_rate.item()))
+            match verdict:
+                case "improved":
+                    # mlx arrays are immutable, so snapshotting the current leaves
+                    # is enough -- the optimizer rebinds new arrays on each step.
+                    snapshot = tree_flatten(lm.trainable_parameters())
+                    mx.eval([v for _, v in snapshot])
+                    self.best = snapshot
+                    if resumable:
+                        _save_best(ckpt_dir, snapshot, loss)
+                case "exhausted":
+                    raise _StopTraining
+                case "no_improvement":
+                    pass
 
     return _LossReport()
 
 
-def _make_iterate_batches(random_state: int | None) -> Callable[..., Iterator[Any]]:
+def _make_iterate_batches(
+    random_state: int | None, numeric: bool = False
+) -> Callable[..., Iterator[Any]]:
     """Build the ``iterate_batches`` ``train`` will drive.
 
     Mirrors mlx-lm's batching (permute, pad to a multiple of 32, truncate) but
     calls ``dataset.reshuffle()`` at each wrap-around so a new column-order
     permutation is drawn per epoch. Epoch 0 uses the dataset's initial buffer;
     the first wrap fires epoch 1. Padding with 0 is harmless: the loss masks
-    padded positions via ``lengths``.
+    padded positions via ``lengths``. With ``numeric`` (the auxiliary numeric
+    loss), each yielded batch grows the dataset's per-token digit arrays and
+    per-number targets -- ``train`` unpacks the tuple into the custom loss.
     """
 
     def iterate_batches(
@@ -830,7 +992,32 @@ def _make_iterate_batches(random_state: int | None) -> Callable[..., Iterator[An
                     t = min(lengths[j], max_seq_length)
                     arr[j, :t] = ids_batch[j][:t]
                     trunc.append(t)
-                yield mx.array(arr), mx.array(list(zip(offsets, trunc, strict=True)))
+                pair = mx.array(arr), mx.array(list(zip(offsets, trunc, strict=True)))
+                if not numeric:
+                    yield pair
+                    continue
+                n = len(indices)
+                slots = max(len(b[5]) for b in batch) or 1
+                scale = np.zeros((n, max_len), dtype=np.float32)
+                variant = np.full((n, max_len), -1, dtype=np.int32)
+                number_id = np.full((n, max_len), -1, dtype=np.int32)
+                targets = np.zeros((n, slots), dtype=np.float32)
+                weights = np.zeros((n, slots), dtype=np.float32)
+                for j, b in enumerate(batch):
+                    t = trunc[j]
+                    scale[j, :t] = b[2][:t]
+                    variant[j, :t] = b[3][:t]
+                    number_id[j, :t] = b[4][:t]
+                    targets[j, : len(b[5])] = b[5]
+                    weights[j, : len(b[6])] = b[6]
+                yield (
+                    *pair,
+                    mx.array(scale),
+                    mx.array(variant),
+                    mx.array(number_id),
+                    mx.array(targets),
+                    mx.array(weights),
+                )
             if not loop:
                 break
 
@@ -919,21 +1106,73 @@ def _build_optimizer(training: TrainingConfig, steps: int, lr: float) -> Any:
     return optimizer
 
 
-def _make_loss(eps: float) -> Callable[..., Any]:
-    """Full-sequence cross-entropy with label smoothing, matching the masking of
-    ``mlx_lm.tuner.trainer.default_loss`` (offset 0 -> loss on every token)."""
+def _make_loss(training: TrainingConfig, digit_tokens: DigitTokens | None) -> Callable[..., Any]:
+    """Cross-entropy with label smoothing, ``target_loss_weight`` weighting and
+    the ``numeric_loss_weight`` auxiliary term.
+
+    Without those knobs the masking matches ``mlx_lm.tuner.trainer.default_loss``
+    (offset 0 -> loss on every token). Under ``target_loss_weight`` the binary
+    prompt mask becomes ``1 - alpha`` / ``alpha`` weights normalized by their
+    sum; under ``numeric_loss_weight`` a softmax restricted to the digit-token
+    candidates reconstructs the expected number per ``number_id`` slot and its
+    mean squared error against the targets is added, each slot's error scaled
+    by its column's reciprocal standard deviation (kept behaviorally identical
+    to ``hf_backend._make_weighted_trainer`` -- invariant 3).
+    """
     import mlx.core as mx
     import mlx.nn as nn
 
-    def loss(model: Any, batch: Any, lengths: Any) -> Any:
+    eps = training.label_smoothing
+    alpha = training.target_loss_weight
+    numeric_weight = training.numeric_loss_weight
+    candidates = digit_tokens.candidates if digit_tokens is not None else ((), ())
+
+    def loss(model: Any, batch: Any, lengths: Any, *numeric: Any) -> Any:
         inputs = batch[:, :-1]
         targets = batch[:, 1:]
         logits = model(inputs)
         steps = mx.arange(1, targets.shape[1] + 1)
-        mask = mx.logical_and(steps >= lengths[:, 0:1], steps <= lengths[:, 1:])
-        ce = nn.losses.cross_entropy(logits, targets, label_smoothing=eps, reduction="none") * mask
-        ntoks = mask.sum()
-        return ce.astype(mx.float32).sum() / ntoks, ntoks
+        in_row = steps <= lengths[:, 1:]
+        if alpha is None:
+            weights = mx.logical_and(steps >= lengths[:, 0:1], in_row).astype(mx.float32)
+        else:
+            weights = mx.where(steps >= lengths[:, 0:1], alpha, 1.0 - alpha) * in_row
+        ce = (
+            nn.losses.cross_entropy(logits, targets, label_smoothing=eps, reduction="none")
+            * weights
+        )
+        wsum = weights.sum()
+        total = ce.astype(mx.float32).sum() / wsum
+        if numeric:
+            # Arrays align with token positions, so their step-1.. tail aligns
+            # with ``targets`` (position t is predicted by the logits at t - 1).
+            scale, variant, number_id, numeric_targets, numeric_weights = numeric
+            s = scale[:, 1:]
+            v = variant[:, 1:]
+            nid = number_id[:, 1:]
+            expected = mx.zeros(s.shape)
+            for var, cand in enumerate(candidates):
+                if not cand:
+                    continue
+                p = mx.softmax(mx.take(logits, mx.array(cand), axis=-1).astype(mx.float32), axis=-1)
+                digits = mx.arange(10).astype(mx.float32)
+                expected = mx.where(v == var, (p * digits).sum(-1), expected)
+            bsz, slots = numeric_targets.shape
+            base = mx.arange(bsz)[:, None] * slots
+            # Non-digit positions land in a dump slot past the real ones.
+            flat = mx.where(nid >= 0, nid + base, bsz * slots).reshape(-1)
+            sums = mx.zeros(bsz * slots + 1).at[flat].add((expected * s).reshape(-1))
+            counts = (
+                mx.zeros(bsz * slots + 1).at[flat].add((nid >= 0).reshape(-1).astype(mx.float32))
+            )
+            valid = counts[:-1] > 0
+            # inv_scale puts the error in standard deviations of its column, so
+            # columns of unlike magnitude weigh alike (invariant 3: HF computes
+            # the same product).
+            err = ((sums[:-1] - numeric_targets.reshape(-1)) * numeric_weights.reshape(-1)) ** 2
+            aux = (err * valid).sum() / mx.maximum(valid.sum(), 1)
+            total = total + numeric_weight * aux
+        return total, wsum
 
     return loss
 

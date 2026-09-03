@@ -8,14 +8,19 @@ load a real model and self-skip without their dependency; the
 from __future__ import annotations
 
 import importlib.util
+import os
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from sklm import (
+    EvalConfig,
     GenerationConfig,
     HFBackend,
+    JSONSerializer,
     LanguageModelClassifier,
     LanguageModelImputer,
     LoRAConfig,
@@ -25,8 +30,15 @@ from sklm import (
     TrainingConfig,
 )
 from sklm import base as sklm_base
-from sklm.backend import LanguageModelBackend
+from sklm.backend import (
+    LanguageModelBackend,
+    digit_scales,
+    numeric_token_arrays,
+    prompt_groups,
+    resolve_digit_tokens,
+)
 from sklm.base import resolve_backend
+from sklm.serialize import Field, NumericSpan, SpacedDigits, TrainingExample
 
 from .conftest import FakeBackend, _has_hf, _has_mlx
 
@@ -46,6 +58,126 @@ def _clf_xy() -> tuple[pd.DataFrame, np.ndarray]:
     X = pd.DataFrame({"a": rng.normal(size=24), "b": rng.choice(["x", "y"], size=24)})
     y = rng.choice(["pos", "neg"], size=24)
     return X, y
+
+
+# --- score grouping (framework-free) ---------------------------------------
+
+
+def test_prompt_groups_runs_of_identical_prompts() -> None:
+    assert prompt_groups([]) == []
+    assert prompt_groups(["a"]) == [(0, 1)]
+    assert prompt_groups(["a", "a", "a"]) == [(0, 3)]
+    assert prompt_groups(["a", "b", "c"]) == [(0, 1), (1, 2), (2, 3)]
+    # a re-run of an earlier prompt is a new group: only consecutive pairs share a cache
+    assert prompt_groups(["a", "a", "b", "a"]) == [(0, 2), (2, 3), (3, 4)]
+
+
+# --- numeric-loss helpers (framework-free) ---------------------------------
+
+
+def _char_encode(text: str) -> list[int]:
+    return [ord(c) for c in text]
+
+
+def test_digit_scales_carry_place_and_sign() -> None:
+    assert digit_scales("2 5 . 7") == [10.0, 1.0, 0.1]
+    assert digit_scales("- 3") == [-1.0]
+    assert digit_scales("100") == [100.0, 10.0, 1.0]
+    assert digit_scales("1e+16") == []  # scientific notation is skipped
+
+
+@pytest.mark.parametrize("value", [25.7, -3.0, 100.0, 0.125])
+def test_digit_scales_reconstruct_the_value(value: float) -> None:
+    encoded = SpacedDigits(max_decimals=None).encode(value)
+    digits = [float(c) for c in encoded if c.isdigit()]
+    scales = digit_scales(encoded)
+    assert sum(d * s for d, s in zip(digits, scales, strict=True)) == pytest.approx(value)
+
+
+def test_resolve_digit_tokens_char_level() -> None:
+    table = resolve_digit_tokens(_char_encode)
+    assert table.candidates[0] == [ord(str(d)) for d in range(10)]
+    assert table.candidates[1] == []  # " 5" is two char-level tokens
+    assert table.variant_of[ord("7")] == 0
+
+
+def test_resolve_digit_tokens_rejects_multi_token_digits() -> None:
+    with pytest.raises(ValueError, match="numeric_loss_weight"):
+        resolve_digit_tokens(lambda t: [0, 1])
+
+
+def test_numeric_token_arrays_mark_digit_positions() -> None:
+    s = JSONSerializer(number=SpacedDigits())
+    fields = [Field("a", 2.5, True), Field("b", "x", False)]
+    text = s.serialize(fields)
+    start, end = s.value_spans(fields)[0]
+    ex = TrainingExample("", text, (NumericSpan(start, end, 2.5, 1.0),))
+    table = resolve_digit_tokens(_char_encode)
+    arrays = numeric_token_arrays(ex, _char_encode(text), _char_encode, table.variant_of)
+    assert arrays.targets == [2.5]
+    marked = [i for i, sc in enumerate(arrays.scale) if sc != 0.0]
+    assert marked == [i for i in range(start, end) if text[i].isdigit()]
+    assert [arrays.scale[i] for i in marked] == [1.0, 0.1]
+    assert all(arrays.number_id[i] == 0 and arrays.variant[i] == 0 for i in marked)
+
+
+def test_numeric_token_arrays_carry_the_span_scales() -> None:
+    s = JSONSerializer(number=SpacedDigits())
+    fields = [Field("a", 2.5, True), Field("b", 40.0, True)]
+    text = s.serialize(fields)
+    spans = tuple(
+        NumericSpan(start, end, value, inv_scale)
+        for (start, end), value, inv_scale in zip(
+            s.value_spans(fields), (2.5, 40.0), (2.0, 0.1), strict=True
+        )
+    )
+    table = resolve_digit_tokens(_char_encode)
+    arrays = numeric_token_arrays(
+        TrainingExample("", text, spans), _char_encode(text), _char_encode, table.variant_of
+    )
+    # one weight per target slot: the loss scales each slot's error by it
+    assert arrays.targets == [2.5, 40.0]
+    assert arrays.weights == [2.0, 0.1]
+
+
+def test_numeric_token_arrays_drop_truncated_spans() -> None:
+    s = JSONSerializer(number=SpacedDigits())
+    fields = [Field("a", 2.5, True)]
+    text = s.serialize(fields)
+    start, end = s.value_spans(fields)[0]
+    ex = TrainingExample("", text, (NumericSpan(start, end, 2.5, 1.0),))
+    ids = _char_encode(text)[: start + 1]  # cut inside the number
+    table = resolve_digit_tokens(_char_encode)
+    arrays = numeric_token_arrays(ex, ids, _char_encode, table.variant_of)
+    # the slot survives with no marked token, so the loss masks it out
+    assert arrays.targets == [2.5]
+    assert arrays.weights == [1.0]
+    assert all(sc == 0.0 for sc in arrays.scale)
+
+
+def test_checkpoint_workdir_reaps_only_dead_owners(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A stale workdir whose owner process died is removed at the next fit;
+    one owned by a live process (a concurrent fit) is left alone."""
+    import subprocess
+    import tempfile
+
+    from sklm.backend import checkpoint_workdir
+
+    monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
+    child = subprocess.Popen([sys.executable, "-c", ""])
+    child.wait()
+    dead = tmp_path / f"sklm_x_{child.pid}_abc123"
+    dead.mkdir()
+    alive = tmp_path / f"sklm_x_{os.getpid()}_def456"
+    alive.mkdir()
+
+    with checkpoint_workdir("sklm_x_") as workdir:
+        assert Path(workdir).name.startswith(f"sklm_x_{os.getpid()}_")
+        assert not dead.exists()
+        assert alive.exists()
+    assert not Path(workdir).exists()
 
 
 # --- HuggingFace ----------------------------------------------------------
@@ -74,27 +206,90 @@ def test_zero_base_dropout_silences_only_dropout_fields() -> None:
     assert config.model_type == "gpt2"
 
 
+def test_apply_eval_kwargs_optimizer_state_persistence() -> None:
+    """Checkpoints carry the optimizer state unless ``save_optimizer_state=False``;
+    a validation set alone forces no save at all (the best is kept in memory)."""
+    from sklm.config import CheckpointConfig
+    from sklm.hf_backend import _apply_eval_kwargs
+
+    eval_only: dict[str, object] = {}
+    _apply_eval_kwargs(eval_only, TrainingConfig(), steps_per_epoch=4, has_eval=True)
+    assert "save_strategy" not in eval_only
+
+    explicit: dict[str, object] = {}
+    _apply_eval_kwargs(
+        explicit, TrainingConfig(checkpoint=CheckpointConfig()), steps_per_epoch=4, has_eval=False
+    )
+    assert explicit["save_only_model"] is False
+
+    weights_only: dict[str, object] = {}
+    _apply_eval_kwargs(
+        weights_only,
+        TrainingConfig(checkpoint=CheckpointConfig(), save_optimizer_state=False),
+        steps_per_epoch=4,
+        has_eval=False,
+    )
+    assert weights_only["save_only_model"] is True
+
+
+@pytest.mark.parametrize(
+    ("on", "each", "expected"), [("epoch", 1, 4), ("epoch", 3, 12), ("step", 1, 1), ("step", 5, 5)]
+)
+def test_apply_eval_kwargs_cadences_in_optimizer_steps(on: str, each: int, expected: int) -> None:
+    """Both the checkpoint and the evaluation cadence reach the ``Trainer`` in
+    optimizer steps, an epoch being ``steps_per_epoch`` of them."""
+    from sklm.config import CheckpointConfig
+    from sklm.hf_backend import _apply_eval_kwargs
+
+    kwargs: dict[str, object] = {}
+    cfg = TrainingConfig(
+        evaluation=EvalConfig(each=each, on=on),  # type: ignore[arg-type]
+        checkpoint=CheckpointConfig(each=each, on=on),  # type: ignore[arg-type]
+    )
+    _apply_eval_kwargs(kwargs, cfg, steps_per_epoch=4, has_eval=True)
+    assert (kwargs["eval_strategy"], kwargs["eval_steps"]) == ("steps", expected)
+    assert (kwargs["save_strategy"], kwargs["save_steps"]) == ("steps", expected)
+
+
+def test_apply_eval_kwargs_no_eval_without_examples() -> None:
+    from sklm.hf_backend import _apply_eval_kwargs
+
+    kwargs: dict[str, object] = {}
+    _apply_eval_kwargs(kwargs, TrainingConfig(), steps_per_epoch=4, has_eval=False)
+    assert "eval_strategy" not in kwargs
+
+
+class _CharTok:
+    eos_token = ""
+
+    def __call__(self, text: str, **_: object) -> dict[str, list[int]]:
+        ids = [ord(c) for c in text]
+        return {"input_ids": ids, "attention_mask": [1] * len(ids)}
+
+
 @pytest.mark.skipif(not _has_hf(), reason="requires the 'hf' extra (torch dataset)")
-def test_hf_dataset_masks_prompt_with_minus_100() -> None:
-    """The dataset emits ``labels`` with -100 over the prompt span (and supervises
-    everything when the prompt is empty). Building the mask as a first-class
-    ``labels`` column keeps it from being dropped by the Trainer's
-    ``remove_unused_columns``, which silently disabled ``loss_on_target_only``."""
+def test_hf_dataset_emits_loss_weights_under_target_loss_weight() -> None:
+    """Under ``target_loss_weight`` the prompt boundary rides as the
+    ``loss_weights`` column (1 - alpha up to it, alpha after) while the labels
+    stay unmasked; without the weight, no extra column is emitted."""
     from sklm.hf_backend import _text_dataset
-    from sklm.serialize import TrainingExample
 
-    class _CharTok:
-        eos_token = ""
+    training = TrainingConfig(target_loss_weight=0.75)
+    item = _text_dataset(lambda _: [TrainingExample("ab", "cd")], _CharTok(), 100, training, None)[
+        0
+    ]
+    assert item["labels"] == [ord(c) for c in "abcd"]  # no -100 masking
+    assert item["loss_weights"] == [0.25, 0.25, 0.75, 0.75]
 
-        def __call__(self, text: str, **_: object) -> dict[str, list[int]]:
-            ids = [ord(c) for c in text]
-            return {"input_ids": ids, "attention_mask": [1] * len(ids)}
-
-    masked = _text_dataset(lambda _: [TrainingExample("ab", "cd")], _CharTok(), 100)[0]
-    assert masked["labels"] == [-100, -100, ord("c"), ord("d")]
-
-    unmasked = _text_dataset(lambda _: [TrainingExample("", "cd")], _CharTok(), 100)[0]
-    assert unmasked["labels"] == [ord("c"), ord("d")]
+    plain = _text_dataset(
+        lambda _: [TrainingExample("", "cd")],
+        _CharTok(),
+        100,
+        TrainingConfig(target_loss_weight=None),
+        None,
+    )[0]
+    assert plain["labels"] == [ord("c"), ord("d")]
+    assert "loss_weights" not in plain
 
 
 @pytest.mark.slow
@@ -225,6 +420,38 @@ def test_hf_score_truncates_right() -> None:
 @pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon")
 def test_mlx_score_truncates_right() -> None:
     _score_truncates_right(MLXBackend(), _MLX_MODEL)
+
+
+# --- numeric constrained decoding parity ------------------------------------
+
+
+def _generate_respects_numeric_constraint(backend: HFBackend | MLXBackend, model: str) -> None:
+    """Under a constraint every generated character is a digit, sign, separator
+    or value delimiter -- even on the base (un-fine-tuned) model at a
+    temperature that would otherwise produce free text."""
+    backend._load(model, ModelConfig())
+    constraint = JSONSerializer().numeric_constraint()
+    outs = backend.generate(
+        ['{"age": 39, "score": '] * 4,
+        GenerationConfig(temperature=1.5, max_new_tokens=8),
+        constraint=constraint,
+    )
+    allowed = constraint.alphabet.union(*constraint.terminators)
+    assert len(outs) == 4
+    for text in outs:
+        assert set(text) <= allowed, text
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _has_hf(), reason="requires the 'hf' extra")
+def test_hf_generate_respects_numeric_constraint() -> None:
+    _generate_respects_numeric_constraint(HFBackend(), "distilgpt2")
+
+
+@pytest.mark.slow
+@pytest.mark.skipif(not _has_mlx(), reason="requires the 'mlx' extra on Apple Silicon")
+def test_mlx_generate_respects_numeric_constraint() -> None:
+    _generate_respects_numeric_constraint(MLXBackend(), _MLX_MODEL)
 
 
 # --- HF/MLX score rank parity on shared weights ----------------------------
