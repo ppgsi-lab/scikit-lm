@@ -28,6 +28,21 @@ def test_prefix_stops_before_target_value() -> None:
     assert s.prefix([], "age") == '{"age": '
 
 
+def test_spaced_delimiters_layout() -> None:
+    s = JSONSerializer(spaced_delimiters=True)
+    fields = [Field("age", 39, True), Field("city", "São Paulo", False)]
+    assert s.serialize(fields) == '{ "age" : 39 , "city" : "São Paulo" }'
+    assert s.prefix([Field("age", 39, True)], "city") == '{ "age" : 39 , "city" : '
+    assert s.prefix([], "age") == '{ "age" : '
+
+
+def test_spaced_delimiters_split_empty_context_keeps_padding() -> None:
+    s = JSONSerializer(spaced_delimiters=True)
+    prompt, completion = s.split([], [Field("label", "yes", False)])
+    assert prompt == "{ "
+    assert completion == '"label" : "yes" }'
+
+
 def test_encode_value() -> None:
     s = JSONSerializer()
     assert s.encode_value(39.0, numeric=True) == "39.0"
@@ -217,6 +232,8 @@ def _serializers() -> list[Serializer]:
     return [
         JSONSerializer(),
         JSONSerializer(number=SpacedDigits()),
+        JSONSerializer(spaced_delimiters=True),
+        JSONSerializer(spaced_delimiters=True, number=SpacedDigits()),
         KeyValueSerializer(),
         KeyValueSerializer(key_value_separator="=", pair_separator=";"),
         BracketSerializer(),
@@ -247,6 +264,55 @@ def test_prefix_then_value_recovers_through_decode(s: Serializer) -> None:
     assert s.decode_value(full[len(prefix) :], numeric=True) == 3.5
 
 
+# --- value_spans -------------------------------------------------------------
+
+
+@pytest.mark.parametrize("s", _serializers())
+@pytest.mark.parametrize(
+    "fields",
+    [
+        [Field("age", 39, True), Field("city", "SP", False), Field("score", -3.5, True)],
+        [Field("score", 3.5, True)],
+        [Field("city", "SP", False)],
+        [],
+    ],
+)
+def test_value_spans_slice_the_encoded_values(s: Serializer, fields: list[Field]) -> None:
+    text = s.serialize(fields)
+    spans = s.value_spans(fields)
+    assert len(spans) == len(fields)
+    for f, (start, end) in zip(fields, spans, strict=True):
+        assert text[start:end] == s.encode_value(f.value, numeric=f.numeric)
+
+
+# --- numeric_constraint -----------------------------------------------------
+
+
+@pytest.mark.parametrize("s", _serializers())
+def test_numeric_constraint_covers_encoded_numbers(s: Serializer) -> None:
+    c = s.numeric_constraint()
+    for value in (39, -3, 1250, 3.14159, 0.001, 1e16):
+        assert set(s.encode_value(value, numeric=True)) <= c.alphabet
+
+
+@pytest.mark.parametrize("s", _serializers())
+def test_numeric_constraint_terminators_end_the_value(s: Serializer) -> None:
+    c = s.numeric_constraint()
+    encoded = s.encode_value(3.5, numeric=True)
+    for terminator in c.terminators:
+        assert s.decode_value(f"{encoded}{terminator}junk", numeric=True) == 3.5
+
+
+def test_value_constraint_allows_values_terminators_and_nothing_else() -> None:
+    c = JSONSerializer().numeric_constraint()
+    assert c.allows(" 39")
+    assert c.allows("3.5")
+    assert c.allows(",")
+    assert not c.allows("abc")
+    assert not c.allows("3a")
+    assert not c.allows("")
+
+
 # --- resolve_serializer ---------------------------------------------------
 
 
@@ -266,6 +332,31 @@ def test_resolve_serializer_selectors(selector: str, cls: type) -> None:
 def test_resolve_serializer_passes_instances_through() -> None:
     s = BracketSerializer(number=SpacedDigits())
     assert resolve_serializer(s) is s
+
+
+def test_resolve_serializer_applies_max_decimals_to_instances() -> None:
+    # An explicit max_decimals reaches an instance's number format; the caller's
+    # serializer object itself stays untouched.
+    s = JSONSerializer(spaced_delimiters=True)
+    resolved = resolve_serializer(s, 2)
+    assert isinstance(resolved, JSONSerializer)
+    number = resolved.number
+    assert isinstance(number, PlainNumber)
+    assert number.max_decimals == 2
+    assert resolved.encode_value(4.2525, numeric=True) == "4.25"
+    original = s.number
+    assert isinstance(original, PlainNumber)
+    assert original.max_decimals is None
+    assert resolved.spaced_delimiters
+
+
+def test_resolve_serializer_rejects_max_decimals_without_number_format() -> None:
+    class Custom:
+        def serialize(self, fields: object) -> str:
+            return ""
+
+    with pytest.raises(ValueError, match="max_decimals=2 cannot be applied"):
+        resolve_serializer(Custom(), 2)  # pyright: ignore[reportArgumentType]
 
 
 def test_resolve_serializer_rejects_unknown() -> None:
